@@ -23,6 +23,8 @@ from typing import Optional, Tuple, Union
 from ..configuration_utils import PreTrainedConfig
 from ..utils import logging
 
+from ..modeling.modeling_rope_utils import RopeParameters
+
 
 logger = logging.get_logger(__name__)
 
