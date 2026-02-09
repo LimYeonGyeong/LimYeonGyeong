@@ -24,3 +24,16 @@ def use_kernelized_func(func):
     def decorator(cls):
         return cls
     return decorator
+
+def use_kernel_func_from_hub(kernel_name):
+    def decorator(func):
+        return func
+    return decorator
+
+def check_model_inputs(func):
+    """
+    입력값을 검증하는 데코레이터 (현재는 더미 구현)
+    """
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper

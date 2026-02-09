@@ -60,6 +60,8 @@ from ..utils.utils import (
     logging,
     use_kernel_forward_from_hub,
     use_kernelized_func,
+    use_kernel_func_from_hub,
+    check_model_inputs,
 )
 try:
     from typing import Unpack

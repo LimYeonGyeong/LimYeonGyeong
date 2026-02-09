@@ -5,6 +5,7 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 # 현재 경로를 추가하여 paged_llama를 인식하게 합니다.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -18,18 +19,20 @@ def patch_llama():
     
     # 모델 로드
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.bfloat16, 
-        device_map="auto"
+        model_id,
+        torch_dtype=torch.float32,  # 안전하게 float32로 변경 (맥북 호환성)
+        device_map="auto",           # <--- 핵심! "메타 장치 말고 CPU에 실물 로딩해라"
+        #low_cpu_mem_usage=True,     # 메모리 효율화
     )
     
     # PagePool 설정
     pool = PagePool(
         num_blocks=1024, 
-        num_heads=model.config.num_attention_heads, 
+        num_heads=32, 
         block_size=16, 
         head_dim=128, 
-        device=model.device
+        device="cuda",  # <--- 여기를 "cpu"로 변경!
+        dtype=torch.float32
     )
 
     print(f">>> [2/3] PagedAttention 부품 교체 시작...")

@@ -11,8 +11,16 @@ class PagePool:
 
         # KV Cache를 위한 거대 텐서 미리 할당 (Zero-copy를 위한 공간)
         # Shape: [물리 블록 개수, 헤드 수, 블록 크기, 헤드 차원]
-        self.k_cache = torch.zeros(num_blocks, num_heads, block_size, head_dim, device=device, dtype=dtype)
-        self.v_cache = torch.zeros(num_blocks, num_heads, block_size, head_dim, device=device, dtype=dtype)
+        self.k_cache = torch.zeros(
+            (int(num_blocks), int(num_heads), int(block_size), int(head_dim)), 
+            device=device, 
+            dtype=dtype
+        )
+        self.v_cache = torch.zeros(
+            (int(num_blocks), int(num_heads), int(block_size), int(head_dim)), 
+            device=device, 
+            dtype=dtype
+        )
         
         # 블록 사용 여부 관리
         self.free_blocks = list(range(num_blocks))
