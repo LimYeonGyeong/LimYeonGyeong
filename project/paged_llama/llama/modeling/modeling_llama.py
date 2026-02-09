@@ -58,6 +58,8 @@ from ..utils.utils import (
     auto_docstring,
     can_return_tuple,
     logging,
+    use_kernel_forward_from_hub,
+    use_kernelized_func,
 )
 try:
     from typing import Unpack
