@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, Optional, TypedDict
 
 from paged_llama.llama.utils import is_torch_available, logging
 
+class RotaryEmbeddingConfigMixin:
+    pass
+
 logger = logging.get_logger(__name__)
 
 
