@@ -1,50 +1,241 @@
-# /Users/yeongyeong/Desktop/3-2/종설/main.py
-
-import sys
-import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import time
+import os
+import psutil
+import gc
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import login
 
+# ==========================================
+# 1. 설정 (모델 및 토큰)
+# ==========================================
+MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
 
-# 현재 경로를 추가하여 paged_llama를 인식하게 합니다.
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+TOKEN = os.getenv("HF_TOKEN")
+if TOKEN:
+    login(token=TOKEN)
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================================
+# 2. 성능 측정 엔진
+# ==========================================
+def measure_performance(model, tokenizer, prompt_text):
+    # 워밍업
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        model.generate(**inputs, max_new_tokens=1)
+    
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # 측정 시작 전 상태 기록
+    process = psutil.Process(os.getpid())
+    ram_start = process.memory_info().rss
+    ctx_start = process.num_ctx_switches()
+    vram_start = torch.cuda.memory_allocated() if device == "cuda" else 0
+    
+    t0 = time.time()
+    
+    # 텍스트 생성 (120토큰)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=120,
+            do_sample=False,
+            use_cache=True
+        )
+    
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    
+    # 결과 계산
+    latency = t1 - t0
+    generated_tokens = outputs.shape[-1] - inputs.input_ids.shape[-1]
+    throughput = generated_tokens / latency
+    
+    ram_usage = (process.memory_info().rss - ram_start) / 1024 / 1024
+    vram_usage = (torch.cuda.memory_allocated() - vram_start) / 1024 / 1024 if device == "cuda" else 0
+    
+    ctx_end = process.num_ctx_switches()
+    ctx_switch = (ctx_end.voluntary + ctx_end.involuntary) - (ctx_start.voluntary + ctx_start.involuntary)
+    
+    return {
+        "text": tokenizer.decode(outputs[0], skip_special_tokens=True),
+        "latency": latency,
+        "throughput": throughput,
+        "ram": ram_usage,
+        "vram": vram_usage,
+        "ctx_switch": ctx_switch
+    }
+
+# ==========================================
+# 3. 실험 수행 (Baseline & Paged)
+# ==========================================
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+prompt = """### Instruction:\nIn this context, "LLM" means "Large Language Model". Explain it in one simple sentence that a university student can understand.\n### Response:\n"""
+
+# --- Baseline 측정 ---
+model_base = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16 if device=="cuda" else torch.float32, device_map=device)
+stats_base = measure_performance(model_base, tokenizer, prompt)
+del model_base
+gc.collect()
+if device == "cuda": torch.cuda.empty_cache()
+
+# --- PagedAttention 측정 ---
 from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
-from paged_llama.llama.memory.block_table import BlockTable
 
-def patch_llama():
-    model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
-    print(f">>> [1/3] 허깅페이스에서 Llama-3 로드 중... (쿠키 사용)")
+model_paged = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16 if device=="cuda" else torch.float32, device_map=device)
+config = model_paged.config
+pool = PagePool(num_blocks=1024, num_heads=config.num_key_value_heads, block_size=16, 
+                head_dim=config.hidden_size // config.num_attention_heads, device=device)
+
+for layer in model_paged.model.layers:
+    new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
+    new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
+    layer.self_attn = new_attn
+
+stats_paged = measure_performance(model_paged, tokenizer, prompt)
+
+# ==========================================
+# 4. 최종 결과 출력
+# ==========================================
+
+print("\n" + "="*60)
+print("[OUTPUT] PagedAttention Generation Result")
+print("="*60)
+print(stats_paged['text'])
+print("="*60 + "\n")
+
+print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged (Ours)':<15} |")
+print("-" * 62)
+print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
+print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
+print(f"{'RAM Usage (MB)':<25} | {stats_base['ram']:<15.1f} | {stats_paged['ram']:<15.1f} |")
+print(f"{'VRAM Usage (MB)':<25} | {stats_base['vram']:<15.1f} | {stats_paged['vram']:<15.1f} |")
+print(f"{'Context Switch':<25} | {stats_base['ctx_switch']:<15} | {stats_paged['ctx_switch']:<15} |")
+print("-" * 62)import torch
+import time
+import os
+import psutil
+import gc
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import login
+
+# ==========================================
+# 1. 설정 (모델 및 토큰)
+# ==========================================
+MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
+
+TOKEN = os.getenv("HF_TOKEN")
+if TOKEN:
+    login(token=TOKEN)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================================
+# 2. 성능 측정 엔진
+# ==========================================
+def measure_performance(model, tokenizer, prompt_text):
+    # 워밍업
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        model.generate(**inputs, max_new_tokens=1)
     
-    # 모델 로드
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float32,  # 안전하게 float32로 변경 (맥북 호환성)
-        device_map="auto",           # <--- 핵심! "메타 장치 말고 CPU에 실물 로딩해라"
-        #low_cpu_mem_usage=True,     # 메모리 효율화
-    )
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # 측정 시작 전 상태 기록
+    process = psutil.Process(os.getpid())
+    ram_start = process.memory_info().rss
+    ctx_start = process.num_ctx_switches()
+    vram_start = torch.cuda.memory_allocated() if device == "cuda" else 0
     
-    # PagePool 설정
-    pool = PagePool(
-        num_blocks=1024, 
-        num_heads=32, 
-        block_size=16, 
-        head_dim=128, 
-        device="cuda",  # <--- 여기를 "cpu"로 변경!
-        dtype=torch.float32
-    )
+    t0 = time.time()
+    
+    # 텍스트 생성 (120토큰)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=120,
+            do_sample=False,
+            use_cache=True
+        )
+    
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    
+    # 결과 계산
+    latency = t1 - t0
+    generated_tokens = outputs.shape[-1] - inputs.input_ids.shape[-1]
+    throughput = generated_tokens / latency
+    
+    ram_usage = (process.memory_info().rss - ram_start) / 1024 / 1024
+    vram_usage = (torch.cuda.memory_allocated() - vram_start) / 1024 / 1024 if device == "cuda" else 0
+    
+    ctx_end = process.num_ctx_switches()
+    ctx_switch = (ctx_end.voluntary + ctx_end.involuntary) - (ctx_start.voluntary + ctx_start.involuntary)
+    
+    return {
+        "text": tokenizer.decode(outputs[0], skip_special_tokens=True),
+        "latency": latency,
+        "throughput": throughput,
+        "ram": ram_usage,
+        "vram": vram_usage,
+        "ctx_switch": ctx_switch
+    }
 
-    print(f">>> [2/3] PagedAttention 부품 교체 시작...")
-    for i, layer in enumerate(model.model.layers):
-        new_attn = PagedLlamaAttention(config=model.config, layer_idx=i, page_pool=pool)
-        # 기존 가중치 그대로 이식
-        new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
-        layer.self_attn = new_attn
-        
-    print(f">>> [3/3] 엔진 교체 완료! 이제 Paged Attention으로 동작합니다.")
-    return model, pool
+# ==========================================
+# 3. 실험 수행 (Baseline & Paged)
+# ==========================================
 
-if __name__ == "__main__":
-    model, pool = patch_llama()
-    # 이후 테스트 추론 코드 추가 가능
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+prompt = """### Instruction:\nIn this context, "LLM" means "Large Language Model". Explain it in one simple sentence that a university student can understand.\n### Response:\n"""
+
+# --- Baseline 측정 ---
+model_base = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16 if device=="cuda" else torch.float32, device_map=device)
+stats_base = measure_performance(model_base, tokenizer, prompt)
+del model_base
+gc.collect()
+if device == "cuda": torch.cuda.empty_cache()
+
+# --- PagedAttention 측정 ---
+from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
+from paged_llama.llama.memory.page_pool import PagePool
+
+model_paged = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16 if device=="cuda" else torch.float32, device_map=device)
+config = model_paged.config
+pool = PagePool(num_blocks=1024, num_heads=config.num_key_value_heads, block_size=16, 
+                head_dim=config.hidden_size // config.num_attention_heads, device=device)
+
+for layer in model_paged.model.layers:
+    new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
+    new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
+    layer.self_attn = new_attn
+
+stats_paged = measure_performance(model_paged, tokenizer, prompt)
+
+# ==========================================
+# 4. 최종 결과 출력
+# ==========================================
+print("[OUTPUT] PagedAttention Generation Result")
+print(stats_paged['text'])
+
+print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged (Ours)':<15} |")
+print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
+print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
+print(f"{'RAM Usage (MB)':<25} | {stats_base['ram']:<15.1f} | {stats_paged['ram']:<15.1f} |")
+print(f"{'VRAM Usage (MB)':<25} | {stats_base['vram']:<15.1f} | {stats_paged['vram']:<15.1f} |")
+print(f"{'Context Switch':<25} | {stats_base['ctx_switch']:<15} | {stats_paged['ctx_switch']:<15} |")
