@@ -668,10 +668,14 @@ class PagedLlamaAttention(nn.Module):
         # key_states shape: [1, heads, 1, dim] -> squeeze -> [heads, dim]
         # PagedPool shape: [num_blocks, heads, block_size, dim]
         
-        # [Batch 0번 기준]
-        self.page_pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0].squeeze(0).squeeze(0)
-        self.page_pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0].squeeze(0).squeeze(0)
+        # 1. 마지막 토큰만 추출하여 [Heads, HeadDim] 형태로 만듭니다.
+        k_to_store = key_states[0, :, -1, :] # [4, 64]
+        v_to_store = value_states[0, :, -1, :] # [4, 64]
 
+        # 2. 캐시의 정해진 위치(물리 블록, 오프셋)에 딱 맞게 넣습니다.
+        self.page_pool.k_cache[physical_block_idx, :, block_offset, :] = k_to_store
+        self.page_pool.v_cache[physical_block_idx, :, block_offset, :] = v_to_store
+        
         # =================================================================
         # [핵심] 4. Paged KV Cache : READ (읽기) & Gather
         # =================================================================
