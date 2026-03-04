@@ -739,22 +739,22 @@ class PagedLlamaAttention(nn.Module):
         # V: [1, H, L, D]
         v = v_flat.unsqueeze(0)
         
-        # attn_weights의 타입(BFloat16)에 맞춰 v의 타입을 변경합니다.
-        # v 역시 캐시(PagePool)에서 불러온 데이터라 Float 타입일 확률이 높습니다.
-        
-        v = v.to(attn_weights.dtype) # v 타입을 attn_weights와 동일하게 맞춤
-        
+        # 1. v 타입을 attn_weights와 맞춤
+        v = v.to(attn_weights.dtype) 
         attn_output = torch.matmul(attn_weights, v)
 
+        # 2. 형태 변환 [B, H, 1, D] -> [B, 1, H, D] -> [B, 1, HiddenSize]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = attn_output.to(target_dtype) 
         
+        # 3. ★ [핵심] o_proj 가중치 타입(Half)으로 강제 변환
+        # 이 줄이 없으면 F.linear에서 float != Half 에러가 납니다.
+        attn_output = attn_output.to(self.o_proj.weight.dtype) 
+        
+        # 4. Output Projection 실행
         attn_output = self.o_proj(attn_output)
-        
-        target_dtype = self.q_proj.weight.dtype
-        attn_output = attn_output.to(target_dtype) 
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        # 5. 최종 반환 전 다시 한번 타입 확인 및 반환
+        attn_output = attn_output.to(self.o_proj.weight.dtype)
         
         return attn_output, None
