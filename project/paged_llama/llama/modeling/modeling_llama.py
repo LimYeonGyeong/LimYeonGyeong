@@ -706,54 +706,44 @@ class PagedLlamaAttention(nn.Module):
         k_flat = k_flat[:, :valid_seq_len, :]
         v_flat = v_flat[:, :valid_seq_len, :]
         
-        # Grouped Query Attention (GQA) 처리 (repeat_kv)
-        # Llama-2-7b 등에서는 num_kv_heads == num_heads이므로 변화 없음
-        k_flat = repeat_kv(k_flat.unsqueeze(0), self.num_key_value_groups).squeeze(0)
-        v_flat = repeat_kv(v_flat.unsqueeze(0), self.num_key_value_groups).squeeze(0)
+        # 1. 과거의 KV 캐시 데이터를 [Batch, Heads, Past_SeqLen, Dim] 형태로 준비
+        # k_flat/v_flat은 [heads, current_pos, dim] 형태임
+        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   # [1, H, current_pos, D]
+        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) # [1, H, current_pos, D]
 
-        # =================================================================
-        # 5. Attention Computation (Standard)
-        # =================================================================
-        # Q: [Batch, Heads, 1, Dim]
-        # K: [Heads, SeqLen, Dim] -> [Batch, Heads, SeqLen, Dim] (Transpose 필요)
-        
-        q = query_states  # [B, H, 1, D]
-        k = k_flat.unsqueeze(0).transpose(2, 3) # [1, H, D, L] -> [1, H, L, D] -> [1, H, D, L] ?? 확인필요
-        # Correct Matmul Shapes:
-        # Q: [B, Heads, 1, Dim]
-        # K_T: [B, Heads, Dim, SeqLen]
-        
-        k_t = k_flat.unsqueeze(0).transpose(2, 3) # [1, H, L, D] -> [1, H, D, L]
-        
-        # q의 타입(BFloat16 혹은 Float16)에 맞춰 k_t의 타입을 변경합니다.
-        # k_t가 캐시에서 불러오면서 타입이 튀었을 가능성이 높습니다.
-        
-        k_t = k_t.to(q.dtype) # k_t 타입을 q와 동일하게 맞춤
-        
-        attn_weights = torch.matmul(q, k_t) / math.sqrt(self.head_dim)
+        # 2. [핵심] 과거 데이터와 현재 생성된 토큰 데이터를 합침 (Concatenation)
+        # query_states: [1, H, 1, D]
+        # full_key_states: [1, H, current_pos + 1, D]
+        full_key_states = torch.cat([past_key_states, key_states], dim=2)
+        full_value_states = torch.cat([past_value_states, value_states], dim=2)
 
+        # 3. Attention Score 계산
+        # k_t: [1, H, D, full_seq_len]
+        k_t = full_key_states.transpose(2, 3)
+        attn_weights = torch.matmul(query_states, k_t) / math.sqrt(self.head_dim)
+
+        # 4. 마스크 처리 (현재 전체 길이에 맞춰 슬라이싱)
         if attention_mask is not None:
-            # Mask Shape 맞춰줘야 함 (생략 가능하거나 현재 길이에 맞춰 슬라이싱)
-            attn_weights = attn_weights + attention_mask
+            # attention_mask의 마지막 차원을 현재 full_key_states 길이에 맞춤
+            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
+        # 5. Softmax 및 가중치 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         
-        # V: [1, H, L, D]
-        v = v_flat.unsqueeze(0)
-        
-        # 1. v 타입을 attn_weights와 동일하게 맞춤 (float16/bfloat16)
-        v = v_flat.unsqueeze(0).to(attn_weights.dtype) 
-        attn_output = torch.matmul(attn_weights, v)
+        # 6. 최종 어텐션 출력 값 계산
+        # full_value_states: [1, H, full_seq_len, D]
+        attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 2. 형태 변환: [Batch, Heads, 1, Dim] -> [Batch, 1, HiddenSize]
+        # 7. 형태 및 타입 변환 (MLP 레이어 호환용)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
-        # 3. [★핵심★] o_proj 실행 전, 입력값을 o_proj 가중치 타입(Half)으로 강제 변환
-        # 여기서 안 맞추면 self.o_proj(attn_output) 호출 시 에러가 납니다.
-        attn_output = attn_output.to(self.o_proj.weight.dtype) 
+        # o_proj 가중치 타입에 맞춤
+        attn_output = attn_output.to(self.o_proj.weight.dtype)
         attn_output = self.o_proj(attn_output)
 
-        attn_output = attn_output.to(original_dtype)
+        # 최종 반환 전 모델 표준 타입으로 고정
+        attn_output = attn_output.to(self.q_proj.weight.dtype)
 
         return attn_output, None
