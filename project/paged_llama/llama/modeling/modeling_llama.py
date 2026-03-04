@@ -652,7 +652,11 @@ class PagedLlamaAttention(nn.Module):
         block_offset = current_pos % self.page_pool.block_size
         
         # Block Table을 통해 '물리적 블록 번호' 획득
-        physical_block_idx = block_table.get_physical_block_idx(current_pos)
+        pool = self.page_pool if self.page_pool is not None else self.pool
+        block_idx_logic = current_pos // pool.block_size
+        
+        # 텐서에서 직접 해당 위치의 블록 번호를 추출합니다.
+        physical_block_idx = block_table[0, block_idx_logic].item()        
         
         if physical_block_idx is None:
             # 아직 할당되지 않은 경우 (새 블록 필요) - 실제로는 스케줄러가 해야 함
