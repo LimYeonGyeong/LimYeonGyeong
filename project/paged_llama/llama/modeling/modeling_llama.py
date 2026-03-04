@@ -752,15 +752,14 @@ class PagedLlamaAttention(nn.Module):
         
         attn_output = self.o_proj(attn_output)
 
-        # 1. 계산된 결과(attn_output)의 차원을 [B, L, D] 형태로 먼저 정렬합니다.
-        # 이 과정에서 transpose가 일어나면 메모리 연속성이 깨지므로 .contiguous()를 붙입니다.
+        # 1. 결과값의 형태를 [Batch, SeqLen, HiddenSize]로 정렬
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        # 2. [가장 중요] MLP 레이어가 기대하는 타입(Half)으로 강제 변환합니다.
-        # self.q_proj.weight.dtype는 모델이 로드될 때 설정된 float16 혹은 bfloat16입니다.
+        # 2. [가장 중요] 다음 레이어(MLP)가 기대하는 Half(float16) 타입으로 강제 변환
+        # self.q_proj.weight.dtype은 모델 로드 시 설정된 타입(Half)입니다.
         target_dtype = self.q_proj.weight.dtype
         attn_output = attn_output.to(target_dtype)
 
-        # 3. Hugging Face Llama 구조에 맞게 (텐서, None) 튜플로 반환합니다.
-        return (attn_output, None)
+        # 3. 반환 형식을 (텐서, None) 튜플로 맞춤
+        return attn_output, None
