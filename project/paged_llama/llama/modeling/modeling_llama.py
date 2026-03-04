@@ -605,6 +605,9 @@ class PagedLlamaAttention(nn.Module):
         use_cache=False,
         **kwargs
     ):
+        hidden_states = hidden_states.to(self.q_proj.weight.dtype)
+        hidden_states = hidden_states.to(self.q_proj.weight.device)
+        
         if block_table is None and hasattr(self, 'pool'):
             # 실제 운영 환경에서는 스케줄러가 관리하지만, 테스트를 위해 풀의 인덱스를 활용합니다.
             device = self.q_proj.weight.device 
