@@ -598,8 +598,8 @@ class PagedLlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states,
-        position_ids,
-        block_table,  # [New] 블록 매핑 테이블 (필수 입력)
+        position_ids=None,
+        block_table=None,  # [New] 블록 매핑 테이블 (필수 입력)
         attention_mask=None,
         past_key_values=None, # 호환성을 위해 남겨두지만 사용하지 않음
         use_cache=False,
