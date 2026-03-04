@@ -599,27 +599,26 @@ class PagedLlamaAttention(nn.Module):
         self,
         hidden_states,
         position_ids=None,
-        block_table=None,  # [New] 블록 매핑 테이블 (필수 입력)
+        block_table=None,
         attention_mask=None,
-        past_key_values=None, # 호환성을 위해 남겨두지만 사용하지 않음
+        past_key_values=None,
         use_cache=False,
         **kwargs
     ):
+        # 1. 입력 타입/장치 고정
         target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
-        
-        hidden_states = hidden_states.to(self.q_proj.weight.dtype)
-        hidden_states = hidden_states.to(self.q_proj.weight.device)
+        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
 
-        if block_table is None and hasattr(self, 'pool'):
-            # 실제 운영 환경에서는 스케줄러가 관리하지만, 테스트를 위해 풀의 인덱스를 활용합니다.
-            device = self.q_proj.weight.device 
-            block_table = torch.arange(self.pool.num_blocks, device=device).view(1, -1)
+        # 2. 이름표 및 블록 테이블 설정
         if hasattr(self, 'pool'):
             self.page_pool = self.pool
+        if block_table is None and hasattr(self, 'pool'):
+            block_table = torch.arange(self.pool.num_blocks, device=target_device).view(1, -1)
+
         bsz, q_len, _ = hidden_states.size()
 
-        # 1. Q, K, V Projection
+        # 3. Projection 및 연산 (생략된 기존 로직 수행...)
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -752,14 +751,14 @@ class PagedLlamaAttention(nn.Module):
         
         attn_output = self.o_proj(attn_output)
 
-        # 1. 결과값의 형태를 [Batch, SeqLen, HiddenSize]로 정렬
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.to(target_dtype) 
+        
+        # 차원 맞추기 [Batch, Seq, Hidden]
+        if attn_output.dim() == 4: # [B, H, L, D] -> [B, L, H, D]
+            attn_output = attn_output.transpose(1, 2)
+        
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.to(target_dtype) # 다시 한번 확정
 
-        # 2. [가장 중요] 다음 레이어(MLP)가 기대하는 Half(float16) 타입으로 강제 변환
-        # self.q_proj.weight.dtype은 모델 로드 시 설정된 타입(Half)입니다.
-        target_dtype = self.q_proj.weight.dtype
-        attn_output = attn_output.to(target_dtype)
-
-        # 3. 반환 형식을 (텐서, None) 튜플로 맞춤
+        # 5. (출력물, None) 형태로 반환
         return attn_output, None
