@@ -675,14 +675,14 @@ class PagedLlamaAttention(nn.Module):
         # 2. 캐시의 정해진 위치(물리 블록, 오프셋)에 딱 맞게 넣습니다.
         self.page_pool.k_cache[physical_block_idx, :, block_offset, :] = k_to_store
         self.page_pool.v_cache[physical_block_idx, :, block_offset, :] = v_to_store
-        
+
         # =================================================================
         # [핵심] 4. Paged KV Cache : READ (읽기) & Gather
         # =================================================================
         # 어텐션 연산을 위해 흩어진 블록들을 모아옵니다.
         
         # 1) 현재 문장이 사용 중인 모든 물리 블록 번호 가져오기
-        active_indices = block_table.get_all_blocks()
+        active_indices = block_table[0]
         
         # 2) PagedPool에서 해당 블록들만 인덱싱 (GPU 연산)
         # Shape: [num_active_blocks, num_kv_heads, block_size, head_dim]
