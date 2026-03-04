@@ -605,6 +605,8 @@ class PagedLlamaAttention(nn.Module):
         use_cache=False,
         **kwargs
     ):
+        if block_table is None and hasattr(self, 'pool'):
+            block_table = self.pool.block_table
         bsz, q_len, _ = hidden_states.size()
 
         # 1. Q, K, V Projection
