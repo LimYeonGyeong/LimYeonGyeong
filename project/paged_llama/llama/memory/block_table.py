@@ -1,4 +1,6 @@
 # paged_llama/llama/memory/block_table.py
+import torch
+
 class BlockTable:
     def __init__(self, block_size):
         self.block_size = block_size
@@ -16,3 +18,6 @@ class BlockTable:
 
     def get_all_blocks(self):
         return self.physical_blocks
+    
+    def __getitem__(self, idx):
+        return torch.tensor(self.physical_blocks, device="cuda")

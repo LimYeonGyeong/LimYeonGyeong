@@ -102,6 +102,7 @@ if device == "cuda": torch.cuda.empty_cache()
 print(">>> PagedAttention 로딩 및 패치 중...")
 from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
+from paged_llama.llama.memory.block_table import BlockTable
 
 model_paged = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, 
@@ -117,11 +118,16 @@ pool = PagePool(
     device=device
 )
 
+table = BlockTable(block_size=16)
+first_block = pool.allocate() 
+table.add_block(first_block)
+
 for layer in model_paged.model.layers:
     new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
     new_attn.to(device)
     new_attn.pool = pool
+    new_attn.block_table = table
     layer.self_attn = new_attn
 
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
