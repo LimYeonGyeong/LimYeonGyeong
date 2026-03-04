@@ -721,6 +721,11 @@ class PagedLlamaAttention(nn.Module):
         
         k_t = k_flat.unsqueeze(0).transpose(2, 3) # [1, H, L, D] -> [1, H, D, L]
         
+        # q의 타입(BFloat16 혹은 Float16)에 맞춰 k_t의 타입을 변경합니다.
+        # k_t가 캐시에서 불러오면서 타입이 튀었을 가능성이 높습니다.
+        
+        k_t = k_t.to(q.dtype) # k_t 타입을 q와 동일하게 맞춤
+        
         attn_weights = torch.matmul(q, k_t) / math.sqrt(self.head_dim)
         
         if attention_mask is not None:
