@@ -120,6 +120,7 @@ pool = PagePool(
 for layer in model_paged.model.layers:
     new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
+    new_attn.to(device)
     new_attn.pool = pool
     layer.self_attn = new_attn
 
