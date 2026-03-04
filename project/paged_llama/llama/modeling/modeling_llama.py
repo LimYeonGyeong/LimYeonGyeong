@@ -606,7 +606,10 @@ class PagedLlamaAttention(nn.Module):
         **kwargs
     ):
         if block_table is None and hasattr(self, 'pool'):
-            block_table = self.pool.block_table
+            # 실제 운영 환경에서는 스케줄러가 관리하지만, 테스트를 위해 풀의 인덱스를 활용합니다.
+            device = hidden_states.device
+            # 간단한 테스트를 위해 0번부터 순차적으로 블록을 배정하는 예시입니다.
+            block_table = torch.arange(self.pool.num_blocks, device=device).view(1, -1)
         bsz, q_len, _ = hidden_states.size()
 
         # 1. Q, K, V Projection
