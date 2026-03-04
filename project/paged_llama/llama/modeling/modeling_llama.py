@@ -706,16 +706,16 @@ class PagedLlamaAttention(nn.Module):
         k_flat = k_flat[:, :valid_seq_len, :]
         v_flat = v_flat[:, :valid_seq_len, :]
         
-       # 1. 과거의 KV 캐시 데이터를 준비 ([1, KV_H, past_len, D])
+        # 1. 과거의 KV 캐시 데이터를 준비 ([1, 4, past_len, D])
         past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   
         past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) 
 
-        # 2. [★핵심 수정★] 결합(torch.cat) 전에 헤드 수를 먼저 맞춥니다.
-        # 4개뿐인 과거 KV 헤드를 32개(Query 헤드 수)로 복제합니다.
+        # 2. [★핵심 수정★] 결합(torch.cat) 전에 헤드 수를 먼저 32개로 복제합니다.
+        # self.num_key_value_groups (TinyLlama의 경우 8) 만큼 반복하여 4 -> 32로 확장
         past_key_states = repeat_kv(past_key_states, self.num_key_value_groups)   # [1, 32, past_len, D]
         past_value_states = repeat_kv(past_value_states, self.num_key_value_groups) # [1, 32, past_len, D]
 
-        # 3. 이제 헤드 수(Dim 1)가 32로 동일하므로 안전하게 합칩니다.
+        # 3. 이제 헤드 수(Dimension 1)가 32로 동일하므로 에러 없이 합칠 수 있습니다.
         # past_key_states: [1, 32, past_len, D] + key_states: [1, 32, 1, D]
         full_key_states = torch.cat([past_key_states, key_states], dim=2)     # [1, 32, full_len, D]
         full_value_states = torch.cat([past_value_states, value_states], dim=2) # [1, 32, full_len, D]
@@ -724,12 +724,11 @@ class PagedLlamaAttention(nn.Module):
         k_t = full_key_states.transpose(2, 3) # [1, 32, D, full_len]
         attn_weights = torch.matmul(query_states, k_t) / math.sqrt(self.head_dim)
         
-        # 5. 마스크 처리 (현재 전체 길이에 맞춰 슬라이싱)
+        # 5. 마스크 처리 및 Softmax 연산
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # 6. Softmax 및 최종 값 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
