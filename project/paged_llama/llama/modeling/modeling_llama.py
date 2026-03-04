@@ -605,6 +605,9 @@ class PagedLlamaAttention(nn.Module):
         use_cache=False,
         **kwargs
     ):
+        target_dtype = self.q_proj.weight.dtype
+        target_device = self.q_proj.weight.device
+        
         hidden_states = hidden_states.to(self.q_proj.weight.dtype)
         hidden_states = hidden_states.to(self.q_proj.weight.device)
 
