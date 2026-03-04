@@ -727,7 +727,7 @@ class PagedLlamaAttention(nn.Module):
         k_t = k_t.to(q.dtype) # k_t 타입을 q와 동일하게 맞춤
         
         attn_weights = torch.matmul(q, k_t) / math.sqrt(self.head_dim)
-        
+
         if attention_mask is not None:
             # Mask Shape 맞춰줘야 함 (생략 가능하거나 현재 길이에 맞춰 슬라이싱)
             attn_weights = attn_weights + attention_mask
@@ -737,7 +737,12 @@ class PagedLlamaAttention(nn.Module):
         # V: [1, H, L, D]
         v = v_flat.unsqueeze(0)
         
-        attn_output = torch.matmul(attn_weights, v) # [B, H, 1, L] @ [B, H, L, D] -> [B, H, 1, D]
+        # attn_weights의 타입(BFloat16)에 맞춰 v의 타입을 변경합니다.
+        # v 역시 캐시(PagePool)에서 불러온 데이터라 Float 타입일 확률이 높습니다.
+        
+        v = v.to(attn_weights.dtype) # v 타입을 attn_weights와 동일하게 맞춤
+        
+        attn_output = torch.matmul(attn_weights, v)
         
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
