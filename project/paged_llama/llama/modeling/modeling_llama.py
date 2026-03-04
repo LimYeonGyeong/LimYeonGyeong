@@ -607,7 +607,7 @@ class PagedLlamaAttention(nn.Module):
     ):
         target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
-        
+
         hidden_states = hidden_states.to(self.q_proj.weight.dtype)
         hidden_states = hidden_states.to(self.q_proj.weight.device)
 
@@ -752,6 +752,9 @@ class PagedLlamaAttention(nn.Module):
         
         attn_output = self.o_proj(attn_output)
 
-        attn_output = attn_output.to(self.q_proj.weight.dtype)
-        
-        return attn_output, None
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        # 3. Hugging Face Llama 모델이 기대하는 튜플 형태로 반환합니다.
+        # (결과값, None) 형태이며, 결과값은 반드시 target_dtype이어야 합니다.
+        return (attn_output, None)
