@@ -9,7 +9,7 @@ from huggingface_hub import login
 # ==========================================
 # 1. 설정 (모델 및 토큰)
 # ==========================================
-MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 # 토큰 설정 (환경변수 또는 직접 입력)
 TOKEN = os.getenv("HF_TOKEN")
