@@ -740,21 +740,25 @@ class PagedLlamaAttention(nn.Module):
         v = v_flat.unsqueeze(0)
         
         # 1. v 타입을 attn_weights와 맞춤
-        v = v.to(attn_weights.dtype) 
+        # 1. v 타입을 attn_weights와 맞춤
+        v = v_flat.unsqueeze(0).to(attn_weights.dtype) 
         attn_output = torch.matmul(attn_weights, v)
 
-        # 2. 형태 변환 [B, H, 1, D] -> [B, 1, H, D] -> [B, 1, HiddenSize]
+        # 2. 형태 변환: [B, H, 1, D] -> [B, 1, H, D] -> [B, 1, HiddenSize]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
-        # 3. ★ [핵심] o_proj 가중치 타입(Half)으로 강제 변환
-        # 이 줄이 없으면 F.linear에서 float != Half 에러가 납니다.
+        # 3. [중요] o_proj 실행 전, 입력값을 o_proj 가중치 타입(Half)으로 변환
+        # 이 과정이 누락되면 o_proj 내부 F.linear에서 에러가 납니다.
         attn_output = attn_output.to(self.o_proj.weight.dtype) 
         
-        # 4. Output Projection 실행
+        # 4. o_proj 실행 (Attention의 마지막 선형 투사)
         attn_output = self.o_proj(attn_output)
 
-        # 5. 최종 반환 전 다시 한번 타입 확인 및 반환
-        attn_output = attn_output.to(self.o_proj.weight.dtype)
+        # 5. [★최종 방어막★] 
+        # Attention 레이어 전체의 결과값을 모델 표준 타입(Half)으로 강제 고정하여 반환합니다.
+        # 그래야 다음 순서인 MLP(gate_proj, down_proj)가 에러 없이 작동합니다.
+        target_dtype = self.q_proj.weight.dtype
+        attn_output = attn_output.to(target_dtype)
         
         return attn_output, None
