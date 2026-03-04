@@ -749,4 +749,6 @@ class PagedLlamaAttention(nn.Module):
         
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None # past_key_values는 더 이상 반환하지 않음 (None)
+        attn_output = attn_output.to(self.q_proj.weight.dtype)
+        
+        return attn_output, None
