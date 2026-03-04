@@ -708,20 +708,24 @@ class PagedLlamaAttention(nn.Module):
         
         # 1. 과거의 KV 캐시 데이터를 [Batch, Heads, Past_SeqLen, Dim] 형태로 준비
         # k_flat/v_flat은 [heads, current_pos, dim] 형태임
-        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   # [1, H, current_pos, D]
-        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) # [1, H, current_pos, D]
+        # 1. 과거의 KV 캐시 데이터를 준비
+        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   # [1, KV_H, current_pos, D]
+        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) # [1, KV_H, current_pos, D]
 
-        # 2. [핵심] 과거 데이터와 현재 생성된 토큰 데이터를 합침 (Concatenation)
-        # query_states: [1, H, 1, D]
-        # full_key_states: [1, H, current_pos + 1, D]
+        # 2. [추가] GQA 처리를 위해 KV 헤드 수를 Query 헤드 수(32개)에 맞게 복제합니다.
+        # 이 과정을 거쳐야 [1, 32, Seq, D] 형태가 되어 연산이 가능해집니다.
+        past_key_states = repeat_kv(past_key_states, self.num_key_value_groups)
+        past_value_states = repeat_kv(past_value_states, self.num_key_value_groups)
+
+        # 3. 과거 데이터와 현재 생성된 토큰 데이터를 합침
+        # 이제 두 텐서 모두 헤드 수가 self.num_heads(32)로 일치합니다.
         full_key_states = torch.cat([past_key_states, key_states], dim=2)
         full_value_states = torch.cat([past_value_states, value_states], dim=2)
 
-        # 3. Attention Score 계산
-        # k_t: [1, H, D, full_seq_len]
+        # 4. Attention Score 계산 (이제 32 == 32가 되어 에러가 사라집니다)
         k_t = full_key_states.transpose(2, 3)
         attn_weights = torch.matmul(query_states, k_t) / math.sqrt(self.head_dim)
-
+        
         # 4. 마스크 처리 (현재 전체 길이에 맞춰 슬라이싱)
         if attention_mask is not None:
             # attention_mask의 마지막 차원을 현재 full_key_states 길이에 맞춤
