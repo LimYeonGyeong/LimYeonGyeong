@@ -743,10 +743,10 @@ class PagedLlamaAttention(nn.Module):
         v = v.to(attn_weights.dtype) # v 타입을 attn_weights와 동일하게 맞춤
         
         attn_output = torch.matmul(attn_weights, v)
-        
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights, None # past_key_values는 더 이상 반환하지 않음 (None)
+        return attn_output, None # past_key_values는 더 이상 반환하지 않음 (None)
