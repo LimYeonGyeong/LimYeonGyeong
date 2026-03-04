@@ -748,17 +748,13 @@ class PagedLlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        
-        attn_output = self.o_proj(attn_output)
 
         attn_output = attn_output.to(target_dtype) 
         
-        # 차원 맞추기 [Batch, Seq, Hidden]
-        if attn_output.dim() == 4: # [B, H, L, D] -> [B, L, H, D]
-            attn_output = attn_output.transpose(1, 2)
+        attn_output = self.o_proj(attn_output)
         
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        attn_output = attn_output.to(target_dtype) # 다시 한번 확정
-
-        # 5. (출력물, None) 형태로 반환
+        target_dtype = self.q_proj.weight.dtype
+        attn_output = attn_output.to(target_dtype) 
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        
         return attn_output, None
