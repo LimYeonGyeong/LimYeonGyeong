@@ -129,7 +129,7 @@ for i, layer in enumerate(model_paged.model.layers):
     # [중요] 텐서로 변환하여 주입
     new_attn.block_table = layer_table.to_tensor(device=device) 
     layer.self_attn = new_attn
-    
+
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
 # ==========================================
 # 4. 최종 결과 출력 (수정된 Key 반영)
@@ -140,13 +140,12 @@ print("[OUTPUT] PagedAttention Generation Result")
 print(stats_paged['text'])
 print("="*60 + "\n")
 
-print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged (Ours)':<15} |")
+print(f"{'Metric':<25} | {'nomal':<15} | {'Paged':<15} |")
 print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
 print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
 
-# [수정] 'ram' 대신 'total_ram' 또는 'ram_usage' 사용
 print(f"{'Total RAM (MB)':<25} | {stats_base['total_ram']:<15.1f} | {stats_paged['total_ram']:<15.1f} |")
-# [수정] 'vram' 대신 'peak_vram' 사용
+
 print(f"{'Peak VRAM (MB)':<25} | {stats_base['peak_vram']:<15.1f} | {stats_paged['peak_vram']:<15.1f} |")
 
 print(f"{'Context Switch':<25} | {stats_base['ctx_switch']:<15} | {stats_paged['ctx_switch']:<15} |")
