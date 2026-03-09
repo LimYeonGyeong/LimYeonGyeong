@@ -592,7 +592,7 @@ class PagedLlamaAttention(nn.Module):
         **kwargs
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # 1. 초기 설정 및 타입 고정 (MLP 에러 방지)
+        # 1. 초기 설정 및 타입 고정
         original_dtype = hidden_states.dtype
         target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
@@ -603,7 +603,6 @@ class PagedLlamaAttention(nn.Module):
         # 2. PagePool 및 BlockTable 확보
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
         if block_table is None and pool is not None:
-            # 레이어 간섭 방지를 위해 layer_idx 기반 오프셋 적용
             layer_offset = self.layer_idx * 100
             block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
 
@@ -612,26 +611,30 @@ class PagedLlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # RoPE 적용 (위치 정보 추가)
         if "position_embeddings" in kwargs:
             cos, sin = kwargs["position_embeddings"]
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE
-        start_pos = position_ids.flatten()[0].item() if position_ids is not None else 0
+        # [★핵심 수정] 4. Paged KV Cache : WRITE (안전 인덱싱)
+        if position_ids is not None:
+            start_pos = position_ids.reshape(-1)[0].item()
+        else:
+            start_pos = 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # 안전한 인덱싱으로 CUDA Assert 방지
+            # block_table의 가로 크기를 넘지 않도록 제한
             safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
-            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+            # 물리 블록 번호가 실제 캐시 크기(num_blocks) 내에 있는지 확인
+            if physical_block_idx < pool.k_cache.size(0):
+                pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+                pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
         # 5. Paged KV Cache : READ (Gather & GQA Expansion)
         active_indices = block_table[0]
@@ -640,28 +643,23 @@ class PagedLlamaAttention(nn.Module):
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # 데이터 정렬 및 타입 변환
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
         
-        total_len = start_pos + q_len
-        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)
-        full_value_states = v_flat[:, :total_len, :].unsqueeze(0)
+        full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
+        full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
         
-        # [GQA 처리] 4헤드를 32헤드로 확장
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 6. Attention 연산
+        # 6. Attention & Output
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(query_states.dtype)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 7. 출력 형태 및 타입 복원 (MLP 레이어 호환)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
