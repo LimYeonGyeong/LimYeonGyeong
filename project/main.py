@@ -111,7 +111,7 @@ model_paged = AutoModelForCausalLM.from_pretrained(
 )
 config = model_paged.config
 pool = PagePool(
-    num_blocks=1024, 
+    num_blocks=2500, 
     num_heads=config.num_key_value_heads, 
     block_size=16, 
     head_dim=config.hidden_size // config.num_attention_heads, 
