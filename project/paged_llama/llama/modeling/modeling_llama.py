@@ -592,12 +592,16 @@ class PagedLlamaAttention(nn.Module):
         **kwargs
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # [핵심 1] 시작하자마자 원래 타입(Half/BFloat16)을 저장합니다.
-        original_dtype = self.q_proj.weight.dtype
+        # [★핵심 추가] 변수 정의부
+        # 모델 가중치의 타입을 target_dtype으로 지정하여 이후 연산에서 참조할 수 있게 합니다.
+        target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
+        original_dtype = hidden_states.dtype # MLP 레이어 복구용
         
-        # 입력값을 모델 가중치 타입으로 강제 통일
-        hidden_states = hidden_states.to(dtype=original_dtype, device=target_device)
+        bsz, q_len, _ = hidden_states.size()
+        
+        # 입력 데이터를 가중치 타입으로 통일
+        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
         bsz, q_len, _ = hidden_states.size()
         
         # 1. PagePool 및 BlockTable 설정
