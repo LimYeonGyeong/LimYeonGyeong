@@ -597,16 +597,15 @@ class PagedLlamaAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,        # 이름 확인!
+        hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
         block_table: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
-        **kwargs                            # 예상치 못한 인자들을 받아내기 위해 필수
+        **kwargs
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # 여기서부터 아까 드린 로직(Projection, RoPE, Paged Write/Read 등)이 시작됩니다.
         original_dtype = hidden_states.dtype
         bsz, q_len, _ = hidden_states.size()
         
@@ -615,71 +614,73 @@ class PagedLlamaAttention(nn.Module):
         target_device = self.q_proj.weight.device
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
 
-        # 2. Projection (Q, K, V 생성)
+        # [수정 핵심] 2. block_table이 None일 경우에 대한 예외 처리
+        pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
+        if block_table is None:
+            if pool is not None:
+                # 실험 환경: Pool의 블록들을 순차적으로 사용하는 기본 테이블 생성
+                block_table = torch.arange(pool.num_blocks, device=target_device).view(1, -1)
+            else:
+                raise ValueError("PagedAttention을 실행하려면 PagePool 또는 BlockTable이 필요합니다.")
+
+        # 3. Projection (Q, K, V 생성)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # RoPE 적용 (위치 임베딩)
+        # RoPE 적용
         if "position_embeddings" in kwargs:
             cos, sin = kwargs["position_embeddings"]
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # =================================================================
-        # [핵심] 3. Paged KV Cache : WRITE (모든 토큰 저장)
+        # [핵심] 4. Paged KV Cache : WRITE (모든 토큰 저장)
         # =================================================================
-        pool = self.page_pool if self.page_pool is not None else self.pool
         start_pos = position_ids[0, 0].item() 
         
-        # [수정] 프롬프트 단계(q_len > 1)에서도 모든 토큰을 루프 돌며 저장해야 합니다.
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # Block Table에서 해당 위치의 물리적 블록 번호를 찾음
+            # 주소록(block_table)에서 실제 창고 번호(physical_block_idx)를 찾음
             physical_block_idx = block_table[0, block_idx_logic].item()
             
-            # i번째 토큰의 K, V를 캐시에 저장
             pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :]
             pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :]
 
         # =================================================================
-        # [핵심] 4. Paged KV Cache : READ (Gather & Align)
+        # [핵심] 5. Paged KV Cache : READ (Gather & Align)
         # =================================================================
-        # 현재까지 사용된 모든 블록 번호들
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
         
-        # 블록 단위로 흩어진 데이터를 가져옴
-        k_blocks = pool.k_cache.index_select(0, block_indices_tensor) # [num_blocks, KV_H, B_Size, D]
-        v_blocks = pool.v_cache.index_select(0, block_indices_tensor) # [num_blocks, KV_H, B_Size, D]
+        k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
+        v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # [★매우 중요] transpose(0, 1)을 해야 헤드 순서가 유지된 채 시퀀스가 정렬됩니다.
+        # 데이터 정렬 (헤드가 섞이지 않도록 transpose 사용)
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
-        # 현재 실제 길이만큼 슬라이싱
         total_len = start_pos + q_len
-        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)   # [1, 4, total_len, 64]
-        full_value_states = v_flat[:, :total_len, :].unsqueeze(0) # [1, 4, total_len, 64]
+        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)
+        full_value_states = v_flat[:, :total_len, :].unsqueeze(0)
         
         # GQA 처리 (4헤드 -> 32헤드 확장)
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 5. Attention 연산
+        # 6. Attention 연산
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            # 마스크 길이를 현재 문맥 전체 길이에 맞춤
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 6. 최종 출력 형태 복원 (mat1, mat2 shape 에러 해결)
+        # 7. 최종 출력 형태 복원
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
