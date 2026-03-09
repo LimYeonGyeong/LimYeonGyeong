@@ -611,59 +611,42 @@ class PagedLlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # RoPE 적용 (위치 임베딩)
         if "position_embeddings" in kwargs:
             cos, sin = kwargs["position_embeddings"]
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE (안전한 인덱싱 및 경계 체크)
-        if position_ids is not None and position_ids.numel() > 0:
-            # [수정] flatten() 대신 reshape(-1)을 사용하여 안전하게 위치 추출
-            start_pos = position_ids.reshape(-1)[0].item()
-        else:
-            start_pos = 0
+        # 4. Paged KV Cache : WRITE
+        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★핵심 수정] block_table의 범위를 절대 넘지 않도록 제한
-            if block_table is None or block_table.size(1) == 0:
-                break
-                
-            # 논리 인덱스가 테이블 크기를 넘지 않도록 clamp (CUDA Assert 방지)
-            max_logic_idx = block_table.size(1) - 1
-            safe_logic_idx = min(block_idx_logic, max_logic_idx)
-            
+            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
-            # [★핵심 수정] 물리 주소가 실제 PagePool 크기 내에 있는지 확인
             if physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (레이어 격리 및 데이터 복원)
-        # 각 레이어는 자기의 layer_idx에 할당된 블록 번호만 읽어야 합니다.
-        layer_offset = self.layer_idx * 100
+        # 5. Paged KV Cache : READ (역사적 문맥 복원)
+        total_seq_len = start_pos + q_len
+        num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
-        # 현재까지 생성된 토큰 수에 필요한 논리적 블록 개수 계산
-        num_needed_blocks = (start_pos + q_len + pool.block_size - 1) // pool.block_size
-        
-        # [★핵심] block_table에서 해당 레이어의 물리 주소만 정확히 슬라이싱
         active_indices = block_table[0, :num_needed_blocks]
         block_indices_tensor = active_indices.to(pool.device)
 
-        # 물리 창고에서 데이터 Gather
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # [★핵심] 데이터를 다시 모델 연산 타입(Half/BFloat16)으로 정밀하게 복원
+        # [데이터 정렬] 블록들을 하나의 연속된 시퀀스로 결합
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         
-        # 현재 시퀀스 길이만큼만 잘라서 사용
-        total_seq_len = start_pos + q_len
+        # 현재까지의 모든 토큰(Prompt + Generated) 추출
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
         
@@ -671,17 +654,19 @@ class PagedLlamaAttention(nn.Module):
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 6. Attention 연산 (정의된 full_key_states 사용)
+        # 6. Attention 연산
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        # 6. Attention & Output
-        attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # [수정] 마스크 적용 (문맥 보호)
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(query_states.dtype)
+            # attention_mask의 길이를 full_key_states에 맞춰 슬라이싱
+            mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
+            attn_weights = attn_weights + mask_slice
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
+        # 7. 출력 복원
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
