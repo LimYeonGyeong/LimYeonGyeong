@@ -1,4 +1,3 @@
-# paged_llama/llama/memory/block_table.py
 import torch
 
 class BlockTable:
@@ -9,15 +8,14 @@ class BlockTable:
     def add_block(self, physical_block_idx):
         self.physical_blocks.append(physical_block_idx)
 
-    def get_physical_block_idx(self, logical_token_idx):
-        """토큰 번호(예: 50번째)를 주면 해당 토큰이 담길 물리 블록 번호를 알려줍니다."""
-        block_idx = logical_token_idx // self.block_size
-        if block_idx < len(self.physical_blocks):
-            return self.physical_blocks[block_idx]
-        return None
+    # modeling_llama.py의 .size(1) 및 [0, idx] 접근을 지원하기 위한 메서드
+    def to_tensor(self, device="cuda"):
+        if not self.physical_blocks:
+            # 비어있을 경우 안전하게 기본 블록 할당 (에러 방지)
+            return torch.zeros((1, 1), dtype=torch.long, device=device)
+        # (1, num_blocks) 형태의 2차원 텐서로 반환해야 .size(1) 연산이 가능합니다.
+        return torch.tensor(self.physical_blocks, device=device).unsqueeze(0)
 
-    def get_all_blocks(self):
-        return self.physical_blocks
-    
     def __getitem__(self, idx):
-        return torch.tensor(self.physical_blocks, device="cuda")
+        # 텐서처럼 동작하게 하려면 내부 리스트를 텐서로 바꿔서 반환
+        return self.to_tensor()
