@@ -618,7 +618,7 @@ class PagedLlamaAttention(nn.Module):
 
         # 4. Paged KV Cache : WRITE (안전한 인덱싱 및 경계 체크)
         if position_ids is not None and position_ids.numel() > 0:
-            # position_ids에서 현재 위치를 안전하게 추출
+            # [수정] flatten() 대신 reshape(-1)을 사용하여 안전하게 위치 추출
             start_pos = position_ids.reshape(-1)[0].item()
         else:
             start_pos = 0
@@ -628,20 +628,18 @@ class PagedLlamaAttention(nn.Module):
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★핵심 수정] block_table의 유효성 및 범위 검사
+            # [★핵심 수정] block_table의 범위를 절대 넘지 않도록 제한
             if block_table is None or block_table.size(1) == 0:
                 break
                 
-            # 논리 인덱스가 테이블 크기를 넘지 않도록 제한 (CUDA Assert 방지)
+            # 논리 인덱스가 테이블 크기를 넘지 않도록 clamp (CUDA Assert 방지)
             max_logic_idx = block_table.size(1) - 1
             safe_logic_idx = min(block_idx_logic, max_logic_idx)
             
-            # 실제 물리 블록 번호 추출
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
             # [★핵심 수정] 물리 주소가 실제 PagePool 크기 내에 있는지 확인
             if physical_block_idx < pool.k_cache.size(0):
-                # 데이터 타입을 맞추어 안전하게 저장
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
