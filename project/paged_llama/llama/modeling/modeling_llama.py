@@ -706,17 +706,17 @@ class PagedLlamaAttention(nn.Module):
         k_flat = k_flat[:, :valid_seq_len, :]
         v_flat = v_flat[:, :valid_seq_len, :]
         
-        # 1. 과거의 KV 캐시 데이터를 준비 ([1, 4, past_len, D])
-        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   
-        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) 
+        # 1. 과거의 KV 캐시 데이터를 읽어옵니다. (현재 4개 헤드 상태)
+        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   # [1, 4, past_len, D]
+        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) # [1, 4, past_len, D]
 
-        # 2. [★핵심 수정★] 결합(torch.cat) 전에 헤드 수를 먼저 32개로 복제합니다.
-        # self.num_key_value_groups (TinyLlama의 경우 8) 만큼 반복하여 4 -> 32로 확장
+        # 2. [★가장 중요★] torch.cat 하기 전에 무조건 repeat_kv를 먼저 해야 합니다.
+        # 4개의 헤드를 32개로 확장합니다. (num_key_value_groups=8)
         past_key_states = repeat_kv(past_key_states, self.num_key_value_groups)   # [1, 32, past_len, D]
         past_value_states = repeat_kv(past_value_states, self.num_key_value_groups) # [1, 32, past_len, D]
 
-        # 3. 이제 헤드 수(Dimension 1)가 32로 동일하므로 에러 없이 합칠 수 있습니다.
-        # past_key_states: [1, 32, past_len, D] + key_states: [1, 32, 1, D]
+        # 3. 이제 둘 다 32개 헤드이므로 안전하게 합칠 수 있습니다.
+        # key_states: [1, 32, 1, D] 와 past_key_states: [1, 32, past_len, D] 결합
         full_key_states = torch.cat([past_key_states, key_states], dim=2)     # [1, 32, full_len, D]
         full_value_states = torch.cat([past_value_states, value_states], dim=2) # [1, 32, full_len, D]
 
