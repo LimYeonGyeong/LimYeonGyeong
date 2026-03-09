@@ -644,23 +644,26 @@ class PagedLlamaAttention(nn.Module):
                 # 데이터 타입 일치화(.to)와 함께 캐시 저장
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-                
+
         # 5. Paged KV Cache : READ (Gather & GQA Expansion)
         active_indices = block_table[0]
-        block_indices_tensor = torch.tensor(active_indices, device=pool.device)
         
+        # [★핵심 수정] 유효한 블록 인덱스만 필터링 (0 이상의 값만 참조)
+        # 만약 block_table에 -1이나 잘못된 큰 값이 섞여 있으면 여기서 걸러냅니다.
+        num_phys_blocks = pool.k_cache.size(0)
+        valid_mask = (active_indices >= 0) & (active_indices < num_phys_blocks)
+        active_indices = active_indices[valid_mask]
+        
+        if len(active_indices) == 0:
+            # 참조할 블록이 없으면 최소한 0번 블록이라도 참조하게 하여 에러 방지
+            active_indices = torch.tensor([0], device=pool.device)
+
+        block_indices_tensor = active_indices.to(pool.device)
+        
+        # 이제 안전하게 index_select를 수행할 수 있습니다.
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
-        
-        full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
-        full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
-        
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
-
         # 6. Attention & Output
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:
