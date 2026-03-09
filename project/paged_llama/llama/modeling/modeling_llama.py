@@ -616,26 +616,41 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # [★핵심 수정] 4. Paged KV Cache : WRITE (안전 인덱싱)
-        if position_ids is not None:
+        # [방어적 수정] 4. Paged KV Cache : WRITE
+        # position_ids가 존재하고 요소가 있는지 엄격히 체크
+        if position_ids is not None and position_ids.numel() > 0:
             start_pos = position_ids.reshape(-1)[0].item()
         else:
-            start_pos = 0
-        
+            # position_ids가 비어있을 경우 (드문 케이스) 0으로 초기화하거나 캐시 위치 참조
+            start_pos = getattr(self, 'cache_position', 0)
+            if isinstance(start_pos, torch.Tensor):
+                start_pos = start_pos.item()
+
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # block_table의 가로 크기를 넘지 않도록 제한
-            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
+            # [★핵심] block_table의 유효성 및 범위 검사
+            if block_table is None or block_table.size(1) == 0:
+                # 테이블이 없으면 연산 중단 (CUDA Assert 방지)
+                break
+                
+            max_logic_idx = block_table.size(1) - 1
+            safe_logic_idx = min(block_idx_logic, max_logic_idx)
+            
+            # 실제 물리 블록 번호 추출
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
-            # 물리 블록 번호가 실제 캐시 크기(num_blocks) 내에 있는지 확인
+            # [★핵심] 캐시 메모리 경계 검사
             if physical_block_idx < pool.k_cache.size(0):
+                # 데이터 타입 일치화 (.to) 포함
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-
+            else:
+                # 범위를 벗어난 물리 주소 접근 차단
+                continue
+            
         # 5. Paged KV Cache : READ (Gather & GQA Expansion)
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
