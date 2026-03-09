@@ -608,11 +608,28 @@ class PagedLlamaAttention(nn.Module):
         
         original_dtype = hidden_states.dtype
         bsz, q_len, _ = hidden_states.size()
-        
-        # 1. 입력 타입/장치 설정
+        target_device = hidden_states.device
+
+        # [수정 핵심] 1. block_table 및 pool 안전하게 확보
+        # 클래스에 pool이 있는지, 혹은 page_pool이 있는지 확인합니다.
+        pool = getattr(self, 'page_pool', None)
+        if pool is None:
+            pool = getattr(self, 'pool', None)
+
+        # block_table이 None으로 들어왔다면 강제로 기본 테이블을 생성합니다.
+        if block_table is None:
+            if pool is not None:
+                # 레이어 간섭 방지를 위해 layer_idx 기반 오프셋 적용
+                layer_offset = getattr(self, 'layer_idx', 0) * 100
+                block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
+            else:
+                # Pool 조차 없다면 PagedAttention 연산이 불가능하므로 명시적 에러 발생
+                raise ValueError("PagedLlamaAttention requires a PagePool. Check if 'pool' is properly initialized.")
+
+        # 2. 입력 타입/장치 설정
         target_dtype = self.q_proj.weight.dtype
-        target_device = self.q_proj.weight.device
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
+
 
         # 2. PagePool 및 BlockTable 설정
         # =================================================================
