@@ -657,10 +657,22 @@ class PagedLlamaAttention(nn.Module):
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
 
+        # 6. Attention 연산 결과 도출
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
-        attn_output = torch.matmul(attn_weights, full_value_states)
+        attn_output = torch.matmul(attn_weights, full_value_states) # [1, 32, q_len, 64]
 
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
+        # =================================================================
+        # [핵심 수정] 7. 출력 형태 및 데이터 타입 복원
+        # =================================================================
+        # 1) 차원 정렬: [1, 32, q_len, 64] -> [1, q_len, 32, 64]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        
+        # 2) 차원 병합: [1, q_len, 2048] (32*64 = 2048)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        
+        # 3) [★매우 중요★] 타입을 원래 모델 타입(Half/BFloat16)으로 복구
+        # 이 과정이 없으면 MLP 레이어(down_proj)에서 dtype 에러가 발생합니다.
+        attn_output = self.o_proj(attn_output).to(original_dtype)
 
+        # 4) Transformers 라이브러리 규격에 맞춰 (output, attention_weights) 반환
         return attn_output, None
