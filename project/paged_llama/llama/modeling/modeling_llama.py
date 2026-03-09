@@ -614,22 +614,32 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE
+       # 4. Paged KV Cache : WRITE
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
+        # block_table 타입 검사 및 텐서 변환 (올려주신 부분)
+        if block_table is None:
+            layer_offset = self.layer_idx * 100
+            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
+        elif hasattr(block_table, "to_tensor"):
+            block_table = block_table.to_tensor(device=target_device)
+        elif not isinstance(block_table, torch.Tensor):
+            block_table = torch.tensor(block_table, device=target_device).view(1, -1)
+
         for i in range(q_len):
             abs_pos = start_pos + i
+            # [★필수 추가] block_idx_logic 계산이 먼저 선언되어야 합니다.
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # 레이어별 격리를 위한 안전한 인덱싱
-            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
+            # 이제 아래 줄들이 정상 작동합니다.
+            max_logic_idx = block_table.size(1) - 1
+            safe_logic_idx = min(block_idx_logic, max_logic_idx)
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
             if physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-
         # 5. Paged KV Cache : READ (문맥 복원)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
