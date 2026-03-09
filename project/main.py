@@ -114,21 +114,22 @@ table = BlockTable(block_size=16)
 first_block = pool.allocate() 
 table.add_block(first_block)
 
-for layer in model_paged.model.layers:
-    new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
+for i, layer in enumerate(model_paged.model.layers):
+    new_attn = PagedLlamaAttention(config=config, layer_idx=i) # layer_idx 명시
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
     
-    # 레이어마다 전용 BlockTable 생성 (문맥 파괴 방지)
+    # 레이어마다 별도의 BlockTable과 블록들을 할당
     layer_table = BlockTable(block_size=16)
-    # 레이어당 10개 블록씩 미리 할당 (충분한 공간 확보)
-    for _ in range(10):
+    # 레이어당 블록 50개씩 독립적으로 할당 (22개 레이어 총 1100개 사용)
+    for _ in range(50):
         layer_table.add_block(pool.allocate())
     
     new_attn.to(device)
     new_attn.page_pool = pool
-    new_attn.block_table = layer_table.to_tensor(device=device) # 텐서로 변환하여 주입
+    # [중요] 텐서로 변환하여 주입
+    new_attn.block_table = layer_table.to_tensor(device=device) 
     layer.self_attn = new_attn
-
+    
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
 # ==========================================
 # 4. 최종 결과 출력 (수정된 Key 반영)
