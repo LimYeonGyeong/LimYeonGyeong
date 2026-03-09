@@ -674,17 +674,21 @@ class PagedLlamaAttention(nn.Module):
 
         # 2) [핵심] 4개 헤드를 32개로 확장 (repeat_kv)
         # full_key_states: [1, 4, seq, 64] -> [1, 32, seq, 64]
+        full_key_states = full_key_states.to(query_states.dtype)
+        full_value_states = full_value_states.to(query_states.dtype)
+
+        # 2. [★가장 중요★] 4개인 KV 헤드를 32개로 확장합니다. (num_key_value_groups=8)
+        # 이 과정을 거쳐야 Query(32헤드)와 Key(32헤드)가 1:1로 매칭되어 정확한 문맥을 읽습니다.
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 3) 이제 (1, 32, 1, 64)와 (1, 32, 64, seq)의 곱셈이 가능합니다.
+        # 3. 이제 정상적인 어텐션 스코어 계산이 가능합니다.
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(query_states.dtype)
             attn_weights = attn_weights + causal_mask
 
-        # Softmax 후 최종 값 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
