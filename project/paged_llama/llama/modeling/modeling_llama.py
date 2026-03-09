@@ -564,11 +564,6 @@ import math
 # (apply_rotary_pos_emb, repeat_kv 등은 이미 파일에 있다고 가정)
 
 class PagedLlamaAttention(nn.Module):
-    """
-    기존 LlamaAttention을 Paged Attention 방식으로 개조한 클래스입니다.
-    - past_key_values 리스트를 키우지 않고, PagePool(VRAM 창고)에 직접 데이터를 저장합니다.
-    - BlockTable을 통해 물리적인 블록 위치를 찾아 데이터를 읽어옵니다.
-    """
     def __init__(self, config, layer_idx=0, page_pool=None):
         super().__init__()
         self.config = config
@@ -583,13 +578,16 @@ class PagedLlamaAttention(nn.Module):
         # 외부에서 주입받을 PagedPool (메모리 창고)
         self.page_pool = page_pool 
 
+        # [수정] __init__에는 position_ids 관련 로직이 절대 들어가면 안 됩니다.
+        # 기존에 있던 if position_ids is not None: ... 줄을 삭제하세요.
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        # Projections
+        # Projections 설정
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
