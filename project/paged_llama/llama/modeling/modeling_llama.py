@@ -618,25 +618,29 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE (에러 방지 핵심)
-        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
+        # 4. Paged KV Cache : WRITE (에러 방지 완결판)
+        if position_ids is not None and position_ids.numel() > 0:
+            start_pos = position_ids.reshape(-1)[0].item()
+        else:
+            start_pos = 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
-            # [★수정] 인덱스 계산을 먼저 수행
+            # [★중요] 루프 안에서 block_idx_logic을 먼저 계산해야 합니다.
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★수정] block_table 범위 체크로 CUDA Assert 방지
-            max_logic_idx = block_table.size(1) - 1
-            safe_logic_idx = min(block_idx_logic, max_logic_idx)
-            physical_block_idx = block_table[0, safe_logic_idx].item()
-            
-            # [★수정] 물리 주소 유효성 검사
-            if physical_block_idx < pool.k_cache.size(0):
-                pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-                pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-
+            # block_table 범위 체크
+            if block_table is not None:
+                max_logic_idx = block_table.size(1) - 1
+                safe_logic_idx = min(block_idx_logic, max_logic_idx)
+                physical_block_idx = block_table[0, safe_logic_idx].item()
+                
+                # 물리 주소 유효성 최종 확인
+                if physical_block_idx < pool.k_cache.size(0):
+                    pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+                    pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+                    
         # 5. Paged KV Cache : READ (정상 답변 핵심)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
