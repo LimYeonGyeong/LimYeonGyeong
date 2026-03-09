@@ -667,16 +667,18 @@ class PagedLlamaAttention(nn.Module):
         full_value_states = v_flat[:, :total_len, :].unsqueeze(0)
         
         # GQA 처리 (4헤드 -> 32헤드 확장)
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+        full_key_states = full_key_states.to(query_states.dtype)
+        full_value_states = full_value_states.to(query_states.dtype)
 
-        # 6. Attention 연산
+        # 이제 두 텐서 모두 BFloat16이므로 에러 없이 곱셈이 가능합니다.
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
+            # 마스크 역시 연산을 위해 타입을 맞춰줍니다.
+            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(query_states.dtype)
             attn_weights = attn_weights + causal_mask
 
+        # Softmax는 정밀도를 위해 Float32로 계산 후 다시 원래 타입으로 복원합니다.
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
