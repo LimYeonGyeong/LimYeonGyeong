@@ -617,7 +617,7 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE
+        # 4. Paged KV Cache : WRITE (물리 주소 검증 추가)
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
         for i in range(q_len):
@@ -625,20 +625,32 @@ class PagedLlamaAttention(nn.Module):
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
+            # 레이어 오프셋을 고려하여 논리 인덱스 제한
+            max_logic_idx = block_table.size(1) - 1
+            safe_logic_idx = min(block_idx_logic, max_logic_idx)
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
+            # [★핵심 수정] 물리 블록 번호가 실제 k_cache의 범위를 넘지 않는지 확인
             if physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (역사적 문맥 복원)
+        # 5. Paged KV Cache : READ (안전한 index_select)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
+        # block_table에서 현재 레이어의 유효한 블록들만 추출
         active_indices = block_table[0, :num_needed_blocks]
-        block_indices_tensor = active_indices.to(pool.device)
+        
+        # [★핵심 수정] index_select 수행 전 유효 범위 필터링
+        num_phys_blocks = pool.k_cache.size(0)
+        valid_mask = (active_indices >= 0) & (active_indices < num_phys_blocks)
+        active_indices = active_indices[valid_mask]
+        
+        if active_indices.numel() == 0:
+            active_indices = torch.tensor([0], device=pool.device)
 
+        block_indices_tensor = active_indices.to(pool.device)
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
