@@ -21,56 +21,48 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
 # 2. 성능 측정 엔진
 # ==========================================
+# ==========================================
+# 2. 성능 측정 엔진 (개선 버전)
+# ==========================================
 def measure_performance(model, tokenizer, prompt_text):
-    # 워밍업
+    process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        model.generate(**inputs, max_new_tokens=1)
     
+    # [변경] 측정 전 캐시 및 통계 초기화
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
-    # 측정 시작 전 상태 기록
-    process = psutil.Process(os.getpid())
-    ram_start = process.memory_info().rss
+    # [변경] 시작 시점의 절대 메모리 기록 (RSS 사용)
+    ram_start = process.memory_info().rss / 1024 / 1024
     ctx_start = process.num_ctx_switches()
-    vram_start = torch.cuda.memory_allocated() if device == "cuda" else 0
     
     t0 = time.time()
-    
-    # 텍스트 생성 (120토큰)
     with torch.no_grad():
         outputs = model.generate(
             **inputs, 
-            max_new_tokens=120,
-            do_sample=False,
+            max_new_tokens=50, # 테스트용으로 짧게 설정
+            do_sample=True,    # 답변 활성화를 위해 샘플링 켬
             use_cache=True
         )
-    
-    if device == "cuda":
-        torch.cuda.synchronize()
+    if device == "cuda": torch.cuda.synchronize()
     t1 = time.time()
     
-    # 결과 계산
+    # [변경] 피크 VRAM 및 최종 RAM 점유량 계산
     latency = t1 - t0
-    generated_tokens = outputs.shape[-1] - inputs.input_ids.shape[-1]
-    throughput = generated_tokens / latency
-    
-    ram_usage = (process.memory_info().rss - ram_start) / 1024 / 1024
-    vram_usage = (torch.cuda.memory_allocated() - vram_start) / 1024 / 1024 if device == "cuda" else 0
+    peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0
+    ram_end = process.memory_info().rss / 1024 / 1024
     
     ctx_end = process.num_ctx_switches()
-    ctx_sw_total_start = ctx_start.voluntary + ctx_start.involuntary
-    ctx_sw_total_end = ctx_end.voluntary + ctx_end.involuntary
-    ctx_switch = ctx_sw_total_end - ctx_sw_total_start
+    ctx_switch = (ctx_end.voluntary + ctx_end.involuntary) - (ctx_start.voluntary + ctx_start.involuntary)
     
     return {
         "text": tokenizer.decode(outputs[0], skip_special_tokens=True),
         "latency": latency,
-        "throughput": throughput,
-        "ram": ram_usage,
-        "vram": vram_usage,
+        "throughput": 50 / latency,
+        "peak_vram": peak_vram,    # 순간 최대 GPU 사용량
+        "total_ram": ram_end,      # 현재 프로세스가 먹고 있는 전체 RAM
         "ctx_switch": ctx_switch
     }
 
@@ -125,13 +117,19 @@ table.add_block(first_block)
 for layer in model_paged.model.layers:
     new_attn = PagedLlamaAttention(config=config, layer_idx=layer.self_attn.layer_idx)
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
+    
+    # 레이어마다 전용 BlockTable 생성 (문맥 파괴 방지)
+    layer_table = BlockTable(block_size=16)
+    # 레이어당 10개 블록씩 미리 할당 (충분한 공간 확보)
+    for _ in range(10):
+        layer_table.add_block(pool.allocate())
+    
     new_attn.to(device)
-    new_attn.pool = pool
-    new_attn.block_table = table
+    new_attn.page_pool = pool
+    new_attn.block_table = layer_table.to_tensor(device=device) # 텐서로 변환하여 주입
     layer.self_attn = new_attn
 
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
-
 # ==========================================
 # 4. 최종 결과 출력
 # ==========================================
