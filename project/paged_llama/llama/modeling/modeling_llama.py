@@ -638,34 +638,37 @@ class PagedLlamaAttention(nn.Module):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (문맥 복원 및 GQA)
+        ## 5. Paged KV Cache : READ (정확한 차원 재구성)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
-        # [★정상화 핵심] 정확한 블록들만 Gather
+        # [★수정] 현재 레이어의 블록들만 정확히 가져옴
         active_indices = block_table[0, :num_needed_blocks].to(target_device)
-        k_blocks = pool.k_cache.index_select(0, active_indices)
+        k_blocks = pool.k_cache.index_select(0, active_indices) # [num_blocks, num_kv_heads, block_size, head_dim]
         v_blocks = pool.v_cache.index_select(0, active_indices)
+
+        # [★수정] 차원 재구성 (중요: num_blocks와 block_size를 합쳐서 seq_len으로 복원)
+        # k_blocks: [B, H, S, D] 형태로 만들기 위해 transpose와 reshape를 정밀하게 수행
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
-        # 블록 정렬 및 차원 맞춤
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
-        
-        full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
-        full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
+        # 현재까지의 실제 길이만큼 슬라이싱 (남는 패딩 제거)
+        full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
+        full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
         
         # GQA 확장 (4 heads -> 32 heads)
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 6. Attention 연산 (마스크 정밀 슬라이싱)
+        # 6. Attention 연산 (수치 안정성 및 마스크)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
         if attention_mask is not None:
-            # [★정상화 핵심] 마스크의 길이를 현재 캐시 길이에 정확히 일치시킴
+            # [★수정] 마스크 길이를 현재 캐시 데이터 길이에 정확히 맞춤
             mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
             attn_weights = attn_weights + mask_slice
 
+        # Softmax 시 float32 사용 (정확도 향상)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
