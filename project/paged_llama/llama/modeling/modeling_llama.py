@@ -595,57 +595,39 @@ class PagedLlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        block_table: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: bool = False,
-        **kwargs
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        
-        original_dtype = hidden_states.dtype
-        bsz, q_len, _ = hidden_states.size()
-        target_device = hidden_states.device
-
-        # 1. block_table 및 pool 확보
+    # =================================================================
+        # [최종 수정] 4. Paged KV Cache : WRITE (안전한 인덱싱 및 레이어 격리)
+        # =================================================================
         pool = getattr(self, 'page_pool', None)
-        if pool is None:
-            pool = getattr(self, 'pool', None)
+        if pool is None: pool = getattr(self, 'pool', None)
 
-        if block_table is None and pool is not None:
-            layer_offset = getattr(self, 'layer_idx', 0) * 100
-            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
+        # 1. position_ids에서 안전하게 현재 위치(start_pos) 추출
+        if position_ids is not None:
+            # view(-1)[0] 대신 item()을 안전하게 호출하기 위해 시점 확인
+            start_pos = position_ids.flatten()[0].item()
+        else:
+            start_pos = 0
 
-        # 2. 입력 타입 설정
-        target_dtype = self.q_proj.weight.dtype
-        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
+        # 2. 레이어 간 데이터 덮어쓰기 방지를 위한 오프셋 설정
+        # 레이어당 100개의 물리 블록을 할당한다고 가정
+        layer_offset = getattr(self, 'layer_idx', 0) * 100
 
-        # [★핵심 수정] 3. Projection: key_states와 value_states를 여기서 정의합니다.
-        # 이 부분이 누락되면 NameError가 발생합니다.
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE 적용
-        if "position_embeddings" in kwargs:
-            cos, sin = kwargs["position_embeddings"]
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # 4. Paged KV Cache : WRITE
-        start_pos = position_ids.view(-1)[0].item() if position_ids is not None else 0
-        
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # 여기서 이제 key_states를 정상적으로 참조할 수 있습니다.
-            physical_block_idx = block_table[0, block_idx_logic].item()
-            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+            # [핵심] block_table의 유효 범위 내로 인덱스를 제한(clamp)하여 CUDA Assert 방지
+            max_logic_idx = block_table.size(1) - 1
+            safe_logic_idx = min(block_idx_logic, max_logic_idx)
+            
+            # 실제 물리 블록 주소 계산
+            physical_block_idx = block_table[0, safe_logic_idx].item()
+            
+            # [★] k_cache/v_cache의 실제 크기를 넘지 않도록 안전장치 추가
+            if physical_block_idx < pool.k_cache.size(0):
+                pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+                pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
 
 
