@@ -635,44 +635,45 @@ class PagedLlamaAttention(nn.Module):
             pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
             pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (Gather & GQA)
+       # 5. Paged KV Cache : READ (Gather & GQA)
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
         
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # 다시 읽어올 때 타입을 원래 모델 타입(BFloat16)으로 돌려줍니다.
+        # [수정] 헤드 데이터를 정렬하여 가져옵니다.
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         
-        full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
-        full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
+        # 현재 생성 중인 전체 시퀀스 길이에 맞춰 슬라이싱
+        total_len = start_pos + q_len
+        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)   # [1, 4, seq, 64]
+        full_value_states = v_flat[:, :total_len, :].unsqueeze(0) # [1, 4, seq, 64]
         
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+        # [★가장 중요★] 결과값을 변수에 재할당해야 합니다. 
+        # 4개의 KV 헤드를 32개로 확장하여 Query와 차원을 맞춥니다.
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   # [1, 32, seq, 64]
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) # [1, 32, seq, 64]
 
-        # 6. Attention & Output
+        # 6. Attention & Output 연산
+        # 이제 (1, 32, 1, 64)와 (1, 32, 64, seq)의 행렬 곱이 가능합니다.
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
+            # 마스크 차원을 full_key_states의 길이에 맞춤
+            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
+            attn_weights = attn_weights + causal_mask
 
-        # 6. Attention 연산 및 Softmax
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Softmax (정밀도를 위해 float32 사용 후 다시 복원)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # =================================================================
-        # [핵심 수정] 7. 출력 형태 및 데이터 타입 복원
-        # =================================================================
-        # 1) 차원 정렬: [Batch, Heads, Seq, Dim] -> [Batch, Seq, Heads, Dim]
-       # [최종 수정] 7. 출력 형태 및 데이터 타입 복원
-        # 1) 차원 정렬 및 병합: [Batch, Seq, HiddenSize] (예: 1, 1, 2048)
+        # 7. 출력 형태 및 데이터 타입 복원 (MLP 레이어 에러 방지)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
-        # 2) [★가장 중요★] 타입을 원래 모델 타입(Half/BFloat16)으로 복구
-        # 이 과정이 누락되면 다음 단계인 MLP(down_proj)에서 dtype 에러가 발생합니다.
+        # o_proj 연산 후 모델의 원래 타입(BFloat16/Half)으로 최종 변환
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
-        # 3) Transformers 규격에 맞춰 (output, attention_weights) 반환
         return attn_output, None
