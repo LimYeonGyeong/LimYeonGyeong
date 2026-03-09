@@ -592,7 +592,7 @@ class PagedLlamaAttention(nn.Module):
         **kwargs
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # 1. 초기 설정 및 타입 고정
+        # 1. 초기 설정 및 타겟 디바이스/타입 명시
         original_dtype = hidden_states.dtype
         target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
@@ -600,73 +600,69 @@ class PagedLlamaAttention(nn.Module):
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
         bsz, q_len, _ = hidden_states.size()
         
-        # 2. PagePool 및 BlockTable 확보 (None 체크 강화)
+        # 2. PagePool 및 BlockTable 정밀 확보
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
+        
+        # [★에러 방지] block_table이 없거나 객체인 경우를 위한 텐서 강제 변환
         if block_table is None:
             layer_offset = self.layer_idx * 100
             block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
         elif hasattr(block_table, "to_tensor"):
             block_table = block_table.to_tensor(device=target_device)
+        else:
+            block_table = block_table.to(device=target_device)
 
-        # 3. Projection (Q, K, V 생성)
+        # 3. Projection 및 RoPE (Q, K, V)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if "position_embeddings" in kwargs:
             cos, sin = kwargs["position_embeddings"]
-            cos, sin = cos.to(target_dtype), sin.to(target_dtype)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-        # 4. Paged KV Cache : WRITE (에러 방지 완결판)
-        if position_ids is not None and position_ids.numel() > 0:
-            start_pos = position_ids.reshape(-1)[0].item()
-        else:
-            start_pos = 0
+        # 4. Paged KV Cache : WRITE (안전한 경계 체크)
+        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
-            # [★교정] 논리 인덱스 계산을 먼저 수행해야 아래에서 사용 가능합니다.
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            if block_table is not None and block_table.size(1) > 0:
-                # 테이블 범위를 벗어나지 않도록 clamp
-                max_logic_idx = block_table.size(1) - 1
-                safe_logic_idx = max(0, min(block_idx_logic, max_logic_idx))
-                physical_block_idx = block_table[0, safe_logic_idx].item()
-                
-                # [★교정] 실제 PagePool의 물리적 한계를 넘지 않는지 최종 확인
-                if 0 <= physical_block_idx < pool.k_cache.size(0):
-                    pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-                    pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+            # [★에러 방지] 논리 인덱스가 테이블 크기를 절대 넘지 않도록 제한
+            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
+            physical_block_idx = block_table[0, safe_logic_idx].item()
+            
+            # 물리 주소가 실제 PagePool 크기 내에 있는지 확인
+            if 0 <= physical_block_idx < pool.k_cache.size(0):
+                pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+                pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (정상 답변 핵심)
+        # 5. Paged KV Cache : READ (문맥 복원 및 GQA)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
-        active_indices = block_table[0, :num_needed_blocks]
-        block_indices_tensor = active_indices.to(pool.device)
-
-        k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
-        v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
+        # [★정상화 핵심] 정확한 블록들만 Gather
+        active_indices = block_table[0, :num_needed_blocks].to(target_device)
+        k_blocks = pool.k_cache.index_select(0, active_indices)
+        v_blocks = pool.v_cache.index_select(0, active_indices)
         
-        # [데이터 복원] 레이어 격리 및 타입 정렬
+        # 블록 정렬 및 차원 맞춤
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
         
-        # GQA 확장
+        # GQA 확장 (4 heads -> 32 heads)
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 6. Attention 연산 (마스크 적용 및 중복 제거)
+        # 6. Attention 연산 (마스크 정밀 슬라이싱)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
         if attention_mask is not None:
-            # [★수정] 마스크를 현재 시퀀스 길이에 맞춰 정확히 적용
+            # [★정상화 핵심] 마스크의 길이를 현재 캐시 길이에 정확히 일치시킴
             mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
             attn_weights = attn_weights + mask_slice
 
