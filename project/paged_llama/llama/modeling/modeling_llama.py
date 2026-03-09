@@ -626,21 +626,21 @@ class PagedLlamaAttention(nn.Module):
         
         for i in range(q_len):
             abs_pos = start_pos + i
-            # [★중요] 루프 안에서 block_idx_logic을 먼저 계산해야 합니다.
+            # [★교정] 논리 인덱스 계산을 먼저 수행해야 아래에서 사용 가능합니다.
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # block_table 범위 체크
-            if block_table is not None:
+            if block_table is not None and block_table.size(1) > 0:
+                # 테이블 범위를 벗어나지 않도록 clamp
                 max_logic_idx = block_table.size(1) - 1
-                safe_logic_idx = min(block_idx_logic, max_logic_idx)
+                safe_logic_idx = max(0, min(block_idx_logic, max_logic_idx))
                 physical_block_idx = block_table[0, safe_logic_idx].item()
                 
-                # 물리 주소 유효성 최종 확인
-                if physical_block_idx < pool.k_cache.size(0):
+                # [★교정] 실제 PagePool의 물리적 한계를 넘지 않는지 최종 확인
+                if 0 <= physical_block_idx < pool.k_cache.size(0):
                     pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                     pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-                    
+
         # 5. Paged KV Cache : READ (정상 답변 핵심)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
