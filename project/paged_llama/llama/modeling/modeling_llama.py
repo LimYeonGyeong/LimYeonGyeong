@@ -610,57 +610,44 @@ class PagedLlamaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         target_device = hidden_states.device
 
-        # [수정 핵심] 1. block_table 및 pool 안전하게 확보
-        # 클래스에 pool이 있는지, 혹은 page_pool이 있는지 확인합니다.
+        # 1. block_table 및 pool 확보
         pool = getattr(self, 'page_pool', None)
         if pool is None:
             pool = getattr(self, 'pool', None)
 
-        # block_table이 None으로 들어왔다면 강제로 기본 테이블을 생성합니다.
-        if block_table is None:
-            if pool is not None:
-                # 레이어 간섭 방지를 위해 layer_idx 기반 오프셋 적용
-                layer_offset = getattr(self, 'layer_idx', 0) * 100
-                block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
-            else:
-                # Pool 조차 없다면 PagedAttention 연산이 불가능하므로 명시적 에러 발생
-                raise ValueError("PagedLlamaAttention requires a PagePool. Check if 'pool' is properly initialized.")
+        if block_table is None and pool is not None:
+            layer_offset = getattr(self, 'layer_idx', 0) * 100
+            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
 
-        # 2. 입력 타입/장치 설정
+        # 2. 입력 타입 설정
         target_dtype = self.q_proj.weight.dtype
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
 
+        # [★핵심 수정] 3. Projection: key_states와 value_states를 여기서 정의합니다.
+        # 이 부분이 누락되면 NameError가 발생합니다.
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # 2. PagePool 및 BlockTable 설정
-        # =================================================================
-        # [핵심] 4. Paged KV Cache : WRITE (안전한 인덱싱 적용)
-        # =================================================================
-        pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
+        # RoPE 적용
+        if "position_embeddings" in kwargs:
+            cos, sin = kwargs["position_embeddings"]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # 4. Paged KV Cache : WRITE
+        start_pos = position_ids.view(-1)[0].item() if position_ids is not None else 0
         
-        # position_ids의 차원을 확인하고 안전하게 첫 번째 위치 값을 가져옵니다.
-        if position_ids is not None and position_ids.numel() > 0:
-            # [수정] 텐서 형태에 상관없이 첫 번째 요소를 가져오도록 변경
-            start_pos = position_ids.view(-1)[0].item() 
-        else:
-            # position_ids가 없을 경우를 대비한 예외 처리 (기본값 0)
-            start_pos = getattr(self, 'cache_position', 0)
-            if isinstance(start_pos, torch.Tensor):
-                start_pos = start_pos.view(-1)[0].item()
-
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [중요] block_table의 크기가 충분한지 확인
-            if block_idx_logic >= block_table.size(1):
-                # 블록 테이블 범위를 벗어나면 강제로 할당된 마지막 블록을 참조하거나 에러 방지
-                block_idx_logic = block_table.size(1) - 1
-            
+            # 여기서 이제 key_states를 정상적으로 참조할 수 있습니다.
             physical_block_idx = block_table[0, block_idx_logic].item()
-            
             pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
             pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+
+
 
         # =================================================================
         # [핵심] 5. Paged KV Cache : READ (Gather & GQA Expansion)
