@@ -727,14 +727,22 @@ class PagedLlamaAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
+        # 6. Softmax 및 최종 값 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, full_value_states) # [1, 32, 1, 64]
+
+        # =================================================================
+        # [핵심 수정] 7. 출력 형태 복원 (Linear Layer 연산을 위해)
+        # =================================================================
+        # 1) [Batch, Heads, SeqLen, Dim] -> [Batch, SeqLen, Heads, Dim]
+        attn_output = attn_output.transpose(1, 2).contiguous() # [1, 1, 32, 64]
         
-        # 5. 최종 어텐션 값 도출
-        attn_output = torch.matmul(attn_weights, full_value_states)
+        # 2) [1, 1, 32, 64] -> [1, 1, 2048] (Heads * Dim = 2048)
+        # 이 과정을 거쳐야 o_proj(2048x2048)와 행렬 곱이 가능해집니다.
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size) # [1, 1, 2048]
         
-        # o_proj 연산 및 최종 타입 고정
-        attn_output = attn_output.to(self.o_proj.weight.dtype)
-        attn_output = self.o_proj(attn_output)
-        attn_output = attn_output.to(original_dtype) # 입구에서 저장한 원래 타입으로 반환
+        # 3) o_proj 연산 및 데이터 타입 복원
+        attn_output = self.o_proj(attn_output) # [1, 1, 2048]
+        attn_output = attn_output.to(original_dtype)
 
         return attn_output, None
