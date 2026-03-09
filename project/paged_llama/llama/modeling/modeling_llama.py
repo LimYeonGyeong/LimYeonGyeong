@@ -701,36 +701,33 @@ class PagedLlamaAttention(nn.Module):
         v_flat = v_blocks.view(self.num_key_value_heads, -1, self.head_dim)
         
         # 4) 유효한 길이까지만 자르기 (Padding 제거)
-        # k_flat은 이미 current_pos + 1(현재 토큰 포함)까지의 모든 정보를 PagedPool에서 가져왔습니다.
+        # k_flat/v_flat은 PagedPool에서 가져온 현재 토큰 포함 전체 문맥입니다.
         valid_seq_len = current_pos + 1
         k_flat = k_flat[:, :valid_seq_len, :]
         v_flat = v_flat[:, :valid_seq_len, :]
         
-        # [수정 핵심] 1. PagedPool에서 가져온 전체 문맥 데이터를 준비 (1, KV_H, Seq, D)
-        # 이미 현재 토큰이 포함되어 있으므로 key_states를 별도로 cat할 필요가 없습니다.
+        # [핵심 수정] 1. PagedPool에서 가져온 전체 데이터를 [1, KV_H, Seq, Dim]으로 준비
+        # 이미 현재 정보가 들어있으므로 별도의 cat 연산이 필요 없습니다.
         full_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   
         full_value_states = v_flat.unsqueeze(0).to(query_states.dtype) 
 
-        # 2. GQA 처리를 위해 KV 헤드 수를 4개에서 32개로 확장합니다.
+        # 2. GQA 처리를 위해 KV 헤드 수를 4개에서 32개로 확장 (repeat_kv)
         # 이 과정을 거쳐야 [1, 32, Seq, 64]가 되어 query_states와 연산이 가능합니다.
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 3. Attention Score 계산
-        # Q: [1, 32, 1, 64] / K_T: [1, 32, 64, Seq]
+        # 3. Attention Score 계산 (Q: [1, 32, 1, 64] * K_T: [1, 32, 64, Seq])
         k_t = full_key_states.transpose(2, 3)
         attn_weights = torch.matmul(query_states, k_t) / math.sqrt(self.head_dim)
         
-        # 4. 마스크 처리 및 Softmax
+        # 4. 마스크 처리 (현재 문맥 길이에 맞게 슬라이싱)
         if attention_mask is not None:
-            # mask 길이를 현재 전체 시퀀스 길이에 맞춤
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # 6. Softmax 및 최종 값 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, full_value_states) # [1, 32, 1, 64]
-
+        attn_output = torch.matmul(attn_weights, full_value_states)
+        
         # =================================================================
         # [핵심 수정] 7. 출력 형태 복원 (Linear Layer 연산을 위해)
         # =================================================================
