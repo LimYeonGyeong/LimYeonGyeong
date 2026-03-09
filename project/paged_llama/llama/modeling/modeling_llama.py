@@ -595,16 +595,18 @@ class PagedLlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-def forward(
+    def forward(
         self,
-        hidden_states,
-        position_ids=None,
-        block_table=None,
-        attention_mask=None,
-        past_key_values=None,
-        use_cache=False,
-        **kwargs
-    ):
+        hidden_states: torch.Tensor,        # 이름 확인!
+        position_ids: Optional[torch.LongTensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+        **kwargs                            # 예상치 못한 인자들을 받아내기 위해 필수
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        
+        # 여기서부터 아까 드린 로직(Projection, RoPE, Paged Write/Read 등)이 시작됩니다.
         original_dtype = hidden_states.dtype
         bsz, q_len, _ = hidden_states.size()
         
