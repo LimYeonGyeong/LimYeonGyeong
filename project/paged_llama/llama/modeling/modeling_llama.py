@@ -645,30 +645,32 @@ class PagedLlamaAttention(nn.Module):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (Gather & Align)
-        active_indices = block_table[0]
-        # [수정] 유효한 인덱스만 추출하여 에러 방지
-        num_phys_blocks = pool.k_cache.size(0)
-        valid_mask = (active_indices >= 0) & (active_indices < num_phys_blocks)
-        block_indices_tensor = active_indices[valid_mask].to(pool.device)
+        # 5. Paged KV Cache : READ (레이어 격리 및 데이터 복원)
+        # 각 레이어는 자기의 layer_idx에 할당된 블록 번호만 읽어야 합니다.
+        layer_offset = self.layer_idx * 100
         
-        if block_indices_tensor.numel() == 0:
-            block_indices_tensor = torch.tensor([0], device=pool.device)
+        # 현재까지 생성된 토큰 수에 필요한 논리적 블록 개수 계산
+        num_needed_blocks = (start_pos + q_len + pool.block_size - 1) // pool.block_size
+        
+        # [★핵심] block_table에서 해당 레이어의 물리 주소만 정확히 슬라이싱
+        active_indices = block_table[0, :num_needed_blocks]
+        block_indices_tensor = active_indices.to(pool.device)
 
-        # [★핵심] 여기서 full_key_states가 정의되어야 합니다.
+        # 물리 창고에서 데이터 Gather
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
+        # [★핵심] 데이터를 다시 모델 연산 타입(Half/BFloat16)으로 정밀하게 복원
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
         
-        total_len = start_pos + q_len
-        # 변수 정의 확인
-        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)   
-        full_value_states = v_flat[:, :total_len, :].unsqueeze(0) 
+        # 현재 시퀀스 길이만큼만 잘라서 사용
+        total_seq_len = start_pos + q_len
+        full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
+        full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
         
         # GQA 확장 (4 -> 32 heads)
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
         # 6. Attention 연산 (정의된 full_key_states 사용)
