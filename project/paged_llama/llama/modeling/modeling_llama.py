@@ -666,19 +666,22 @@ class PagedLlamaAttention(nn.Module):
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 6. Attention 연산
+       # 6. Attention 연산 (정의된 full_key_states 사용)
+        # [수정] 중복된 matmul을 하나로 합치고 마스크를 softmax 직전에 정확히 적용합니다.
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        # [수정] 마스크 적용 (문맥 보호)
+
         if attention_mask is not None:
-            # attention_mask의 길이를 full_key_states에 맞춰 슬라이싱
-            mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
+            # [★핵심] 현재 생성된 전체 길이(total_seq_len)만큼 마스크를 정확히 슬라이싱합니다.
+            mask_slice = attention_mask[:, :, :, :total_seq_len].to(query_states.dtype)
             attn_weights = attn_weights + mask_slice
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
+        # Softmax 수행 (수치 안정성을 위해 float32 사용 후 복원)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        # 가중치와 Value를 곱해 최종 출력값 생성
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 7. 출력 복원
+        # 7. 출력 형태 변환 및 타입 복원 (MLP 레이어 호환)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
