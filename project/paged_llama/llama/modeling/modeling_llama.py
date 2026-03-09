@@ -592,23 +592,21 @@ class PagedLlamaAttention(nn.Module):
         **kwargs
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # [수정] 1. 모델 가중치와 입력 데이터의 타입을 일치시킵니다.
-        # self.q_proj.weight.dtype을 참조하여 Half(BFloat16)로 통일합니다.
-        target_dtype = self.q_proj.weight.dtype
+        # [핵심 1] 시작하자마자 원래 타입(Half/BFloat16)을 저장합니다.
+        original_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
         
-        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
-        original_dtype = target_dtype
-        
+        # 입력값을 모델 가중치 타입으로 강제 통일
+        hidden_states = hidden_states.to(dtype=original_dtype, device=target_device)
         bsz, q_len, _ = hidden_states.size()
         
-        # 2. PagePool 및 BlockTable 설정
+        # 1. PagePool 및 BlockTable 설정
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
         if block_table is None and pool is not None:
             layer_offset = self.layer_idx * 100
             block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
 
-        # 3. Projection (이제 데이터 타입이 같으므로 에러가 나지 않습니다)
+        # 2. Projection (Q, K, V 생성)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -616,64 +614,51 @@ class PagedLlamaAttention(nn.Module):
         # RoPE 적용
         if "position_embeddings" in kwargs:
             cos, sin = kwargs["position_embeddings"]
-            # cos, sin도 데이터 타입을 맞춰줍니다.
-            cos, sin = cos.to(target_dtype), sin.to(target_dtype)
+            cos, sin = cos.to(original_dtype), sin.to(original_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE
+        # 3. Paged KV Cache : WRITE
         start_pos = position_ids.flatten()[0].item() if position_ids is not None else 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
-            
             safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
-            # 캐시 저장 시에도 타입을 맞춥니다.
             pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
             pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-       # 5. Paged KV Cache : READ (Gather & GQA)
+        # 4. Paged KV Cache : READ (Gather & GQA)
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
-        
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # [수정] 헤드 데이터를 정렬하여 가져옵니다.
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(target_dtype)
+        # [핵심 2] 읽어온 데이터를 다시 original_dtype(Half)으로 변환
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(original_dtype)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(original_dtype)
         
-        # 현재 생성 중인 전체 시퀀스 길이에 맞춰 슬라이싱
-        total_len = start_pos + q_len
-        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)   # [1, 4, seq, 64]
-        full_value_states = v_flat[:, :total_len, :].unsqueeze(0) # [1, 4, seq, 64]
+        full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
+        full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
         
-        # [★가장 중요★] 결과값을 변수에 재할당해야 합니다. 
-        # 4개의 KV 헤드를 32개로 확장하여 Query와 차원을 맞춥니다.
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   # [1, 32, seq, 64]
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) # [1, 32, seq, 64]
+        # GQA 확장 (4 -> 32 heads)
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 6. Attention & Output 연산
-        # 이제 (1, 32, 1, 64)와 (1, 32, 64, seq)의 행렬 곱이 가능합니다.
+        # 5. Attention 연산 (정밀도를 위해 내부만 float32 사용)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
         if attention_mask is not None:
-            # 마스크 차원을 full_key_states의 길이에 맞춤
-            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
-            attn_weights = attn_weights + causal_mask
+            attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(original_dtype)
 
-        # Softmax (정밀도를 위해 float32 사용 후 다시 복원)
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(original_dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 7. 출력 형태 및 데이터 타입 복원 (MLP 레이어 에러 방지)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # [핵심 3] 최종 출력물을 반드시 Half/BFloat16 타입으로 고정
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         
-        # o_proj 연산 후 모델의 원래 타입(BFloat16/Half)으로 최종 변환
-        attn_output = self.o_proj(attn_output).to(original_dtype)
+        # o_proj를 통과시킨 후 최종적으로 한 번 더 타입을 강제합니다.
+        attn_output = self.o_proj(attn_output).to(dtype=original_dtype)
 
         return attn_output, None
