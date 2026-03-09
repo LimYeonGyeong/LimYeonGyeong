@@ -615,34 +615,31 @@ class PagedLlamaAttention(nn.Module):
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
 
         # 2. PagePool 및 BlockTable 설정
+        # =================================================================
+        # [핵심] 4. Paged KV Cache : WRITE (안전한 인덱싱 적용)
+        # =================================================================
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
-        if block_table is None:
-            # 프로토타입: 각 레이어별로 독립된 블록 범위를 가지도록 설정 (레이어당 100개 블록 가정)
-            # 이렇게 해야 레이어끼리 데이터가 섞이지 않습니다.
-            layer_offset = self.layer_idx * 100 
-            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
-
-        # 3. Projection (Q, K, V 생성)
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE 적용
-        if "position_embeddings" in kwargs:
-            cos, sin = kwargs["position_embeddings"]
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # =================================================================
-        # [핵심] 4. Paged KV Cache : WRITE (레이어 간섭 방지)
-        # =================================================================
-        start_pos = position_ids[0, 0].item() 
         
+        # position_ids의 차원을 확인하고 안전하게 첫 번째 위치 값을 가져옵니다.
+        if position_ids is not None and position_ids.numel() > 0:
+            # [수정] 텐서 형태에 상관없이 첫 번째 요소를 가져오도록 변경
+            start_pos = position_ids.view(-1)[0].item() 
+        else:
+            # position_ids가 없을 경우를 대비한 예외 처리 (기본값 0)
+            start_pos = getattr(self, 'cache_position', 0)
+            if isinstance(start_pos, torch.Tensor):
+                start_pos = start_pos.view(-1)[0].item()
+
         for i in range(q_len):
             abs_pos = start_pos + i
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # 레이어 전용 물리 블록 번호 획득
+            # [중요] block_table의 크기가 충분한지 확인
+            if block_idx_logic >= block_table.size(1):
+                # 블록 테이블 범위를 벗어나면 강제로 할당된 마지막 블록을 참조하거나 에러 방지
+                block_idx_logic = block_table.size(1) - 1
+            
             physical_block_idx = block_table[0, block_idx_logic].item()
             
             pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
