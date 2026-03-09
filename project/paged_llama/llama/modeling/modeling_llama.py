@@ -701,41 +701,35 @@ class PagedLlamaAttention(nn.Module):
         v_flat = v_blocks.view(self.num_key_value_heads, -1, self.head_dim)
         
         # 4) 유효한 길이까지만 자르기 (Padding 제거)
-        # 전체 슬롯 크기보다 실제 시퀀스 길이가 짧을 수 있음
+        # k_flat은 이미 current_pos + 1(현재 토큰 포함)까지의 모든 정보를 PagedPool에서 가져왔습니다.
         valid_seq_len = current_pos + 1
         k_flat = k_flat[:, :valid_seq_len, :]
         v_flat = v_flat[:, :valid_seq_len, :]
         
-    # 1. 과거의 KV 캐시 데이터를 PagedPool에서 읽어옵니다.
-        # k_flat/v_flat shape: [num_kv_heads, total_len, head_dim] -> [4, past_len, 64]
-        past_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   # [1, 4, past_len, 64]
-        past_value_states = v_flat.unsqueeze(0).to(query_states.dtype) # [1, 4, past_len, 64]
+        # [수정 핵심] 1. PagedPool에서 가져온 전체 문맥 데이터를 준비 (1, KV_H, Seq, D)
+        # 이미 현재 토큰이 포함되어 있으므로 key_states를 별도로 cat할 필요가 없습니다.
+        full_key_states = k_flat.unsqueeze(0).to(query_states.dtype)   
+        full_value_states = v_flat.unsqueeze(0).to(query_states.dtype) 
 
-        # 2. [★핵심 수정★] GQA 처리를 위해 KV 헤드 수를 4개에서 32개로 확장합니다.
-        # self.num_key_value_groups는 32 // 4 = 8 입니다.
-        # 이 과정을 거쳐야 [1, 32, past_len, 64]가 되어 query_states와 연산이 가능합니다.
-        past_key_states = repeat_kv(past_key_states, self.num_key_value_groups)   # [1, 32, past_len, 64]
-        past_value_states = repeat_kv(past_value_states, self.num_key_value_groups) # [1, 32, past_len, 64]
+        # 2. GQA 처리를 위해 KV 헤드 수를 4개에서 32개로 확장합니다.
+        # 이 과정을 거쳐야 [1, 32, Seq, 64]가 되어 query_states와 연산이 가능합니다.
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
 
-        # 3. 이제 모든 텐서의 헤드 수가 32로 동일하므로 결합(cat)이 가능합니다.
-        # key_states(현재 토큰): [1, 32, 1, 64]
-        # full_key_states(전체 문맥): [1, 32, past_len + 1, 64]
-        full_key_states = torch.cat([past_key_states, key_states], dim=2)
-        full_value_states = torch.cat([past_value_states, value_states], dim=2)
-
-        # 4. Attention Score 계산
-        # k_t: [1, 32, 64, full_len]
+        # 3. Attention Score 계산
+        # Q: [1, 32, 1, 64] / K_T: [1, 32, 64, Seq]
         k_t = full_key_states.transpose(2, 3)
         attn_weights = torch.matmul(query_states, k_t) / math.sqrt(self.head_dim)
         
-        # 5. 마스크 처리 (전체 시퀀스 길이에 맞춤)
+        # 4. 마스크 처리 및 Softmax
         if attention_mask is not None:
-            # attention_mask의 마지막 차원이 full_len과 일치해야 함
+            # mask 길이를 현재 전체 시퀀스 길이에 맞춤
             causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # 6. Softmax 및 최종 값 계산
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        # 5. 최종 어텐션 값 도출
         attn_output = torch.matmul(attn_weights, full_value_states)
         
         # o_proj 연산 및 최종 타입 고정
