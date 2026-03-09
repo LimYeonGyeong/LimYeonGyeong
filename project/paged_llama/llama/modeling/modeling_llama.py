@@ -647,21 +647,26 @@ class PagedLlamaAttention(nn.Module):
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 5. Attention 연산 (정밀도를 위해 내부만 float32 사용)
+        # 6. Attention 연산
+        # query_states: [1, 32, 1, 64], full_key_states: [1, 32, seq, 64]
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(original_dtype)
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(original_dtype)
-        # [최종 수정] 7. 출력 형태 및 데이터 타입 복원
-        # 1) 차원 정렬 및 병합: [Batch, Seq, HiddenSize]
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
+        
+        # [★핵심 수정] 여기서 attn_output이 처음으로 정의됩니다.
+        # attn_weights: [1, 32, 1, seq] @ full_value_states: [1, 32, seq, 64]
+        attn_output = torch.matmul(attn_weights, full_value_states)
+
+        # 7. 출력 형태 및 데이터 타입 복원
+        # 이제 attn_output이 정의되었으므로 에러 없이 실행됩니다.
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
-        # 2) [★가장 중요★] 타입을 원래 모델 타입(Half/BFloat16)으로 강제 복구
-        # original_dtype은 forward 시작 시점에 저장한 hidden_states.dtype입니다.
-        # 이 변환이 없으면 다음 단계인 MLP(down_proj)에서 dtype 에러가 반복됩니다.
+        # 원래 모델 타입(BFloat16/Half)으로 최종 변환하여 반환
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
-        # 3) Transformers 규격에 맞춰 (output, attention_weights) 반환
         return attn_output, None
