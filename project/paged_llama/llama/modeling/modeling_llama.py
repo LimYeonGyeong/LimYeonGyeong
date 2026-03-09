@@ -616,9 +616,9 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = cos.to(target_dtype), sin.to(target_dtype)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # 4. Paged KV Cache : WRITE (안전한 인덱싱 적용)
-        # [수정] position_ids에서 현재 토큰의 시작 위치를 안전하게 추출
+        # 4. Paged KV Cache : WRITE (안전한 인덱싱 및 경계 체크)
         if position_ids is not None and position_ids.numel() > 0:
+            # position_ids에서 현재 위치를 안전하게 추출
             start_pos = position_ids.reshape(-1)[0].item()
         else:
             start_pos = 0
@@ -628,7 +628,7 @@ class PagedLlamaAttention(nn.Module):
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★핵심] block_table 존재 여부와 인덱스 범위 체크
+            # [★핵심 수정] block_table의 유효성 및 범위 검사
             if block_table is None or block_table.size(1) == 0:
                 break
                 
@@ -636,12 +636,12 @@ class PagedLlamaAttention(nn.Module):
             max_logic_idx = block_table.size(1) - 1
             safe_logic_idx = min(block_idx_logic, max_logic_idx)
             
-            # 물리 블록 번호 추출
+            # 실제 물리 블록 번호 추출
             physical_block_idx = block_table[0, safe_logic_idx].item()
             
-            # [★핵심] 물리 주소가 할당된 pool의 크기 내에 있는지 확인
+            # [★핵심 수정] 물리 주소가 실제 PagePool 크기 내에 있는지 확인
             if physical_block_idx < pool.k_cache.size(0):
-                # 데이터 타입 일치화(.to)와 함께 캐시 저장
+                # 데이터 타입을 맞추어 안전하게 저장
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
