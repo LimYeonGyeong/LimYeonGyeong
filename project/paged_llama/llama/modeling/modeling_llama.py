@@ -635,25 +635,27 @@ class PagedLlamaAttention(nn.Module):
             pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
         # 4. Paged KV Cache : READ (Gather & GQA)
+        # 5. Paged KV Cache : READ (Gather & Align)
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
+        
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # [핵심 2] 읽어온 데이터를 다시 original_dtype(Half)으로 변환
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(original_dtype)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(original_dtype)
+        # 데이터 정렬 및 타입 변환
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
         
-        full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
-        full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
+        total_len = start_pos + q_len
+        full_key_states = k_flat[:, :total_len, :].unsqueeze(0)   # [1, 4, seq, 64]
+        full_value_states = v_flat[:, :total_len, :].unsqueeze(0) # [1, 4, seq, 64]
         
-       # 5. Attention & Output 연산
-        # [★가장 중요★] 연산 전 모든 텐서의 타입을 query_states(Half/BFloat16)에 맞춥니다.
-        # full_key_states와 full_value_states는 Float32일 수 있으므로 강제 변환이 필요합니다.
-        full_key_states = full_key_states.to(query_states.dtype)
-        full_value_states = full_value_states.to(query_states.dtype)
+        # [★핵심 수정★] GQA 처리: 4개의 헤드를 32개로 확장합니다. (num_key_value_groups = 8)
+        # 이 과정을 거쳐야 Dimension 1의 크기가 32로 일치하게 됩니다.
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)   # [1, 32, seq, 64]
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) # [1, 32, seq, 64]
 
-        # 이제 (Half @ Half) 연산이 정상적으로 수행됩니다.
+        # 6. Attention 연산 (이제 32 vs 32로 크기가 맞습니다)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
         if attention_mask is not None:
