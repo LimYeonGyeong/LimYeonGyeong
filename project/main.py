@@ -83,7 +83,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-prompt = """### Instruction:\nIn this context, "LLM" means "Large Language Model". Explain it in one simple sentence that a university student can understand.\n### Response:\n"""
+prompt = """### Instruction:\nIn this context, "LLM" means "Large Language Model". Explain it in one simple sentence.\n### Response:\n"""
 
 # --- Baseline 측정 ---
 model_base = AutoModelForCausalLM.from_pretrained(
