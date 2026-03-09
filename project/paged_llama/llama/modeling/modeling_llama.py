@@ -647,30 +647,27 @@ class PagedLlamaAttention(nn.Module):
         full_key_states = k_flat[:, :start_pos + q_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :start_pos + q_len, :].unsqueeze(0)
         
-        # GQA 확장 (4 -> 32 heads)
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+       # 5. Attention & Output 연산
+        # [★가장 중요★] 연산 전 모든 텐서의 타입을 query_states(Half/BFloat16)에 맞춥니다.
+        # full_key_states와 full_value_states는 Float32일 수 있으므로 강제 변환이 필요합니다.
+        full_key_states = full_key_states.to(query_states.dtype)
+        full_value_states = full_value_states.to(query_states.dtype)
 
-        # 6. Attention 연산
-        # query_states: [1, 32, 1, 64], full_key_states: [1, 32, seq, 64]
+        # 이제 (Half @ Half) 연산이 정상적으로 수행됩니다.
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :full_key_states.shape[-2]].to(target_dtype)
-            attn_weights = attn_weights + causal_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(target_dtype)
         
-        # [★핵심 수정] 여기서 attn_output이 처음으로 정의됩니다.
-        # attn_weights: [1, 32, 1, seq] @ full_value_states: [1, 32, seq, 64]
+        if attention_mask is not None:
+            # 마스크 역시 연산을 위해 타입을 맞춰줍니다.
+            attn_weights = attn_weights + attention_mask[:, :, :, :full_key_states.shape[-2]].to(query_states.dtype)
+
+        # Softmax는 수치적 안정성을 위해 내부에서 Float32로 계산 후 다시 원래 타입으로 복원합니다.
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, full_value_states)
 
-        # 7. 출력 형태 및 데이터 타입 복원
-        # 이제 attn_output이 정의되었으므로 에러 없이 실행됩니다.
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # 6. 최종 출력 형태 및 타입 복원 (MLP 레이어 에러 방지)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         
-        # 원래 모델 타입(BFloat16/Half)으로 최종 변환하여 반환
+        # original_dtype(BFloat16/Half)로 최종 변환
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
