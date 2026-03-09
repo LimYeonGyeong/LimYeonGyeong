@@ -614,14 +614,13 @@ class PagedLlamaAttention(nn.Module):
         target_device = self.q_proj.weight.device
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
 
-        # [수정 핵심] 2. block_table이 None일 경우에 대한 예외 처리
+        # 2. PagePool 및 BlockTable 설정
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
         if block_table is None:
-            if pool is not None:
-                # 실험 환경: Pool의 블록들을 순차적으로 사용하는 기본 테이블 생성
-                block_table = torch.arange(pool.num_blocks, device=target_device).view(1, -1)
-            else:
-                raise ValueError("PagedAttention을 실행하려면 PagePool 또는 BlockTable이 필요합니다.")
+            # 프로토타입: 각 레이어별로 독립된 블록 범위를 가지도록 설정 (레이어당 100개 블록 가정)
+            # 이렇게 해야 레이어끼리 데이터가 섞이지 않습니다.
+            layer_offset = self.layer_idx * 100 
+            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
 
         # 3. Projection (Q, K, V 생성)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -634,7 +633,7 @@ class PagedLlamaAttention(nn.Module):
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # =================================================================
-        # [핵심] 4. Paged KV Cache : WRITE (모든 토큰 저장)
+        # [핵심] 4. Paged KV Cache : WRITE (레이어 간섭 방지)
         # =================================================================
         start_pos = position_ids[0, 0].item() 
         
@@ -643,14 +642,14 @@ class PagedLlamaAttention(nn.Module):
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # 주소록(block_table)에서 실제 창고 번호(physical_block_idx)를 찾음
+            # 레이어 전용 물리 블록 번호 획득
             physical_block_idx = block_table[0, block_idx_logic].item()
             
-            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :]
-            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :]
+            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
         # =================================================================
-        # [핵심] 5. Paged KV Cache : READ (Gather & Align)
+        # [핵심] 5. Paged KV Cache : READ (Gather & GQA Expansion)
         # =================================================================
         active_indices = block_table[0]
         block_indices_tensor = torch.tensor(active_indices, device=pool.device)
@@ -658,31 +657,19 @@ class PagedLlamaAttention(nn.Module):
         k_blocks = pool.k_cache.index_select(0, block_indices_tensor)
         v_blocks = pool.v_cache.index_select(0, block_indices_tensor)
         
-        # 데이터 정렬 (헤드가 섞이지 않도록 transpose 사용)
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+        # 데이터 정렬 및 타입 변환
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim).to(query_states.dtype)
         
         total_len = start_pos + q_len
         full_key_states = k_flat[:, :total_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :total_len, :].unsqueeze(0)
         
         # GQA 처리 (4헤드 -> 32헤드 확장)
-        # [최종 수정] 5. Attention 연산 전 타입 및 차원 일치화
-        # 1) 타입을 BFloat16으로 통일
-        full_key_states = full_key_states.to(query_states.dtype)
-        full_value_states = full_value_states.to(query_states.dtype)
-
-        # 2) [핵심] 4개 헤드를 32개로 확장 (repeat_kv)
-        # full_key_states: [1, 4, seq, 64] -> [1, 32, seq, 64]
-        full_key_states = full_key_states.to(query_states.dtype)
-        full_value_states = full_value_states.to(query_states.dtype)
-
-        # 2. [★가장 중요★] 4개인 KV 헤드를 32개로 확장합니다. (num_key_value_groups=8)
-        # 이 과정을 거쳐야 Query(32헤드)와 Key(32헤드)가 1:1로 매칭되어 정확한 문맥을 읽습니다.
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        # 3. 이제 정상적인 어텐션 스코어 계산이 가능합니다.
+        # 6. Attention 연산
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
