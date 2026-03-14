@@ -642,26 +642,25 @@ class PagedLlamaAttention(nn.Module):
             if 0 <= physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-        ## 5. Paged KV Cache : READ (정확한 차원 재구성)
+        # 5. Paged KV Cache : READ (차원 순서 완벽 복원)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
-        
-        # [★수정] 현재 레이어의 블록들만 정확히 가져옴
         active_indices = block_table[0, :num_needed_blocks].to(target_device)
-        if self.layer_idx == 0: # 모든 레이어를 찍으면 너무 많으므로 0번 레이어만 확인
-            print(f"[READ] Layer 0 | Total Seq: {total_seq_len} | Blocks: {active_indices.tolist()}")
-        k_blocks = pool.k_cache.index_select(0, active_indices) # [num_blocks, num_kv_heads, block_size, head_dim]
+        
+        k_blocks = pool.k_cache.index_select(0, active_indices) 
         v_blocks = pool.v_cache.index_select(0, active_indices)
 
-        # [★수정] 차원 재구성 (중요: num_blocks와 block_size를 합쳐서 seq_len으로 복원)
-        # k_blocks: [B, H, S, D] 형태로 만들기 위해 transpose와 reshape를 정밀하게 수행
+        # [★핵심 수정] 
+        # k_blocks는 현재 [num_blocks, num_heads, block_size, head_dim]입니다.
+        # 이를 시퀀스 순서대로 합치려면 (num_heads)를 맨 앞으로 빼고, 
+        # (num_blocks)와 (block_size)를 인접하게 두어 reshape 해야 합니다.
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
-        # 현재까지의 실제 길이만큼 슬라이싱 (남는 패딩 제거)
+        # [★핵심 수정] Llama 어텐션은 (batch, heads, seq, dim) 형식을 기대합니다.
+        # k_flat을 (1, heads, seq, dim)으로 명확히 변형합니다.
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
-        
         # GQA 확장 (4 heads -> 32 heads)
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
