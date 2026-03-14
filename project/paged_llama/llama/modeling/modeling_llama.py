@@ -23,7 +23,7 @@
 import torch
 from torch import nn
 import math
-from typing import Optional, Callable, Union, List
+from typing import Optional, Callable, Any, Union, List
 
 from ..activations import ACT2FN
 from ..memory.cache_utils import Cache, DynamicCache
