@@ -637,6 +637,8 @@ class PagedLlamaAttention(nn.Module):
             if 0 <= physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+                if i == 0: 
+                    print(f"[WRITE] Layer {self.layer_idx} | Pos {abs_pos} -> Physical Block {physical_block_idx}")                
 
         ## 5. Paged KV Cache : READ (정확한 차원 재구성)
         total_seq_len = start_pos + q_len
@@ -644,6 +646,8 @@ class PagedLlamaAttention(nn.Module):
         
         # [★수정] 현재 레이어의 블록들만 정확히 가져옴
         active_indices = block_table[0, :num_needed_blocks].to(target_device)
+        if self.layer_idx == 0: # 모든 레이어를 찍으면 너무 많으므로 0번 레이어만 확인
+            print(f"[READ] Layer 0 | Total Seq: {total_seq_len} | Blocks: {active_indices.tolist()}")
         k_blocks = pool.k_cache.index_select(0, active_indices) # [num_blocks, num_kv_heads, block_size, head_dim]
         v_blocks = pool.v_cache.index_select(0, active_indices)
 
