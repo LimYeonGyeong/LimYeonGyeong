@@ -588,10 +588,16 @@ class PagedLlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Any] = None, # [수정] 이 인자가 들어와야 시퀀스 길이를 추적함
-        use_cache: bool = False,               # [수정] generate 루프를 위해 필요
+        past_key_value: Optional[Any] = None, # Any를 쓰려면 상단에 import typing 필요
+        use_cache: bool = False,
+        block_table: Optional[torch.Tensor] = None, # [★중요] 이 줄이 누락되었는지 확인하세요!
         **kwargs
     ) -> tuple[torch.Tensor, Optional[Any]]:
+        
+        # 이제 아래 로직이 정상 작동합니다.
+        effective_block_table = block_table
+        if effective_block_table is None:
+            effective_block_table = getattr(self, 'block_table', None)
         
         # 1. 초기 설정 및 타겟 디바이스/타입 명시
         original_dtype = hidden_states.dtype
