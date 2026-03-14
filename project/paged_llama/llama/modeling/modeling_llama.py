@@ -603,14 +603,29 @@ class PagedLlamaAttention(nn.Module):
         # 2. PagePool 및 BlockTable 정밀 확보
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
         
-        # [★에러 방지] block_table이 없거나 객체인 경우를 위한 텐서 강제 변환
-        if block_table is None:
+        # ---------------------------------------------------------
+        # [★핵심 수정] 주입된 self.block_table을 무시하지 않도록 변경
+        # ---------------------------------------------------------
+        # 1. 먼저 외부에서 block_table이 들어왔는지 확인
+        effective_block_table = block_table
+        
+        # 2. 외부 인자가 없다면, main.py에서 주입한 self.block_table을 확인
+        if effective_block_table is None:
+            effective_block_table = getattr(self, 'block_table', None)
+        
+        # 3. 둘 다 없는 경우에만 '최후의 수단'으로 가짜 테이블 생성
+        if effective_block_table is None:
             layer_offset = self.layer_idx * 100
-            block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
-        elif hasattr(block_table, "to_tensor"):
-            block_table = block_table.to_tensor(device=target_device)
+            effective_block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
+        
+        # 4. 가져온 테이블이 BlockTable 객체라면 텐서로 변환
+        if hasattr(effective_block_table, "to_tensor"):
+            block_table = effective_block_table.to_tensor(device=target_device)
         else:
-            block_table = block_table.to(device=target_device)
+            block_table = effective_block_table.to(device=target_device)
+        # ---------------------------------------------------------
+
+        # 3. Projection 및 RoPE (이후부터는 동일)
 
         # 3. Projection 및 RoPE (Q, K, V)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
