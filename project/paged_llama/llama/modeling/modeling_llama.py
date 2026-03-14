@@ -626,20 +626,22 @@ class PagedLlamaAttention(nn.Module):
         
         for i in range(q_len):
             abs_pos = start_pos + i
+            # 현재 토큰이 들어가야 할 '정확한' 논리 블록 순서
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★에러 방지] 논리 인덱스가 테이블 크기를 절대 넘지 않도록 제한
-            safe_logic_idx = min(block_idx_logic, block_table.size(1) - 1)
-            physical_block_idx = block_table[0, safe_logic_idx].item()
+            # [★수정] 레이어의 block_table에서 현재 시퀀스 위치에 맞는 블록을 정확히 선택
+            # 만약 block_idx_logic이 table 범위를 넘으면 마지막 블록이라도 쓰게 함
+            target_idx = min(block_idx_logic, block_table.size(1) - 1)
+            physical_block_idx = block_table[0, target_idx].item()
             
-            # 물리 주소가 실제 PagePool 크기 내에 있는지 확인
+            # [검증] 쓰는 위치가 매번 정확히 계산되는지 확인
+            if i == 0 or abs_pos % 16 == 0: # 블록이 바뀔 때만 출력
+                print(f"[WRITE] Layer {self.layer_idx} | Pos {abs_pos} -> Block {physical_block_idx}")
+
             if 0 <= physical_block_idx < pool.k_cache.size(0):
                 pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
                 pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-                if i == 0: 
-                    print(f"[WRITE] Layer {self.layer_idx} | Pos {abs_pos} -> Physical Block {physical_block_idx}")                
-
         ## 5. Paged KV Cache : READ (정확한 차원 재구성)
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size

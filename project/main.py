@@ -121,7 +121,7 @@ for i, layer in enumerate(model_paged.model.layers):
     # 레이어마다 별도의 BlockTable과 블록들을 할당
     layer_table = BlockTable(block_size=16)
     # 레이어당 블록 50개씩 독립적으로 할당 (22개 레이어 총 1100개 사용)
-    for _ in range(50):
+    for _ in range(100):
         layer_table.add_block(pool.allocate())
     
     new_attn.to(device)
