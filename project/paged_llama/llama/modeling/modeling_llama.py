@@ -645,47 +645,68 @@ class PagedLlamaAttention(nn.Module):
         # 4. Paged KV Cache : WRITE (안전한 경계 체크)
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
+        # 4. Paged KV Cache : WRITE (정합성 검증 로직 추가)
+        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
+        
         for i in range(q_len):
             abs_pos = start_pos + i
-            # 현재 토큰이 들어가야 할 '정확한' 논리 블록 순서
+            # 현재 토큰의 논리적 블록 위치 계산
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [★수정] 레이어의 block_table에서 현재 시퀀스 위치에 맞는 블록을 정확히 선택
-            # 만약 block_idx_logic이 table 범위를 넘으면 마지막 블록이라도 쓰게 함
-            target_idx = min(block_idx_logic, block_table.size(1) - 1)
-            physical_block_idx = block_table[0, target_idx].item()
-            
-            # [검증] 쓰는 위치가 매번 정확히 계산되는지 확인
-            if i == 0 or abs_pos % 16 == 0: # 블록이 바뀔 때만 출력
-                print(f"[WRITE] Layer {self.layer_idx} | Pos {abs_pos} -> Block {physical_block_idx}")
+            # [검증 1] block_table의 크기가 현재 시퀀스 길이를 감당할 수 있는지 확인
+            if block_idx_logic >= block_table.size(1):
+                # 이 에러가 발생한다면 main.py에서 할당한 블록 개수가 부족한 것입니다.
+                raise IndexError(f"[ERROR] Layer {self.layer_idx} | block_table size ({block_table.size(1)}) is too small for logical block index {block_idx_logic} at pos {abs_pos}")
 
-            if 0 <= physical_block_idx < pool.k_cache.size(0):
-                pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-                pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-        # 5. Paged KV Cache : READ (차원 순서 완벽 복원)
+            # [★수정] 정확한 논리 인덱스에 매핑된 물리 블록 ID 추출
+            physical_block_idx = block_table[0, block_idx_logic].item()
+            
+            # [검증 2] 물리 블록 인덱스가 유효한 범위인지 확인
+            if not (0 <= physical_block_idx < pool.k_cache.size(0)):
+                raise ValueError(f"[ERROR] Layer {self.layer_idx} | Physical block index {physical_block_idx} is out of PagePool range!")
+
+            # [로그] 블록이 전환되거나 첫 토큰일 때만 출력 (성능 영향 최소화)
+            if i == 0 or abs_pos % pool.block_size == 0:
+                print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (LogicBlock {block_idx_logic}) -> PhysicalBlock {physical_block_idx}")
+
+        # 5. Paged KV Cache : READ (차원 순서 완벽 복원 및 검증)
         total_seq_len = start_pos + q_len
+        # 현재까지 쌓인 전체 토큰을 담기 위해 필요한 블록 개수 계산
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
+        
+        # [검증] 주입된 block_table에서 현재 시퀀스 길이에 필요한 만큼의 물리 블록 인덱스만 추출
+        # block_table[0, :num_needed_blocks]를 통해 쓰기 시 사용한 블록 순서를 그대로 가져옴
+        if num_needed_blocks > block_table.size(1):
+             raise RuntimeError(f"Layer {self.layer_idx} | Block table size too small! Need {num_needed_blocks} blocks but only have {block_table.size(1)}")
+        
         active_indices = block_table[0, :num_needed_blocks].to(target_device)
         
+        # [로그] 읽기 정합성 확인용 (디버깅 시 주석 해제)
+        # if start_pos % 16 == 0:
+        #     print(f"[VERIFY-READ] Layer {self.layer_idx} | TotalSeq: {total_seq_len} | Blocks: {active_indices.tolist()}")
+
+        # 물리 메모리(PagePool)에서 필요한 블록들만 쏙쏙 골라냄
+        # 결과 차원: [num_needed_blocks, num_kv_heads, block_size, head_dim]
         k_blocks = pool.k_cache.index_select(0, active_indices) 
         v_blocks = pool.v_cache.index_select(0, active_indices)
 
-        # [★핵심 수정] 
-        # k_blocks는 현재 [num_blocks, num_heads, block_size, head_dim]입니다.
-        # 이를 시퀀스 순서대로 합치려면 (num_heads)를 맨 앞으로 빼고, 
-        # (num_blocks)와 (block_size)를 인접하게 두어 reshape 해야 합니다.
+        # [★차원 복원 핵심]
+        # 1. transpose(0, 1): [num_kv_heads, num_needed_blocks, block_size, head_dim]
+        # 2. reshape: [num_kv_heads, num_needed_blocks * block_size, head_dim] -> 시퀀스 방향으로 이어붙임
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
-        # [★핵심 수정] Llama 어텐션은 (batch, heads, seq, dim) 형식을 기대합니다.
-        # k_flat을 (1, heads, seq, dim)으로 명확히 변형합니다.
+        # 3. 슬라이싱: 실제 데이터가 들어있는 total_seq_len만큼만 자름 (나머지 padding 제거)
+        # 4. unsqueeze(0): Llama 어텐션 규격인 (batch=1, heads, seq, dim)으로 맞춤
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
-        # GQA 확장 (4 heads -> 32 heads)
+        
+        # 5. GQA(Grouped Query Attention) 처리
+        # KV 헤드 수가 Query 헤드 수보다 적을 경우, 이를 반복하여 32헤드 등으로 확장
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups) 
-
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+        
         # 6. Attention 연산 (수치 안정성 및 마스크)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
