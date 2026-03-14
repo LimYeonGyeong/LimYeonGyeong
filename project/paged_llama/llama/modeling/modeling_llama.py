@@ -586,11 +586,12 @@ class PagedLlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        block_table: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Any] = None, # [수정] 이 인자가 들어와야 시퀀스 길이를 추적함
+        use_cache: bool = False,               # [수정] generate 루프를 위해 필요
         **kwargs
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[Any]]:
         
         # 1. 초기 설정 및 타겟 디바이스/타입 명시
         original_dtype = hidden_states.dtype
@@ -624,8 +625,7 @@ class PagedLlamaAttention(nn.Module):
         else:
             block_table = effective_block_table.to(device=target_device)
         # ---------------------------------------------------------
-
-        # 3. Projection 및 RoPE (이후부터는 동일)
+        present_key_value = past_key_value
 
         # 3. Projection 및 RoPE (Q, K, V)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -696,4 +696,5 @@ class PagedLlamaAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
-        return attn_output, None
+        # [수정] None 대신 present_key_value를 반환하여 HF 스케줄러가 다음 토큰 위치를 알게 합니다.
+        return attn_output, present_key_value
