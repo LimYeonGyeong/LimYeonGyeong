@@ -729,4 +729,4 @@ class PagedLlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         # [수정] None 대신 present_key_value를 반환하여 HF 스케줄러가 다음 토큰 위치를 알게 합니다.
-        return attn_output, present_key_value
+        return attn_output, None
