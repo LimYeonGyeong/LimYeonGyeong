@@ -1,29 +1,28 @@
 # paged_llama/llama/memory/page_pool.py
 import torch
 
+# page_pool.py의 __init__ 부분
 class PagePool:
-    def __init__(self, num_blocks, num_heads, block_size, head_dim, device="cuda", dtype=torch.float16):
+    def __init__(self, num_blocks, num_layers, num_heads, block_size, head_dim, device="cuda", dtype=torch.float16):
         self.num_blocks = num_blocks
+        self.num_layers = num_layers  # 추가
         self.block_size = block_size
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.device = device
-        self.dtype = dtype # 타입 저장
+        self.dtype = dtype
 
-        # [★핵심] k_cache와 v_cache를 주입받은 dtype으로 생성
-        # 차원 순서: [블록 개수, 헤드 수, 블록 내 토큰 수, 헤드 차원]
+        # [★핵심 수정] (num_blocks, num_layers, ...) 형태로 레이어 차원 삽입
         self.k_cache = torch.zeros(
-            (num_blocks, num_heads, block_size, head_dim),
+            (num_blocks, num_layers, num_heads, block_size, head_dim),
             dtype=dtype,
             device=device
         )
         self.v_cache = torch.zeros(
-            (num_blocks, num_heads, block_size, head_dim),
+            (num_blocks, num_layers, num_heads, block_size, head_dim),
             dtype=dtype,
             device=device
         )
-        
-        # 자유 블록 리스트 (빈 블록 관리)
         self.free_blocks = list(range(num_blocks))
 
     def allocate(self):

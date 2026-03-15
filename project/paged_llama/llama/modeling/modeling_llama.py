@@ -675,9 +675,9 @@ class PagedLlamaAttention(nn.Module):
                 print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}")
 
             # 실제 PagePool 메모리에 K, V 값 기록
-            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :]
-            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :] 
-        
+            pool.k_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+            pool.v_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
+
         # 5. Paged KV Cache : READ (차원 순서 완벽 복원 및 검증)
         total_seq_len = start_pos + q_len
         # 현재까지 쌓인 전체 토큰을 담기 위해 필요한 블록 개수 계산
@@ -696,14 +696,14 @@ class PagedLlamaAttention(nn.Module):
 
         # 물리 메모리(PagePool)에서 필요한 블록들만 쏙쏙 골라냄
         # 결과 차원: [num_needed_blocks, num_kv_heads, block_size, head_dim]
+        # 1. 물리 블록들을 긁어옴 [num_needed_blocks, num_layers, num_heads, block_size, head_dim]
         k_blocks = pool.k_cache.index_select(0, active_indices) 
         v_blocks = pool.v_cache.index_select(0, active_indices)
 
-        # [★차원 복원 핵심]
-        # 1. transpose(0, 1): [num_kv_heads, num_needed_blocks, block_size, head_dim]
-        # 2. reshape: [num_kv_heads, num_needed_blocks * block_size, head_dim] -> 시퀀스 방향으로 이어붙임
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+        # 2. [★수정] 그 중에서 '현재 레이어'의 데이터만 슬라이싱함
+        # 결과 차원: [num_needed_blocks, num_heads, block_size, head_dim]
+        k_blocks = k_blocks[:, self.layer_idx]
+        v_blocks = v_blocks[:, self.layer_idx]
         
         # 3. 슬라이싱: 실제 데이터가 들어있는 total_seq_len만큼만 자름 (나머지 padding 제거)
         # 4. unsqueeze(0): Llama 어텐션 규격인 (batch=1, heads, seq, dim)으로 맞춤
@@ -727,7 +727,7 @@ class PagedLlamaAttention(nn.Module):
 
         # 6. Attention 연산 (이제 두 텐서의 타입이 Half로 일치하여 에러가 나지 않습니다)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
+
         if attention_mask is not None:
             # [★수정] 마스크 길이를 현재 캐시 데이터 길이에 정확히 맞춤
             mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)

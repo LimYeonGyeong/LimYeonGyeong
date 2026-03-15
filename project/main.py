@@ -106,17 +106,16 @@ model_paged = AutoModelForCausalLM.from_pretrained(
 
 # [★핵심 수정] 모델의 실제 dtype을 가져옵니다. (보통 float16)
 model_dtype = model_paged.dtype 
+# main.py의 PagePool 생성 부분
 config = model_paged.config
-
-# 캐시 풀 생성 시 모델과 동일한 dtype 주입
-# PagePool 생성 시 모델의 dtype을 명시적으로 전달
 pool = PagePool(
     num_blocks=2500, 
+    num_layers=config.num_hidden_layers,  # [★추가] 보통 22
     num_heads=config.num_key_value_heads, 
     block_size=16, 
     head_dim=config.hidden_size // config.num_attention_heads, 
     device=device,
-    dtype=model_paged.dtype # <--- 추가됨
+    dtype=model_paged.dtype
 )
 
 shared_block_table = BlockTable(block_size=16)
