@@ -675,9 +675,9 @@ class PagedLlamaAttention(nn.Module):
                 print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}")
 
             # 실제 PagePool 메모리에 K, V 값 기록
-            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-
+            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :]
+            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :] 
+        
         # 5. Paged KV Cache : READ (차원 순서 완벽 복원 및 검증)
         total_seq_len = start_pos + q_len
         # 현재까지 쌓인 전체 토큰을 담기 위해 필요한 블록 개수 계산
@@ -707,8 +707,8 @@ class PagedLlamaAttention(nn.Module):
         
         # 3. 슬라이싱: 실제 데이터가 들어있는 total_seq_len만큼만 자름 (나머지 padding 제거)
         # 4. unsqueeze(0): Llama 어텐션 규격인 (batch=1, heads, seq, dim)으로 맞춤
-        full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
-        full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0).to(target_dtype)
+        full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
+        full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
         
         # 5. GQA(Grouped Query Attention) 처리
         # KV 헤드 수가 Query 헤드 수보다 적을 경우, 이를 반복하여 32헤드 등으로 확장

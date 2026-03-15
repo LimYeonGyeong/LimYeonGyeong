@@ -97,25 +97,29 @@ from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.block_table import BlockTable
 
+
 model_paged = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, 
     torch_dtype=torch.float16 if device=="cuda" else torch.float32, 
     device_map=device
 )
+
+# [★핵심 수정] 모델의 실제 dtype을 가져옵니다. (보통 float16)
+model_dtype = model_paged.dtype 
 config = model_paged.config
 
-# 1. 공통 자원 풀 생성
+# 캐시 풀 생성 시 모델과 동일한 dtype 주입
 pool = PagePool(
     num_blocks=2500, 
     num_heads=config.num_key_value_heads, 
     block_size=16, 
     head_dim=config.hidden_size // config.num_attention_heads, 
-    device=device
+    device=device,
+    dtype=model_dtype  # <--- [★이 부분이 핵심]
 )
 
-# 2. [★핵심] 모든 레이어가 공유할 '단 하나'의 BlockTable 생성
-# 레이어마다 따로 만들면 읽기/쓰기 주소가 어긋나서 답변이 깨집니다.
 shared_block_table = BlockTable(block_size=16)
+# ... (이후 블록 할당 및 레이어 패치 로직은 동일)
 
 # 테스트 문장에 필요한 충분한 블록 할당 (예: 100개)
 for _ in range(100):
