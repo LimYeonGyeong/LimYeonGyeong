@@ -5,14 +5,10 @@ import torch
 class PagePool:
     def __init__(self, num_blocks, num_layers, num_heads, block_size, head_dim, device="cuda", dtype=torch.float16):
         self.num_blocks = num_blocks
-        self.num_layers = num_layers  # 추가
+        self.num_layers = num_layers
         self.block_size = block_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.device = device
-        self.dtype = dtype
-
-        # [★핵심 수정] (num_blocks, num_layers, ...) 형태로 레이어 차원 삽입
+        
+        # [★핵심] 레이어별 독립 공간 확보: (Blocks, Layers, Heads, Tokens, Dim)
         self.k_cache = torch.zeros(
             (num_blocks, num_layers, num_heads, block_size, head_dim),
             dtype=dtype,

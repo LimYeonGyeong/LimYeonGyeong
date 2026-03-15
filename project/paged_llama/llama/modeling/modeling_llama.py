@@ -675,9 +675,8 @@ class PagedLlamaAttention(nn.Module):
                 print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}")
 
             # 실제 PagePool 메모리에 K, V 값 기록
-            pool.k_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
-            pool.v_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
-
+            pool.k_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = key_states[0, :, i, :]
+            pool.v_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = value_states[0, :, i, :]
         # 5. Paged KV Cache : READ
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
@@ -688,15 +687,14 @@ class PagedLlamaAttention(nn.Module):
         # 블록 테이블에서 필요한 물리 블록 인덱스 추출
         active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
         
-        # [★1번 해결 반영] 레이어 차원이 포함된 캐시에서 현재 레이어 데이터만 추출
-        # pool.k_cache shape: [num_blocks, num_layers, num_heads, block_size, head_dim]
+        # 5. Paged KV Cache : READ
+        # index_select(0, ...)는 블록들을 가져오므로 결과는 [num_needed_blocks, num_layers, heads, tokens, dim]
+        # 여기서 [:, self.layer_idx]를 통해 자기 레이어 데이터만 쏙 빼옵니다.
         k_blocks = pool.k_cache.index_select(0, active_indices)[:, self.layer_idx] 
         v_blocks = pool.v_cache.index_select(0, active_indices)[:, self.layer_idx]
-        # 추출 후 shape: [num_needed_blocks, num_heads, block_size, head_dim]
-
-        # [★중요] k_flat, v_flat 정의 (에러 발생 지점)
-        # 차원 순서 변경: [num_heads, num_needed_blocks, block_size, head_dim]
-        # reshape: [num_heads, num_needed_blocks * block_size, head_dim]
+        
+        # 추출 후 k_blocks shape: [num_needed_blocks, num_heads, block_size, head_dim]
+        # 이제 안전하게 Flatten 하여 Attention에 넣습니다.
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
