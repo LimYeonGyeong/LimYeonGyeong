@@ -630,7 +630,7 @@ class PagedLlamaAttention(nn.Module):
             block_table_tensor = target_block_table.to_tensor(device=target_device)
         else:
             block_table_tensor = target_block_table.to(device=target_device)
-        present_key_value = past_key_value
+
 
         # 3. Projection 및 RoPE (Q, K, V)
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
