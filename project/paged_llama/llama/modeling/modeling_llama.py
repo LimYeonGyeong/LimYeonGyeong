@@ -615,17 +615,30 @@ class PagedLlamaAttention(nn.Module):
         # ---------------------------------------------------------
         # [★해결 1] BlockTable 객체와 텐서 변환 로직 통합
         # ---------------------------------------------------------
-        # 우선순위: 인자로 받은 block_table > 객체 내부 self.block_table
-        target_block_table = block_table if block_table is not None else getattr(self, 'block_table', None)
+       # ---------------------------------------------------------
+        # [수정] block_table 확보 로직 (더 안전하게)
+        # ---------------------------------------------------------
+        # 1. 인자로 들어온 것 확인
+        target_block_table = block_table
         
+        # 2. 인자가 없다면 self에 등록된 것 확인
         if target_block_table is None:
-            raise ValueError(f"[ERROR] Layer {self.layer_idx} | No block_table provided.")
+            target_block_table = getattr(self, 'block_table', None)
+            
+        # 3. 그래도 없다면? 에러 메시지를 상세히 출력해서 디버깅을 돕습니다.
+        if target_block_table is None:
+            raise ValueError(
+                f"Layer {self.layer_idx}: block_table is None! "
+                f"Check if it was injected in main.py or passed in forward."
+            )
         
-        # BlockTable 객체인 경우 to_tensor() 호출하여 연산용 텐서(block_table_tensor) 확보
+        # 4. 객체라면 텐서로 변환, 텐서라면 그대로 사용
         if hasattr(target_block_table, "to_tensor"):
             block_table_tensor = target_block_table.to_tensor(device=target_device)
         else:
             block_table_tensor = target_block_table.to(device=target_device)
+            
+        # 이후 모든 로직에서 'block_table' 대신 'block_table_tensor' 변수명을 사용하세요.
         # ---------------------------------------------------------
 
         present_key_value = past_key_value
@@ -672,10 +685,10 @@ class PagedLlamaAttention(nn.Module):
         
         # [검증] 주입된 block_table에서 현재 시퀀스 길이에 필요한 만큼의 물리 블록 인덱스만 추출
         # block_table[0, :num_needed_blocks]를 통해 쓰기 시 사용한 블록 순서를 그대로 가져옴
-        if num_needed_blocks > block_table.size(1):
+        if num_needed_blocks > block_table_tensor.size(1):
             raise RuntimeError(f"Layer {self.layer_idx} | Block table size too small! Need {num_needed_blocks} blocks but only have {block_table.size(1)}")
         
-        active_indices = block_table[0, :num_needed_blocks].to(target_device)
+        active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
         
         # [로그] 읽기 정합성 확인용 (디버깅 시 주석 해제)
         # if start_pos % 16 == 0:

@@ -91,6 +91,7 @@ gc.collect()
 if device == "cuda": torch.cuda.empty_cache()
 
 # --- PagedAttention 측정 ---
+# --- PagedAttention 측정 ---
 print(">>> PagedAttention 로딩 및 패치 중...")
 from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
@@ -102,6 +103,8 @@ model_paged = AutoModelForCausalLM.from_pretrained(
     device_map=device
 )
 config = model_paged.config
+
+# 1. 공통 자원 풀 생성
 pool = PagePool(
     num_blocks=2500, 
     num_heads=config.num_key_value_heads, 
@@ -110,27 +113,31 @@ pool = PagePool(
     device=device
 )
 
-table = BlockTable(block_size=16)
-first_block = pool.allocate() 
-table.add_block(first_block)
+# 2. [★핵심] 모든 레이어가 공유할 '단 하나'의 BlockTable 생성
+# 레이어마다 따로 만들면 읽기/쓰기 주소가 어긋나서 답변이 깨집니다.
+shared_block_table = BlockTable(block_size=16)
 
+# 테스트 문장에 필요한 충분한 블록 할당 (예: 100개)
+for _ in range(100):
+    shared_block_table.add_block(pool.allocate())
+
+# 3. 레이어 패치 루프
 for i, layer in enumerate(model_paged.model.layers):
-    new_attn = PagedLlamaAttention(config=config, layer_idx=i) # layer_idx 명시
+    new_attn = PagedLlamaAttention(config=config, layer_idx=i)
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
-    
-    # 레이어마다 별도의 BlockTable과 블록들을 할당
-    layer_table = BlockTable(block_size=16)
-    # 레이어당 블록 50개씩 독립적으로 할당 (22개 레이어 총 1100개 사용)
-    for _ in range(100):
-        layer_table.add_block(pool.allocate())
     
     new_attn.to(device)
     new_attn.page_pool = pool
-    # [중요] 텐서로 변환하여 주입
-    new_attn.block_table = layer_table.to_tensor(device=device) 
+    
+    # 4. [★핵심] 모든 레이어에 '동일한' BlockTable 객체를 주입
+    # modeling_llama.py에서 hasattr(..., "to_tensor")로 처리하도록 설계했습니다.
+    new_attn.block_table = shared_block_table 
+    
     layer.self_attn = new_attn
 
+# 패치 완료 후 성능 측정
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
+
 # ==========================================
 # 4. 최종 결과 출력 (수정된 Key 반영)
 # ==========================================
