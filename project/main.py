@@ -44,7 +44,7 @@ def measure_performance(model, tokenizer, prompt_text):
             **inputs,
             max_new_tokens=20,
             do_sample=False,
-            use_cache=False
+            use_cache=True
         )
     if device == "cuda": torch.cuda.synchronize()
     t1 = time.time()
