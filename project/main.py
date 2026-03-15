@@ -109,13 +109,14 @@ model_dtype = model_paged.dtype
 config = model_paged.config
 
 # 캐시 풀 생성 시 모델과 동일한 dtype 주입
+# PagePool 생성 시 모델의 dtype을 명시적으로 전달
 pool = PagePool(
     num_blocks=2500, 
     num_heads=config.num_key_value_heads, 
     block_size=16, 
     head_dim=config.hidden_size // config.num_attention_heads, 
     device=device,
-    dtype=model_dtype  # <--- [★이 부분이 핵심]
+    dtype=model_paged.dtype # <--- 추가됨
 )
 
 shared_block_table = BlockTable(block_size=16)
