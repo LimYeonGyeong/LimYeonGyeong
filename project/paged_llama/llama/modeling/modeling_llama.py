@@ -678,44 +678,39 @@ class PagedLlamaAttention(nn.Module):
             pool.k_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
             pool.v_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
-        # 5. Paged KV Cache : READ (차원 순서 완벽 복원 및 검증)
+        # 5. Paged KV Cache : READ
         total_seq_len = start_pos + q_len
-        # 현재까지 쌓인 전체 토큰을 담기 위해 필요한 블록 개수 계산
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
-        # [검증] 주입된 block_table에서 현재 시퀀스 길이에 필요한 만큼의 물리 블록 인덱스만 추출
-        # block_table[0, :num_needed_blocks]를 통해 쓰기 시 사용한 블록 순서를 그대로 가져옴
         if num_needed_blocks > block_table_tensor.size(1):
             raise RuntimeError(f"Layer {self.layer_idx} | Block table size too small! Need {num_needed_blocks} blocks but only have {block_table.size(1)}")
         
+        # 블록 테이블에서 필요한 물리 블록 인덱스 추출
         active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
         
-        # [로그] 읽기 정합성 확인용 (디버깅 시 주석 해제)
-        # if start_pos % 16 == 0:
-        #     print(f"[VERIFY-READ] Layer {self.layer_idx} | TotalSeq: {total_seq_len} | Blocks: {active_indices.tolist()}")
+        # [★1번 해결 반영] 레이어 차원이 포함된 캐시에서 현재 레이어 데이터만 추출
+        # pool.k_cache shape: [num_blocks, num_layers, num_heads, block_size, head_dim]
+        k_blocks = pool.k_cache.index_select(0, active_indices)[:, self.layer_idx] 
+        v_blocks = pool.v_cache.index_select(0, active_indices)[:, self.layer_idx]
+        # 추출 후 shape: [num_needed_blocks, num_heads, block_size, head_dim]
 
-        # 물리 메모리(PagePool)에서 필요한 블록들만 쏙쏙 골라냄
-        # 결과 차원: [num_needed_blocks, num_kv_heads, block_size, head_dim]
-        # 1. 물리 블록들을 긁어옴 [num_needed_blocks, num_layers, num_heads, block_size, head_dim]
-        k_blocks = pool.k_cache.index_select(0, active_indices) 
-        v_blocks = pool.v_cache.index_select(0, active_indices)
-
-        # 2. [★수정] 그 중에서 '현재 레이어'의 데이터만 슬라이싱함
-        # 결과 차원: [num_needed_blocks, num_heads, block_size, head_dim]
-        k_blocks = k_blocks[:, self.layer_idx]
-        v_blocks = v_blocks[:, self.layer_idx]
+        # [★중요] k_flat, v_flat 정의 (에러 발생 지점)
+        # 차원 순서 변경: [num_heads, num_needed_blocks, block_size, head_dim]
+        # reshape: [num_heads, num_needed_blocks * block_size, head_dim]
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         
-        # 3. 슬라이싱: 실제 데이터가 들어있는 total_seq_len만큼만 자름 (나머지 padding 제거)
-        # 4. unsqueeze(0): Llama 어텐션 규격인 (batch=1, heads, seq, dim)으로 맞춤
+        # 실제 토큰 길이만큼 슬라이싱 및 Llama 규격으로 변환
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)
         
-        # 5. GQA(Grouped Query Attention) 처리
-        # KV 헤드 수가 Query 헤드 수보다 적을 경우, 이를 반복하여 32헤드 등으로 확장
+        # GQA 확장 전 dtype 맞춤
+        full_key_states = full_key_states.to(dtype=query_states.dtype)
+        full_value_states = full_value_states.to(dtype=query_states.dtype)
+
         # GQA 확장
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
-        
         # ---------------------------------------------------------
         # [★핵심 수정] dtype 불일치 해결 (Half vs Float 에러 방지)
         # ---------------------------------------------------------
