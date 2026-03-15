@@ -607,30 +607,27 @@ class PagedLlamaAttention(nn.Module):
         hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
         bsz, q_len, _ = hidden_states.size()
         
-        # 2. PagePool 및 BlockTable 정밀 확보
+        # 2. PagePool 확보
         pool = self.page_pool if self.page_pool is not None else getattr(self, 'pool', None)
-        
+        if pool is None:
+            raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
+
         # ---------------------------------------------------------
-        # [★핵심 수정] 주입된 self.block_table을 무시하지 않도록 변경
+        # [★해결 1] BlockTable 객체와 텐서 변환 로직 통합
         # ---------------------------------------------------------
-        # 1. 먼저 외부에서 block_table이 들어왔는지 확인
-        effective_block_table = block_table
+        # 우선순위: 인자로 받은 block_table > 객체 내부 self.block_table
+        target_block_table = block_table if block_table is not None else getattr(self, 'block_table', None)
         
-        # 2. 외부 인자가 없다면, main.py에서 주입한 self.block_table을 확인
-        if effective_block_table is None:
-            effective_block_table = getattr(self, 'block_table', None)
+        if target_block_table is None:
+            raise ValueError(f"[ERROR] Layer {self.layer_idx} | No block_table provided.")
         
-        # 3. 둘 다 없는 경우에만 '최후의 수단'으로 가짜 테이블 생성
-        if effective_block_table is None:
-            layer_offset = self.layer_idx * 100
-            effective_block_table = (torch.arange(100, device=target_device) + layer_offset).view(1, -1)
-        
-        # 4. 가져온 테이블이 BlockTable 객체라면 텐서로 변환
-        if hasattr(effective_block_table, "to_tensor"):
-            block_table = effective_block_table.to_tensor(device=target_device)
+        # BlockTable 객체인 경우 to_tensor() 호출하여 연산용 텐서(block_table_tensor) 확보
+        if hasattr(target_block_table, "to_tensor"):
+            block_table_tensor = target_block_table.to_tensor(device=target_device)
         else:
-            block_table = effective_block_table.to(device=target_device)
+            block_table_tensor = target_block_table.to(device=target_device)
         # ---------------------------------------------------------
+
         present_key_value = past_key_value
 
         # 3. Projection 및 RoPE (Q, K, V)
@@ -645,30 +642,28 @@ class PagedLlamaAttention(nn.Module):
         # 4. Paged KV Cache : WRITE (안전한 경계 체크)
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
-        # 4. Paged KV Cache : WRITE (정합성 검증 로직 추가)
+        # 4. Paged KV Cache : WRITE
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
         for i in range(q_len):
             abs_pos = start_pos + i
-            # 현재 토큰의 논리적 블록 위치 계산
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # [검증 1] block_table의 크기가 현재 시퀀스 길이를 감당할 수 있는지 확인
-            if block_idx_logic >= block_table.size(1):
-                # 이 에러가 발생한다면 main.py에서 할당한 블록 개수가 부족한 것입니다.
-                raise IndexError(f"[ERROR] Layer {self.layer_idx} | block_table size ({block_table.size(1)}) is too small for logical block index {block_idx_logic} at pos {abs_pos}")
+            # [검증] 논리 블록 인덱스가 텐서 범위를 넘지 않는지 확인
+            if block_idx_logic >= block_table_tensor.size(1):
+                raise IndexError(f"Layer {self.layer_idx} | block_idx_logic {block_idx_logic} out of range (size {block_table_tensor.size(1)})")
 
-            # [★수정] 정확한 논리 인덱스에 매핑된 물리 블록 ID 추출
-            physical_block_idx = block_table[0, block_idx_logic].item()
+            # [★해결 2] 정확한 물리 블록 ID 추출 및 데이터 쓰기
+            physical_block_idx = block_table_tensor[0, block_idx_logic].item()
             
-            # [검증 2] 물리 블록 인덱스가 유효한 범위인지 확인
-            if not (0 <= physical_block_idx < pool.k_cache.size(0)):
-                raise ValueError(f"[ERROR] Layer {self.layer_idx} | Physical block index {physical_block_idx} is out of PagePool range!")
-
-            # [로그] 블록이 전환되거나 첫 토큰일 때만 출력 (성능 영향 최소화)
+            # 검증 로그
             if i == 0 or abs_pos % pool.block_size == 0:
-                print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (LogicBlock {block_idx_logic}) -> PhysicalBlock {physical_block_idx}")
+                print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}")
+
+            # 실제 PagePool 메모리에 K, V 값 기록
+            pool.k_cache[physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+            pool.v_cache[physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype)
 
         # 5. Paged KV Cache : READ (차원 순서 완벽 복원 및 검증)
         total_seq_len = start_pos + q_len
@@ -678,7 +673,7 @@ class PagedLlamaAttention(nn.Module):
         # [검증] 주입된 block_table에서 현재 시퀀스 길이에 필요한 만큼의 물리 블록 인덱스만 추출
         # block_table[0, :num_needed_blocks]를 통해 쓰기 시 사용한 블록 순서를 그대로 가져옴
         if num_needed_blocks > block_table.size(1):
-             raise RuntimeError(f"Layer {self.layer_idx} | Block table size too small! Need {num_needed_blocks} blocks but only have {block_table.size(1)}")
+            raise RuntimeError(f"Layer {self.layer_idx} | Block table size too small! Need {num_needed_blocks} blocks but only have {block_table.size(1)}")
         
         active_indices = block_table[0, :num_needed_blocks].to(target_device)
         
