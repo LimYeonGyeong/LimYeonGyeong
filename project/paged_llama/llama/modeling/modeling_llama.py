@@ -584,15 +584,15 @@ class PagedLlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Any] = None, # Any를 쓰려면 상단에 import typing 필요
-        use_cache: bool = False,
-        block_table: Optional[torch.Tensor] = None, # [★중요] 이 줄이 누락되었는지 확인하세요!
-        **kwargs
-    ) -> tuple[torch.Tensor, Optional[Any]]:
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    **kwargs,
+    
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         # 이제 아래 로직이 정상 작동합니다.
         effective_block_table = block_table
@@ -615,32 +615,21 @@ class PagedLlamaAttention(nn.Module):
         # ---------------------------------------------------------
         # [★해결 1] BlockTable 객체와 텐서 변환 로직 통합
         # ---------------------------------------------------------
-       # ---------------------------------------------------------
+        # ---------------------------------------------------------
         # [수정] block_table 확보 로직 (더 안전하게)
         # ---------------------------------------------------------
         # 1. 인자로 들어온 것 확인
         target_block_table = block_table
-        
-        # 2. 인자가 없다면 self에 등록된 것 확인
         if target_block_table is None:
-            target_block_table = getattr(self, 'block_table', None)
-            
-        # 3. 그래도 없다면? 에러 메시지를 상세히 출력해서 디버깅을 돕습니다.
+            target_block_table = getattr(self, "block_table", None)
+
         if target_block_table is None:
-            raise ValueError(
-                f"Layer {self.layer_idx}: block_table is None! "
-                f"Check if it was injected in main.py or passed in forward."
-            )
-        
-        # 4. 객체라면 텐서로 변환, 텐서라면 그대로 사용
+            raise ValueError(f"Layer {self.layer_idx}: block_table is None")
+
         if hasattr(target_block_table, "to_tensor"):
             block_table_tensor = target_block_table.to_tensor(device=target_device)
         else:
             block_table_tensor = target_block_table.to(device=target_device)
-            
-        # 이후 모든 로직에서 'block_table' 대신 'block_table_tensor' 변수명을 사용하세요.
-        # ---------------------------------------------------------
-
         present_key_value = past_key_value
 
         # 3. Projection 및 RoPE (Q, K, V)
@@ -648,10 +637,14 @@ class PagedLlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if "position_embeddings" in kwargs:
-            cos, sin = kwargs["position_embeddings"]
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
+        if position_embeddings is None and "position_embeddings" in kwargs:
+            position_embeddings = kwargs["position_embeddings"]
 
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos.to(target_device), sin.to(target_device)
+            )
         # 4. Paged KV Cache : WRITE (안전한 경계 체크)
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
         
@@ -675,9 +668,8 @@ class PagedLlamaAttention(nn.Module):
                 print(f"[VERIFY-WRITE] Layer {self.layer_idx} | Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}")
 
             # 실제 PagePool 메모리에 K, V 값 기록
-            pool.k_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = key_states[0, :, i, :]
-            pool.v_cache[physical_block_idx, self.layer_idx, :, block_offset, :] = value_states[0, :, i, :]
-        # 5. Paged KV Cache : READ
+            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = key_states[0, :, i, :].to(pool.k_cache.dtype)
+            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = value_states[0, :, i, :].to(pool.v_cache.dtype) # 5. Paged KV Cache : READ
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
         
@@ -690,14 +682,16 @@ class PagedLlamaAttention(nn.Module):
         # 5. Paged KV Cache : READ
         # index_select(0, ...)는 블록들을 가져오므로 결과는 [num_needed_blocks, num_layers, heads, tokens, dim]
         # 여기서 [:, self.layer_idx]를 통해 자기 레이어 데이터만 쏙 빼옵니다.
-        k_blocks = pool.k_cache.index_select(0, active_indices)[:, self.layer_idx] 
-        v_blocks = pool.v_cache.index_select(0, active_indices)[:, self.layer_idx]
-        
+        layer_k_cache = pool.k_cache[self.layer_idx]   # [num_blocks, num_kv_heads, block_size, head_dim]
+        layer_v_cache = pool.v_cache[self.layer_idx]
+
+        k_blocks = layer_k_cache.index_select(0, active_indices)
+        v_blocks = layer_v_cache.index_select(0, active_indices)
         # 추출 후 k_blocks shape: [num_needed_blocks, num_heads, block_size, head_dim]
         # 이제 안전하게 Flatten 하여 Attention에 넣습니다.
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
         v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-        
+
         # 실제 토큰 길이만큼 슬라이싱 및 Llama 규격으로 변환
         full_key_states = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states = v_flat[:, :total_seq_len, :].unsqueeze(0)

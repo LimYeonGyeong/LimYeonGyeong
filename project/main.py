@@ -41,10 +41,10 @@ def measure_performance(model, tokenizer, prompt_text):
     t0 = time.time()
     with torch.no_grad():
         outputs = model.generate(
-            **inputs, 
-            max_new_tokens=50, # 테스트용으로 짧게 설정
-            do_sample=True,    # 답변 활성화를 위해 샘플링 켬
-            use_cache=True
+            **inputs,
+            max_new_tokens=20,
+            do_sample=False,
+            use_cache=False
         )
     if device == "cuda": torch.cuda.synchronize()
     t1 = time.time()
