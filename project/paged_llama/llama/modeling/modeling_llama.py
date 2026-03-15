@@ -712,10 +712,20 @@ class PagedLlamaAttention(nn.Module):
         
         # 5. GQA(Grouped Query Attention) 처리
         # KV 헤드 수가 Query 헤드 수보다 적을 경우, 이를 반복하여 32헤드 등으로 확장
+        # GQA 확장
         full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
         full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
         
-        # 6. Attention 연산 (수치 안정성 및 마스크)
+        # ---------------------------------------------------------
+        # [★핵심 수정] dtype 불일치 해결 (Half vs Float 에러 방지)
+        # ---------------------------------------------------------
+        # PagePool에서 가져온 데이터가 Float(float32)일 경우, 
+        # 모델 연산 타입인 Half(float16)로 강제 변환합니다.
+        full_key_states = full_key_states.to(dtype=query_states.dtype)
+        full_value_states = full_value_states.to(dtype=query_states.dtype)
+        # ---------------------------------------------------------
+
+        # 6. Attention 연산 (이제 두 텐서의 타입이 Half로 일치하여 에러가 나지 않습니다)
         attn_weights = torch.matmul(query_states, full_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         
         if attention_mask is not None:
