@@ -145,7 +145,7 @@ class LlamaRotaryEmbedding(nn.Module):
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[s:, None, :].float()
+        position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with autocast(device_type=device_type, enabled=False):  # Force float32
@@ -316,13 +316,228 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+# 기존 modeling_llama.py 상단에 있는 함수들을 활용합니다.
+# (apply_rotary_pos_emb, repeat_kv 등은 이미 파일에 있다고 가정)
+class PagedLlamaAttention(nn.Module):
+    def __init__(self, config, layer_idx=0, page_pool=None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
+        # 외부에서 주입받을 PagedPool
+        self.page_pool = page_pool
+
+        # projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        use_cache: bool | None = False,
+        **kwargs,
+    ):
+
+        # 1. dtype / device
+        original_dtype = hidden_states.dtype
+        target_dtype = self.q_proj.weight.dtype
+        target_device = self.q_proj.weight.device
+
+        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
+        bsz, q_len, _ = hidden_states.size()
+
+        # 2. page pool
+        pool = self.page_pool if self.page_pool is not None else getattr(self, "pool", None)
+        if pool is None:
+            raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
+
+        # 3. block table 확보
+        target_block_table = block_table
+        if target_block_table is None:
+            target_block_table = getattr(self, "block_table", None)
+
+        if target_block_table is None:
+            raise ValueError(f"Layer {self.layer_idx} | block_table is None")
+
+        if hasattr(target_block_table, "to_tensor"):
+            block_table_tensor = target_block_table.to_tensor(device=target_device)
+        else:
+            block_table_tensor = target_block_table.to(device=target_device)
+
+        # 4. q, k, v projection
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
+
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
+
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
+
+        # 5. RoPE
+        if position_embeddings is None and "position_embeddings" in kwargs:
+            position_embeddings = kwargs["position_embeddings"]
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos.to(target_device),
+                sin.to(target_device),
+            )
+
+        # 6. 현재 step 위치 정보
+        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
+        total_seq_len = start_pos + q_len
+        num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
+
+        # 7. WRITE
+        for i in range(q_len):
+            abs_pos = start_pos + i
+            block_idx_logic = abs_pos // pool.block_size
+            block_offset = abs_pos % pool.block_size
+
+            if block_idx_logic >= block_table_tensor.size(1):
+                raise IndexError(
+                    f"Layer {self.layer_idx} | block_idx_logic {block_idx_logic} "
+                    f"out of range (size {block_table_tensor.size(1)})"
+                )
+
+            physical_block_idx = block_table_tensor[0, block_idx_logic].item()
+
+            if i == 0 or abs_pos % pool.block_size == 0:
+                print(
+                    f"[VERIFY-WRITE] Layer {self.layer_idx} | "
+                    f"Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}"
+                )
+
+            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
+                key_states[0, :, i, :].to(pool.k_cache.dtype)
+
+            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
+                value_states[0, :, i, :].to(pool.v_cache.dtype)
+
+        # 8. block table 크기 확인
+        if num_needed_blocks > block_table_tensor.size(1):
+            raise RuntimeError(
+                f"Layer {self.layer_idx} | Block table size too small! "
+                f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
+            )
+
+        # 9. READ 준비
+        active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
+
+        layer_k_cache = pool.k_cache[self.layer_idx]   # [num_blocks, num_kv_heads, block_size, head_dim]
+        layer_v_cache = pool.v_cache[self.layer_idx]
+
+        k_blocks = layer_k_cache.index_select(0, active_indices)
+        v_blocks = layer_v_cache.index_select(0, active_indices)
+
+        print(f"[VERIFY-READ-1] Layer {self.layer_idx}")
+        print(f"  active_indices = {active_indices.tolist()}")
+        print(f"  k_blocks.shape = {k_blocks.shape}")
+        print(f"  v_blocks.shape = {v_blocks.shape}")
+        print(f"  total_seq_len = {total_seq_len}")
+        print(f"  num_needed_blocks = {num_needed_blocks}")
+
+        # 10. flatten
+        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+
+        # repeat 전 상태 보관 (검증용)
+        full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
+        full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
+
+        print(f"[VERIFY-READ-2] Layer {self.layer_idx}")
+        print(f"  k_flat.shape = {k_flat.shape}")
+        print(f"  v_flat.shape = {v_flat.shape}")
+        print(f"  full_key_states_before_repeat.shape = {full_key_states_before_repeat.shape}")
+        print(f"  full_value_states_before_repeat.shape = {full_value_states_before_repeat.shape}")
+
+        # 11. WRITE vs READ 직접 비교
+        check_pos = total_seq_len - 1
+        check_logic_block = check_pos // pool.block_size
+        check_offset = check_pos % pool.block_size
+        check_physical_block = block_table_tensor[0, check_logic_block].item()
+
+        written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
+        written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
+
+        print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
+        print(f"  check_pos = {check_pos}")
+        print(f"  logic_block = {check_logic_block}")
+        print(f"  physical_block = {check_physical_block}")
+        print(f"  offset = {check_offset}")
+        print(f"  written_k sample = {written_k[0, :8].detach().cpu()}")
+        print(f"  written_v sample = {written_v[0, :8].detach().cpu()}")
+
+        read_k = full_key_states_before_repeat[0, :, check_pos, :]
+        read_v = full_value_states_before_repeat[0, :, check_pos, :]
+
+        print(f"[VERIFY-READ-4] Layer {self.layer_idx}")
+        print(f"  read_k sample = {read_k[0, :8].detach().cpu()}")
+        print(f"  read_v sample = {read_v[0, :8].detach().cpu()}")
+
+        k_diff = (written_k - read_k).abs().max().item()
+        v_diff = (written_v - read_v).abs().max().item()
+
+        print(f"  max |written_k - read_k| = {k_diff}")
+        print(f"  max |written_v - read_v| = {v_diff}")
+
+        # 12. GQA 확장
+        full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
+        full_value_states = full_value_states_before_repeat.to(dtype=query_states.dtype)
+
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+
+        full_key_states = full_key_states.to(dtype=query_states.dtype)
+        full_value_states = full_value_states.to(dtype=query_states.dtype)
+
+        # 13. attention
+        attn_weights = torch.matmul(
+            query_states, full_key_states.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
+            attn_weights = attn_weights + mask_slice
+
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(target_dtype)
+
+        attn_output = torch.matmul(attn_weights, full_value_states)
+
+        # 14. output
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output).to(original_dtype)
+
+        return attn_output, None
+    
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = PagedLlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -560,218 +775,3 @@ import torch
 import torch.nn as nn
 import math
 
-# 기존 modeling_llama.py 상단에 있는 함수들을 활용합니다.
-# (apply_rotary_pos_emb, repeat_kv 등은 이미 파일에 있다고 가정)
-class PagedLlamaAttention(nn.Module):
-    def __init__(self, config, layer_idx=0, page_pool=None):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
-        # 외부에서 주입받을 PagedPool
-        self.page_pool = page_pool
-
-        # projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        block_table: Optional[torch.Tensor] = None,
-        use_cache: bool | None = False,
-        **kwargs,
-    ):
-
-        # 1. dtype / device
-        original_dtype = hidden_states.dtype
-        target_dtype = self.q_proj.weight.dtype
-        target_device = self.q_proj.weight.device
-
-        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
-        bsz, q_len, _ = hidden_states.size()
-
-        # 2. page pool
-        pool = self.page_pool if self.page_pool is not None else getattr(self, "pool", None)
-        if pool is None:
-            raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
-
-        # 3. block table 확보
-        target_block_table = block_table
-        if target_block_table is None:
-            target_block_table = getattr(self, "block_table", None)
-
-        if target_block_table is None:
-            raise ValueError(f"Layer {self.layer_idx} | block_table is None")
-
-        if hasattr(target_block_table, "to_tensor"):
-            block_table_tensor = target_block_table.to_tensor(device=target_device)
-        else:
-            block_table_tensor = target_block_table.to(device=target_device)
-
-        # 4. q, k, v projection
-        query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
-
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
-
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
-
-        # 5. RoPE
-        if position_embeddings is None and "position_embeddings" in kwargs:
-            position_embeddings = kwargs["position_embeddings"]
-
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states,
-                key_states,
-                cos.to(target_device),
-                sin.to(target_device),
-            )
-
-        # 6. 현재 step 위치 정보
-        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
-        total_seq_len = start_pos + q_len
-        num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
-
-        # 7. WRITE
-        for i in range(q_len):
-            abs_pos = start_pos + i
-            block_idx_logic = abs_pos // pool.block_size
-            block_offset = abs_pos % pool.block_size
-
-            if block_idx_logic >= block_table_tensor.size(1):
-                raise IndexError(
-                    f"Layer {self.layer_idx} | block_idx_logic {block_idx_logic} "
-                    f"out of range (size {block_table_tensor.size(1)})"
-                )
-
-            physical_block_idx = block_table_tensor[0, block_idx_logic].item()
-
-            if i == 0 or abs_pos % pool.block_size == 0:
-                print(
-                    f"[VERIFY-WRITE] Layer {self.layer_idx} | "
-                    f"Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}"
-                )
-
-            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
-                key_states[0, :, i, :].to(pool.k_cache.dtype)
-
-            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
-                value_states[0, :, i, :].to(pool.v_cache.dtype)
-
-        # 8. block table 크기 확인
-        if num_needed_blocks > block_table_tensor.size(1):
-            raise RuntimeError(
-                f"Layer {self.layer_idx} | Block table size too small! "
-                f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
-            )
-
-        # 9. READ 준비
-        active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
-
-        layer_k_cache = pool.k_cache[self.layer_idx]   # [num_blocks, num_kv_heads, block_size, head_dim]
-        layer_v_cache = pool.v_cache[self.layer_idx]
-
-        k_blocks = layer_k_cache.index_select(0, active_indices)
-        v_blocks = layer_v_cache.index_select(0, active_indices)
-
-        print(f"[VERIFY-READ-1] Layer {self.layer_idx}")
-        print(f"  active_indices = {active_indices.tolist()}")
-        print(f"  k_blocks.shape = {k_blocks.shape}")
-        print(f"  v_blocks.shape = {v_blocks.shape}")
-        print(f"  total_seq_len = {total_seq_len}")
-        print(f"  num_needed_blocks = {num_needed_blocks}")
-
-        # 10. flatten
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-
-        # repeat 전 상태 보관 (검증용)
-        full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
-        full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
-
-        print(f"[VERIFY-READ-2] Layer {self.layer_idx}")
-        print(f"  k_flat.shape = {k_flat.shape}")
-        print(f"  v_flat.shape = {v_flat.shape}")
-        print(f"  full_key_states_before_repeat.shape = {full_key_states_before_repeat.shape}")
-        print(f"  full_value_states_before_repeat.shape = {full_value_states_before_repeat.shape}")
-
-        # 11. WRITE vs READ 직접 비교
-        check_pos = total_seq_len - 1
-        check_logic_block = check_pos // pool.block_size
-        check_offset = check_pos % pool.block_size
-        check_physical_block = block_table_tensor[0, check_logic_block].item()
-
-        written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
-        written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
-
-        print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
-        print(f"  check_pos = {check_pos}")
-        print(f"  logic_block = {check_logic_block}")
-        print(f"  physical_block = {check_physical_block}")
-        print(f"  offset = {check_offset}")
-        print(f"  written_k sample = {written_k[0, :8].detach().cpu()}")
-        print(f"  written_v sample = {written_v[0, :8].detach().cpu()}")
-
-        read_k = full_key_states_before_repeat[0, :, check_pos, :]
-        read_v = full_value_states_before_repeat[0, :, check_pos, :]
-
-        print(f"[VERIFY-READ-4] Layer {self.layer_idx}")
-        print(f"  read_k sample = {read_k[0, :8].detach().cpu()}")
-        print(f"  read_v sample = {read_v[0, :8].detach().cpu()}")
-
-        k_diff = (written_k - read_k).abs().max().item()
-        v_diff = (written_v - read_v).abs().max().item()
-
-        print(f"  max |written_k - read_k| = {k_diff}")
-        print(f"  max |written_v - read_v| = {v_diff}")
-
-        # 12. GQA 확장
-        full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
-        full_value_states = full_value_states_before_repeat.to(dtype=query_states.dtype)
-
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
-
-        full_key_states = full_key_states.to(dtype=query_states.dtype)
-        full_value_states = full_value_states.to(dtype=query_states.dtype)
-
-        # 13. attention
-        attn_weights = torch.matmul(
-            query_states, full_key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            mask_slice = attention_mask[:, :, :, :total_seq_len].to(target_dtype)
-            attn_weights = attn_weights + mask_slice
-
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(target_dtype)
-
-        attn_output = torch.matmul(attn_weights, full_value_states)
-
-        # 14. output
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output).to(original_dtype)
-
-        return attn_output, None
