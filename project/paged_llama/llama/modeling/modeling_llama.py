@@ -530,33 +530,23 @@ class PagedLlamaAttention(nn.Module):
         full_value_states = full_value_states.to(dtype=query_states.dtype)
 
         # 13. attention
-        # 1. matmul 먼저
         attn_weights = torch.matmul(
             query_states, full_key_states.transpose(2, 3)
         )
 
-        # 2. scaling은 float32에서
-        attn_weights = attn_weights.float() * (1.0 / math.sqrt(self.head_dim))
+        attn_weights = attn_weights.float()
+        attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
-        # 3. mask 적용 (float32 상태에서!)
-        if attention_mask is not None:
-            mask_slice = attention_mask[:, :, :, :total_seq_len]
-            attn_weights = attn_weights + mask_slice
-
-        # 4. softmax (float32 유지)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-
-        # 5. 다시 dtype 복귀
-        attn_weights = attn_weights.to(query_states.dtype)
-
-        attn_output = torch.matmul(attn_weights, full_value_states)
         if attention_mask is None:
             print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None")
         else:
-            print(
-                f"[DEBUG] Layer {self.layer_idx} attention_mask shape = {attention_mask.shape}, "
-                f"min = {attention_mask.min().item()}, max = {attention_mask.max().item()}"
-            )
+            mask_slice = attention_mask[:, :, :, :total_seq_len].float()
+            attn_weights = attn_weights + mask_slice
+
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(query_states.dtype)
+
+        attn_output = torch.matmul(attn_weights, full_value_states)
         print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
         print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
         print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
