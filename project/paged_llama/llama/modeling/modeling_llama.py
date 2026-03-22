@@ -550,7 +550,10 @@ class PagedLlamaAttention(nn.Module):
         attn_weights = attn_weights.to(query_states.dtype)
 
         attn_output = torch.matmul(attn_weights, full_value_states)
-        print(attention_mask.min(), attention_mask.max())
+        if attention_mask is None:
+            print("[DEBUG] attention_mask is None")
+        else:
+            print("[DEBUG] attention_mask min/max:", attention_mask.min(), attention_mask.max())
         print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
         print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
         print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
