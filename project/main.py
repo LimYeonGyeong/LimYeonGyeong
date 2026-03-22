@@ -48,81 +48,70 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
     return model
 
 @torch.no_grad()
-def greedy_decode_fullseq(model, tokenizer, prompt, max_new_tokens=30, device="cuda"):
-    """
-    HF generate() 대신 full-sequence 방식으로 직접 1토큰씩 생성.
-    scheduler 없이 PagePool + BlockTable 검증할 때 사용.
-    """
-    model.eval()
-
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
-
-    for _ in range(max_new_tokens):
-        outputs = model(input_ids=input_ids, use_cache=False)
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-        input_ids = torch.cat([input_ids, next_token], dim=-1)
-
-        # EOS면 종료
-        if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
-            break
-
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
-
 def greedy_decode_fullseq(model, input_ids, max_new_tokens=20, device="cuda"):
     model.eval()
     generated = input_ids
 
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            outputs = model(
-                input_ids=generated,
-                use_cache=False
-            )
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token], dim=1)
+    for step in range(max_new_tokens):
+        outputs = model(
+            input_ids=generated,
+            use_cache=False
+        )
+
+        logits = outputs.logits
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+
+        print(f"[DECODE-STEP {step}] next_token_id = {next_token.item()}")
+
+        generated = torch.cat([generated, next_token], dim=1)
 
     return generated
 
 def measure_performance(model, tokenizer, prompt_text):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-    
-    # [변경] 측정 전 캐시 및 통계 초기화
+
+    prompt_len = inputs["input_ids"].shape[1]
+    max_new_tokens = 20
+
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    # [변경] 시작 시점의 절대 메모리 기록 (RSS 사용)
     ram_start = process.memory_info().rss / 1024 / 1024
     ctx_start = process.num_ctx_switches()
-    
+
     t0 = time.time()
     with torch.no_grad():
         outputs = greedy_decode_fullseq(
             model=model,
             input_ids=inputs["input_ids"],
-            max_new_tokens=20,
+            max_new_tokens=max_new_tokens,
             device=model.device
         )
-    if device == "cuda": torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
     t1 = time.time()
-    
-    # [변경] 피크 VRAM 및 최종 RAM 점유량 계산
+
     latency = t1 - t0
     peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0
     ram_end = process.memory_info().rss / 1024 / 1024
-    
+
     ctx_end = process.num_ctx_switches()
     ctx_switch = (ctx_end.voluntary + ctx_end.involuntary) - (ctx_start.voluntary + ctx_start.involuntary)
-    
+
+    decoded_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    print("\n[DEBUG] decoded text preview")
+    print(decoded_text)
+
     return {
-        "text": tokenizer.decode(outputs[0], skip_special_tokens=True),
+        "text": decoded_text,
         "latency": latency,
-        "throughput": 50 / latency,
-        "peak_vram": peak_vram,    # 순간 최대 GPU 사용량
-        "total_ram": ram_end,      # 현재 프로세스가 먹고 있는 전체 RAM
+        "throughput": max_new_tokens / latency,
+        "peak_vram": peak_vram,
+        "total_ram": ram_end,
         "ctx_switch": ctx_switch
     }
 
@@ -207,6 +196,17 @@ pool.k_cache.zero_()
 pool.v_cache.zero_()
 # 패치 완료 후 성능 측정
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
+
+print("\n[DEBUG] PagePool / BlockTable 확인")
+print("pool.k_cache.shape =", pool.k_cache.shape)
+print("pool.v_cache.shape =", pool.v_cache.shape)
+
+if hasattr(shared_block_table, "to_tensor"):
+    bt = shared_block_table.to_tensor(device=device)
+    print("block_table.shape =", bt.shape)
+    print("block_table[0, :10] =", bt[0, :10])
+else:
+    print("shared_block_table has no to_tensor()")
 
 # ==========================================
 # 4. 최종 결과 출력 (수정된 Key 반영)
