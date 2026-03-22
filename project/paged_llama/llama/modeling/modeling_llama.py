@@ -530,6 +530,7 @@ class PagedLlamaAttention(nn.Module):
         full_value_states = full_value_states.to(dtype=query_states.dtype)
 
         # 13. attention
+        # 13. attention
         attn_weights = torch.matmul(
             query_states, full_key_states.transpose(2, 3)
         )
@@ -538,7 +539,25 @@ class PagedLlamaAttention(nn.Module):
         attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
         if attention_mask is None:
-            print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None")
+            print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None -> make local causal mask")
+
+            # query 길이 = 현재 step에서 들어온 토큰 수
+            # key 길이 = 지금까지 누적 전체 토큰 수
+            causal_mask = torch.full(
+                (q_len, total_seq_len),
+                float("-inf"),
+                device=target_device,
+                dtype=torch.float32,
+            )
+
+            # start_pos를 고려해서 현재 query가 볼 수 있는 key만 허용
+            for i in range(q_len):
+                abs_pos = start_pos + i
+                causal_mask[i, : abs_pos + 1] = 0.0
+
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, total_seq_len]
+            attn_weights = attn_weights + causal_mask
+
         else:
             mask_slice = attention_mask[:, :, :, :total_seq_len].float()
             attn_weights = attn_weights + mask_slice
