@@ -48,18 +48,38 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
     return model
 
 @torch.no_grad()
-def greedy_decode_fullseq(model, input_ids, max_new_tokens=20, device="cuda"):
+def greedy_decode_fullseq(model, tokenizer, input_ids, max_new_tokens=20, device="cuda"):
     model.eval()
     generated = input_ids
+    attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+    # 1) 공백/개행 계열 토큰 미리 수집
+    banned_token_ids = set()
+    bad_texts = {"", " ", "\n", "\t", "\r", " ", " ", " "}  # 마지막은 non-breaking space
+
+    for tid in range(tokenizer.vocab_size):
+        txt = tokenizer.decode([tid], skip_special_tokens=False)
+        if txt in bad_texts:
+            banned_token_ids.add(tid)
+
+    banned_token_ids = list(banned_token_ids)
+    print(f"[DEBUG] banned_token_ids count = {len(banned_token_ids)}")
 
     for step in range(max_new_tokens):
         outputs = model(
             input_ids=generated,
+            attention_mask=attention_mask,
             use_cache=False
         )
 
-        logits = outputs.logits
-        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        logits = outputs.logits[:, -1, :].clone()
+
+        # 2) 공백 토큰 막기
+        if len(banned_token_ids) > 0:
+            logits[:, banned_token_ids] = -1e9
+
+        # 3) greedy decode
+        next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
         token_id = next_token.item()
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
@@ -67,6 +87,14 @@ def greedy_decode_fullseq(model, input_ids, max_new_tokens=20, device="cuda"):
         print(f"[DECODE-STEP {step}] next_token_id = {token_id} | token_text = {repr(token_text)}")
 
         generated = torch.cat([generated, next_token], dim=1)
+
+        # attention mask도 같이 늘려주기
+        new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)
+        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+
+        # eos 만나면 종료
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+            break
 
     return generated
 
@@ -89,6 +117,7 @@ def measure_performance(model, tokenizer, prompt_text):
     with torch.no_grad():
         outputs = greedy_decode_fullseq(
             model=model,
+            tokenizer=tokenizer,
             input_ids=inputs["input_ids"],
             max_new_tokens=max_new_tokens,
             device=model.device
