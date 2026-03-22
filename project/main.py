@@ -22,9 +22,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # 2. 성능 측정 엔진
 # ==========================================
 def patch_model_with_paged_attention(model, page_pool, block_table):
-    """
-    model.model.layers[i].self_attn 를 PagedLlamaAttention으로 교체
-    """
     for layer_idx, layer in enumerate(model.model.layers):
         old_attn = layer.self_attn
 
@@ -32,9 +29,9 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
             config=model.config,
             layer_idx=layer_idx,
             page_pool=page_pool,
-        ).to(next(old_attn.parameters()).device)
+        )
 
-        # 기존 projection weight 복사
+        # 기존 weight 정확히 복사
         new_attn.q_proj.weight.data.copy_(old_attn.q_proj.weight.data)
         new_attn.k_proj.weight.data.copy_(old_attn.k_proj.weight.data)
         new_attn.v_proj.weight.data.copy_(old_attn.v_proj.weight.data)
@@ -42,6 +39,10 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
 
         # block_table 연결
         new_attn.block_table = block_table
+
+        # old attention과 완전히 같은 dtype / device로 이동
+        ref_param = next(old_attn.parameters())
+        new_attn = new_attn.to(device=ref_param.device, dtype=ref_param.dtype)
 
         layer.self_attn = new_attn
 
@@ -207,22 +208,11 @@ for _ in range(100):
     shared_block_table.add_block(pool.allocate())
 
 # 3. 레이어 패치 루프
-for i, layer in enumerate(model_paged.model.layers):
-    new_attn = PagedLlamaAttention(
-        config=config,
-        layer_idx=i,
-        page_pool=pool 
-    )
-    new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
-    
-    new_attn.to(device)
-    new_attn.page_pool = pool
-    
-    # 4. [★핵심] 모든 레이어에 '동일한' BlockTable 객체를 주입
-    # modeling_llama.py에서 hasattr(..., "to_tensor")로 처리하도록 설계했습니다.
-    new_attn.block_table = shared_block_table 
-    
-    layer.self_attn = new_attn
+model_paged = patch_model_with_paged_attention(
+    model=model_paged,
+    page_pool=pool,
+    block_table=shared_block_table
+)
 
 pool.k_cache.zero_()
 pool.v_cache.zero_()
