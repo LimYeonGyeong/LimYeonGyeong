@@ -71,6 +71,23 @@ from ..config.configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
+class PagedCacheShim:
+    """
+    HF generate()가 요구하는 최소 cache 인터페이스만 흉내내는 객체.
+    실제 KV는 저장하지 않고, '현재까지 본 토큰 수'만 관리한다.
+    """
+    def __init__(self, seen_tokens: int = 0):
+        self.seen_tokens = seen_tokens
+
+    def get_seq_length(self):
+        return self.seen_tokens
+
+    def update_seen_tokens(self, new_len: int):
+        self.seen_tokens = new_len
+
+    def __repr__(self):
+        return f"PagedCacheShim(seen_tokens={self.seen_tokens})"
+
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -634,7 +651,13 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            first_attn = self.layers[0].self_attn
+            if hasattr(first_attn, "page_pool") and first_attn.page_pool is not None:
+                # paged attention 경로: HF generate용 길이 추적만 수행
+                past_key_values = PagedCacheShim(seen_tokens=0)
+            else:
+                # 기본 경로
+                past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -670,6 +693,9 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        if use_cache and isinstance(past_key_values, PagedCacheShim):
+            # 이번 forward까지 처리한 총 길이 기록
+            past_key_values.update_seen_tokens(int(cache_position[-1].item()) + 1)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -770,8 +796,3 @@ __all__ = [
     "LlamaForQuestionAnswering",
     "LlamaForTokenClassification",
 ]
-
-import torch
-import torch.nn as nn
-import math
-

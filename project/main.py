@@ -21,9 +21,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
 # 2. 성능 측정 엔진
 # ==========================================
-# ==========================================
-# 2. 성능 측정 엔진 (개선 버전)
-# ==========================================
+
 def measure_performance(model, tokenizer, prompt_text):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
@@ -127,7 +125,11 @@ for _ in range(100):
 
 # 3. 레이어 패치 루프
 for i, layer in enumerate(model_paged.model.layers):
-    new_attn = PagedLlamaAttention(config=config, layer_idx=i)
+    new_attn = PagedLlamaAttention(
+        config=config,
+        layer_idx=i,
+        page_pool=pool 
+    )
     new_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
     
     new_attn.to(device)
@@ -138,7 +140,9 @@ for i, layer in enumerate(model_paged.model.layers):
     new_attn.block_table = shared_block_table 
     
     layer.self_attn = new_attn
-
+    
+pool.k_cache.zero_()
+pool.v_cache.zero_()
 # 패치 완료 후 성능 측정
 stats_paged = measure_performance(model_paged, tokenizer, prompt)
 
