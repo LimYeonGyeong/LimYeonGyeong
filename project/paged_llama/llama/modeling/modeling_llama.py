@@ -593,7 +593,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            block_table=getattr(past_key_values, "block_table", None),
+            block_table=getattr(self.self_attn, "block_table", None),
             use_cache=use_cache,
             **kwargs,
         )
