@@ -21,6 +21,68 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
 # 2. 성능 측정 엔진
 # ==========================================
+def patch_model_with_paged_attention(model, page_pool, block_table):
+    """
+    model.model.layers[i].self_attn 를 PagedLlamaAttention으로 교체
+    """
+    for layer_idx, layer in enumerate(model.model.layers):
+        old_attn = layer.self_attn
+
+        new_attn = PagedLlamaAttention(
+            config=model.config,
+            layer_idx=layer_idx,
+            page_pool=page_pool,
+        ).to(next(old_attn.parameters()).device)
+
+        # 기존 projection weight 복사
+        new_attn.q_proj.weight.data.copy_(old_attn.q_proj.weight.data)
+        new_attn.k_proj.weight.data.copy_(old_attn.k_proj.weight.data)
+        new_attn.v_proj.weight.data.copy_(old_attn.v_proj.weight.data)
+        new_attn.o_proj.weight.data.copy_(old_attn.o_proj.weight.data)
+
+        # block_table 연결
+        new_attn.block_table = block_table
+
+        layer.self_attn = new_attn
+
+    return model
+
+@torch.no_grad()
+def greedy_decode_fullseq(model, tokenizer, prompt, max_new_tokens=30, device="cuda"):
+    """
+    HF generate() 대신 full-sequence 방식으로 직접 1토큰씩 생성.
+    scheduler 없이 PagePool + BlockTable 검증할 때 사용.
+    """
+    model.eval()
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+
+    for _ in range(max_new_tokens):
+        outputs = model(input_ids=input_ids, use_cache=False)
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        input_ids = torch.cat([input_ids, next_token], dim=-1)
+
+        # EOS면 종료
+        if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+            break
+
+    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+def greedy_decode_fullseq(model, input_ids, max_new_tokens=20, device="cuda"):
+    model.eval()
+    generated = input_ids
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            outputs = model(
+                input_ids=generated,
+                use_cache=False
+            )
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+
+    return generated
 
 def measure_performance(model, tokenizer, prompt_text):
     process = psutil.Process(os.getpid())
@@ -38,11 +100,11 @@ def measure_performance(model, tokenizer, prompt_text):
     
     t0 = time.time()
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
+        outputs = greedy_decode_fullseq(
+            model=model,
+            input_ids=inputs["input_ids"],
             max_new_tokens=20,
-            do_sample=False,
-            use_cache=True
+            device=model.device
         )
     if device == "cuda": torch.cuda.synchronize()
     t1 = time.time()
@@ -140,7 +202,7 @@ for i, layer in enumerate(model_paged.model.layers):
     new_attn.block_table = shared_block_table 
     
     layer.self_attn = new_attn
-    
+
 pool.k_cache.zero_()
 pool.v_cache.zero_()
 # 패치 완료 후 성능 측정

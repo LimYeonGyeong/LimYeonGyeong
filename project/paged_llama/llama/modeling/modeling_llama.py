@@ -29,6 +29,7 @@ from ..activations import ACT2FN
 from ..memory.cache_utils import Cache, DynamicCache
 from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
+from ..memory.paged_cache import PagedCache
 
 # 같은 modeling 폴더 내 파일 참조
 from .modeling_layers import (
@@ -569,6 +570,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        block_table=getattr(past_key_values, "block_table", None),
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -627,6 +629,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.page_pool = None
+        self.block_table = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -651,12 +655,13 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            first_attn = self.layers[0].self_attn
-            if hasattr(first_attn, "page_pool") and first_attn.page_pool is not None:
-                # paged attention 경로: HF generate용 길이 추적만 수행
-                past_key_values = PagedCacheShim(seen_tokens=0)
+            if self.page_pool is not None and self.block_table is not None:
+                past_key_values = PagedCacheShim(
+                    config=self.config,
+                    page_pool=self.page_pool,
+                    block_table=self.block_table,
+                )
             else:
-                # 기본 경로
                 past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
