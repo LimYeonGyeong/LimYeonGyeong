@@ -551,9 +551,12 @@ class PagedLlamaAttention(nn.Module):
 
         attn_output = torch.matmul(attn_weights, full_value_states)
         if attention_mask is None:
-            print("[DEBUG] attention_mask is None")
+            print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None")
         else:
-            print("[DEBUG] attention_mask min/max:", attention_mask.min(), attention_mask.max())
+            print(
+                f"[DEBUG] Layer {self.layer_idx} attention_mask shape = {attention_mask.shape}, "
+                f"min = {attention_mask.min().item()}, max = {attention_mask.max().item()}"
+            )
         print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
         print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
         print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
@@ -576,7 +579,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = PagedLlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -601,10 +604,10 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             block_table=getattr(self.self_attn, "block_table", None),
-            use_cache=use_cache,
             **kwargs,
         )
 
@@ -644,6 +647,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.page_pool = None
+
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
