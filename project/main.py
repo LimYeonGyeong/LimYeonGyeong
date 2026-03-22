@@ -76,7 +76,7 @@ def greedy_decode_fullseq(model, tokenizer, input_ids, max_new_tokens=20, device
 
         # 2) 공백 토큰 막기
         if len(banned_token_ids) > 0:
-            logits[:, banned_token_ids] = -1e9
+            logits[:, banned_token_ids] = torch.finfo(logits.dtype).min
 
         # 3) greedy decode
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
