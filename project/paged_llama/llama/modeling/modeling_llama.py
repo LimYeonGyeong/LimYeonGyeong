@@ -29,7 +29,7 @@ from ..activations import ACT2FN
 from ..memory.cache_utils import Cache, DynamicCache
 from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
-from ..memory.paged_cache import PagedCache
+from ..memory.page_cache import PagedCache
 
 # 같은 modeling 폴더 내 파일 참조
 from .modeling_layers import (
