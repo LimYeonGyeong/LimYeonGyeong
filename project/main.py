@@ -61,7 +61,10 @@ def greedy_decode_fullseq(model, input_ids, max_new_tokens=20, device="cuda"):
         logits = outputs.logits
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
 
-        print(f"[DECODE-STEP {step}] next_token_id = {next_token.item()}")
+        token_id = next_token.item()
+        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+
+        print(f"[DECODE-STEP {step}] next_token_id = {token_id} | token_text = {repr(token_text)}")
 
         generated = torch.cat([generated, next_token], dim=1)
 
