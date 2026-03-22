@@ -544,9 +544,20 @@ class PagedLlamaAttention(nn.Module):
 
         attn_output = torch.matmul(attn_weights, full_value_states)
 
+        print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
+        print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
+        print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
+        print(f"  attn_output nan = {torch.isnan(attn_output).any().item()}")
+        print(f"  attn_output inf = {torch.isinf(attn_output).any().item()}")
+        print(f"  attn_output abs max = {attn_output.abs().max().item()}")
+
         # 14. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
+        print(f"[VERIFY-O-PROJ] Layer {self.layer_idx}")
+        print(f"  output nan = {torch.isnan(attn_output).any().item()}")
+        print(f"  output inf = {torch.isinf(attn_output).any().item()}")
+        print(f"  output abs max = {attn_output.abs().max().item()}")
 
         return attn_output, None
     
