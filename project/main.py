@@ -93,7 +93,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-prompt = """### Instruction:\nIn this context, "LLM" means "Large Language Model". Explain it in one simple sentence.\n### Response:\n"""
+prompt = """### Instruction:\n what is paged attention?.\n### Response:\n"""
 
 model_base = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
