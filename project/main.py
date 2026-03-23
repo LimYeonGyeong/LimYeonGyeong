@@ -275,7 +275,7 @@ def main():
 
     prompt = (
         '### Instruction:\n'
-        'In this context, "LLM" means "Large Language Model". '
+        'what are you doing now?". '
         'Explain it in one simple sentence.\n'
         '### Response:\n'
     )
