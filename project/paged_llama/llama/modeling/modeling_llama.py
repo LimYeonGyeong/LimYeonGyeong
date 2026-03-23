@@ -468,12 +468,12 @@ class PagedLlamaAttention(nn.Module):
         k_blocks = layer_k_cache.index_select(0, active_indices)
         v_blocks = layer_v_cache.index_select(0, active_indices)
 
-        print(f"[VERIFY-READ-1] Layer {self.layer_idx}")
-        print(f"  active_indices = {active_indices.tolist()}")
-        print(f"  k_blocks.shape = {k_blocks.shape}")
-        print(f"  v_blocks.shape = {v_blocks.shape}")
-        print(f"  total_seq_len = {total_seq_len}")
-        print(f"  num_needed_blocks = {num_needed_blocks}")
+        #print(f"[VERIFY-READ-1] Layer {self.layer_idx}")
+        #print(f"  active_indices = {active_indices.tolist()}")
+        #print(f"  k_blocks.shape = {k_blocks.shape}")
+        #print(f"  v_blocks.shape = {v_blocks.shape}")
+        #print(f"  total_seq_len = {total_seq_len}")
+        #print(f"  num_needed_blocks = {num_needed_blocks}")
 
         # 10. flatten
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
@@ -483,11 +483,11 @@ class PagedLlamaAttention(nn.Module):
         full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
 
-        print(f"[VERIFY-READ-2] Layer {self.layer_idx}")
-        print(f"  k_flat.shape = {k_flat.shape}")
-        print(f"  v_flat.shape = {v_flat.shape}")
-        print(f"  full_key_states_before_repeat.shape = {full_key_states_before_repeat.shape}")
-        print(f"  full_value_states_before_repeat.shape = {full_value_states_before_repeat.shape}")
+        #print(f"[VERIFY-READ-2] Layer {self.layer_idx}")
+        #print(f"  k_flat.shape = {k_flat.shape}")
+        #print(f"  v_flat.shape = {v_flat.shape}")
+        #print(f"  full_key_states_before_repeat.shape = {full_key_states_before_repeat.shape}")
+        #print(f"  full_value_states_before_repeat.shape = {full_value_states_before_repeat.shape}")
 
         # 11. WRITE vs READ 직접 비교
         check_pos = total_seq_len - 1
@@ -498,26 +498,26 @@ class PagedLlamaAttention(nn.Module):
         written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
         written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
 
-        print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
-        print(f"  check_pos = {check_pos}")
-        print(f"  logic_block = {check_logic_block}")
-        print(f"  physical_block = {check_physical_block}")
-        print(f"  offset = {check_offset}")
-        print(f"  written_k sample = {written_k[0, :8].detach().cpu()}")
-        print(f"  written_v sample = {written_v[0, :8].detach().cpu()}")
+        #print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
+        #print(f"  check_pos = {check_pos}")
+        #print(f"  logic_block = {check_logic_block}")
+        #print(f"  physical_block = {check_physical_block}")
+        #print(f"  offset = {check_offset}")
+        #print(f"  written_k sample = {written_k[0, :8].detach().cpu()}")
+        #print(f"  written_v sample = {written_v[0, :8].detach().cpu()}")
 
         read_k = full_key_states_before_repeat[0, :, check_pos, :]
         read_v = full_value_states_before_repeat[0, :, check_pos, :]
 
-        print(f"[VERIFY-READ-4] Layer {self.layer_idx}")
-        print(f"  read_k sample = {read_k[0, :8].detach().cpu()}")
-        print(f"  read_v sample = {read_v[0, :8].detach().cpu()}")
+        #print(f"[VERIFY-READ-4] Layer {self.layer_idx}")
+        #print(f"  read_k sample = {read_k[0, :8].detach().cpu()}")
+        #print(f"  read_v sample = {read_v[0, :8].detach().cpu()}")
 
         k_diff = (written_k - read_k).abs().max().item()
         v_diff = (written_v - read_v).abs().max().item()
 
-        print(f"  max |written_k - read_k| = {k_diff}")
-        print(f"  max |written_v - read_v| = {v_diff}")
+        #print(f"  max |written_k - read_k| = {k_diff}")
+        #print(f"  max |written_v - read_v| = {v_diff}")
 
         # 12. GQA 확장
         full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
@@ -539,7 +539,7 @@ class PagedLlamaAttention(nn.Module):
         attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
         if attention_mask is None:
-            print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None -> make local causal mask")
+            #print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None -> make local causal mask")
 
             # query 길이 = 현재 step에서 들어온 토큰 수
             # key 길이 = 지금까지 누적 전체 토큰 수
@@ -566,20 +566,20 @@ class PagedLlamaAttention(nn.Module):
         attn_weights = attn_weights.to(query_states.dtype)
 
         attn_output = torch.matmul(attn_weights, full_value_states)
-        print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
-        print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
-        print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
-        print(f"  attn_output nan = {torch.isnan(attn_output).any().item()}")
-        print(f"  attn_output inf = {torch.isinf(attn_output).any().item()}")
-        print(f"  attn_output abs max = {attn_output.abs().max().item()}")
+        #print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
+        #print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
+        #print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
+        #print(f"  attn_output nan = {torch.isnan(attn_output).any().item()}")
+        #print(f"  attn_output inf = {torch.isinf(attn_output).any().item()}")
+        #print(f"  attn_output abs max = {attn_output.abs().max().item()}")
 
         # 14. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
-        print(f"[VERIFY-O-PROJ] Layer {self.layer_idx}")
-        print(f"  output nan = {torch.isnan(attn_output).any().item()}")
-        print(f"  output inf = {torch.isinf(attn_output).any().item()}")
-        print(f"  output abs max = {attn_output.abs().max().item()}")
+        #print(f"[VERIFY-O-PROJ] Layer {self.layer_idx}")
+        #print(f"  output nan = {torch.isnan(attn_output).any().item()}")
+        #print(f"  output inf = {torch.isinf(attn_output).any().item()}")
+        #print(f"  output abs max = {attn_output.abs().max().item()}")
 
         return attn_output, None
     
