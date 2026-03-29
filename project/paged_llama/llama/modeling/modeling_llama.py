@@ -440,11 +440,12 @@ class PagedLlamaAttention(nn.Module):
 
             physical_block_idx = block_table_tensor[0, block_idx_logic].item()
 
-            if i == 0 or abs_pos % pool.block_size == 0:
-                print(
-                    f"[VERIFY-WRITE] Layer {self.layer_idx} | "
-                    f"Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}"
-                )
+            if getattr(self, "debug", False):
+                if i == 0 or abs_pos % pool.block_size == 0:
+                    print(
+                        f"[VERIFY-WRITE] Layer {self.layer_idx} | "
+                        f"Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}"
+                    )
 
             pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
                 key_states[0, :, i, :].to(pool.k_cache.dtype)

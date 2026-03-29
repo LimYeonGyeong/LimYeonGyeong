@@ -60,19 +60,32 @@ def measure_performance(model, tokenizer, prompt_text, max_new_tokens=20):
     ram_end = process.memory_info().rss / 1024 / 1024
     ctx_end = process.num_ctx_switches()
 
+    if device == "cuda":
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        current_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+        current_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+        max_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024
+    else:
+        peak_allocated = 0.0
+        current_allocated = 0.0
+        current_reserved = 0.0
+        max_reserved = 0.0
+
     stats = {
         "text": generated_text,
         "latency": t1 - t0,
         "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
-        "ram_mb": ram_end,
+        "ram_mb": ram_end - ram_start,
         "ctx_switches": (ctx_end.voluntary - ctx_start.voluntary)
         + (ctx_end.involuntary - ctx_start.involuntary),
+        "peak_vram_mb": peak_allocated,
+        "alloc_vram_mb": current_allocated,
+        "reserved_vram_mb": current_reserved,
+        "max_reserved_vram_mb": max_reserved,
+        "vram_per_token_kb": (peak_allocated * 1024 / generated_tokens) if generated_tokens > 0 else 0.0,
+        "used_blocks": 0,
+        "block_utilization": 0.0,
     }
-
-    if device == "cuda":
-        stats["peak_vram_mb"] = torch.cuda.max_memory_allocated() / 1024 / 1024
-    else:
-        stats["peak_vram_mb"] = 0.0
 
     return stats
 
@@ -150,7 +163,7 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_to
 # HF cache OFF + PagePool only
 # -----------------------------
 @torch.no_grad()
-def measure_paged_only(model, tokenizer, prompt_text, max_new_tokens=20):
+def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new_tokens=20):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
@@ -214,19 +227,41 @@ def measure_paged_only(model, tokenizer, prompt_text, max_new_tokens=20):
     ram_end = process.memory_info().rss / 1024 / 1024
     ctx_end = process.num_ctx_switches()
 
+    if device == "cuda":
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        current_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+        current_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+        max_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024
+    else:
+        peak_allocated = 0.0
+        current_allocated = 0.0
+        current_reserved = 0.0
+        max_reserved = 0.0
+
+    if hasattr(block_table, "to_tensor"):
+        bt = block_table.to_tensor(device="cpu")
+        used_blocks = bt.shape[1]
+    else:
+        used_blocks = len(block_table.block_table[0])
+
+    total_blocks = pool.num_blocks
+    block_utilization = used_blocks / total_blocks if total_blocks > 0 else 0.0
+
     stats = {
         "text": generated_text,
         "latency": t1 - t0,
         "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
-        "ram_mb": ram_end,
+        "ram_mb": ram_end - ram_start,
         "ctx_switches": (ctx_end.voluntary - ctx_start.voluntary)
         + (ctx_end.involuntary - ctx_start.involuntary),
+        "peak_vram_mb": peak_allocated,
+        "alloc_vram_mb": current_allocated,
+        "reserved_vram_mb": current_reserved,
+        "max_reserved_vram_mb": max_reserved,
+        "vram_per_token_kb": (peak_allocated * 1024 / generated_tokens) if generated_tokens > 0 else 0.0,
+        "used_blocks": used_blocks,
+        "block_utilization": block_utilization,
     }
-
-    if device == "cuda":
-        stats["peak_vram_mb"] = torch.cuda.max_memory_allocated() / 1024 / 1024
-    else:
-        stats["peak_vram_mb"] = 0.0
 
     return stats
 
@@ -333,15 +368,6 @@ def main():
         dtype=model_paged.dtype,
     )
 
-    pool = PagePool(
-    num_blocks=128,   # 일단 넉넉하게
-    num_layers=config.num_hidden_layers,
-    num_heads=config.num_key_value_heads,
-    block_size=16,
-    head_dim=config.hidden_size // config.num_attention_heads,
-    device=device,
-    dtype=model_paged.dtype,
-)
 
     scheduler = SimpleScheduler(page_pool=pool, block_size=16)
 
@@ -368,12 +394,12 @@ def main():
     # -------------------------
     print(">>> HF cache OFF + PagePool only 테스트 중...")
 
-    test_text = test_paged_generation_step_by_step(
-        model=model_paged,
-        tokenizer=tokenizer,
-        prompt_text=prompt,
-        max_new_tokens=20,
-    )
+    #test_text = test_paged_generation_step_by_step(
+    #    model=model_paged,
+    #    tokenizer=tokenizer,
+    #    prompt_text=prompt,
+    #    max_new_tokens=20,
+    #)
 
     # -------------------------
     # 2단계 성능 측정
@@ -382,6 +408,8 @@ def main():
         model=model_paged,
         tokenizer=tokenizer,
         prompt_text=prompt,
+        block_table=block_table,
+        pool=pool,
         max_new_tokens=max_new_tokens,
     )
 
@@ -414,9 +442,15 @@ def main():
     print(f"{'Metric':<25} | {'normal':<15} | {'Paged':<15} |")
     print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
     print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
-    print(f"{'Total RAM (MB)':<25} | {stats_base['ram_mb']:<15.1f} | {stats_paged['ram_mb']:<15.1f} |")
+    print(f"{'RAM Increase (MB)':<25} | {stats_base['ram_mb']:<15.1f} | {stats_paged['ram_mb']:<15.1f} |")
     print(f"{'Peak VRAM (MB)':<25} | {stats_base['peak_vram_mb']:<15.1f} | {stats_paged['peak_vram_mb']:<15.1f} |")
+    print(f"{'Alloc VRAM (MB)':<25} | {stats_base['alloc_vram_mb']:<15.1f} | {stats_paged['alloc_vram_mb']:<15.1f} |")
+    print(f"{'Reserved VRAM (MB)':<25} | {stats_base['reserved_vram_mb']:<15.1f} | {stats_paged['reserved_vram_mb']:<15.1f} |")
+    print(f"{'Max Reserved VRAM (MB)':<25} | {stats_base['max_reserved_vram_mb']:<15.1f} | {stats_paged['max_reserved_vram_mb']:<15.1f} |")
+    print(f"{'VRAM/token (KB)':<25} | {stats_base['vram_per_token_kb']:<15.2f} | {stats_paged['vram_per_token_kb']:<15.2f} |")
     print(f"{'Context Switch':<25} | {stats_base['ctx_switches']:<15} | {stats_paged['ctx_switches']:<15} |")
+    print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged['used_blocks']:<15} |")
+    print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged['block_utilization']:<15.2%} |")
 
 
 if __name__ == "__main__":
