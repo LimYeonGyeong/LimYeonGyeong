@@ -385,7 +385,7 @@ def main():
         max_new_tokens=max_new_tokens,
     )
 
-    scheduler.release_request(request_id)
+    
 
     # -------------------------
     # 디버그 정보
@@ -394,12 +394,14 @@ def main():
     print("pool.k_cache.shape =", pool.k_cache.shape)
     print("pool.v_cache.shape =", pool.v_cache.shape)
 
-    if hasattr(shared_block_table, "to_tensor"):
-        bt = shared_block_table.to_tensor(device=device)
+    if hasattr(block_table, "to_tensor"):
+        bt = block_table.to_tensor(device=device)
         print("block_table.shape =", bt.shape)
         print("block_table[0, :10] =", bt[0, :10])
     else:
-        print("shared_block_table has no to_tensor()")
+        print("block_table has no to_tensor()")
+    
+    scheduler.release_request(request_id)
 
     print("\n" + "=" * 60)
     print("[OUTPUT] PagedAttention Generation Result")
