@@ -6,6 +6,7 @@ import torch
 
 from huggingface_hub import login
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
 from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
@@ -332,14 +333,30 @@ def main():
         dtype=model_paged.dtype,
     )
 
-    shared_block_table = BlockTable(block_size=block_size)
-    for _ in range(needed_blocks + 4):
-        shared_block_table.add_block(pool.allocate())
+    pool = PagePool(
+    num_blocks=128,   # 일단 넉넉하게
+    num_layers=config.num_hidden_layers,
+    num_heads=config.num_key_value_heads,
+    block_size=16,
+    head_dim=config.hidden_size // config.num_attention_heads,
+    device=device,
+    dtype=model_paged.dtype,
+)
+
+    scheduler = SimpleScheduler(page_pool=pool, block_size=16)
+
+    request_id = "req_1"
+
+    prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
+    max_new_tokens = 20
+    total_tokens = prompt_len + max_new_tokens
+
+    block_table = scheduler.allocate_for_request(request_id, total_tokens)
 
     model_paged = patch_model_with_paged_attention(
         model=model_paged,
         page_pool=pool,
-        block_table=shared_block_table,
+        block_table=block_table,
     )
 
     # PagePool 초기화
@@ -365,8 +382,10 @@ def main():
         model=model_paged,
         tokenizer=tokenizer,
         prompt_text=prompt,
-        max_new_tokens=20,
+        max_new_tokens=max_new_tokens,
     )
+
+    scheduler.release_request(request_id)
 
     # -------------------------
     # 디버그 정보
