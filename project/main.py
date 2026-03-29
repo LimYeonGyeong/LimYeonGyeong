@@ -311,7 +311,7 @@ def main():
 
     prompt = (
         '### Instruction:\n'
-        'what are you doing now?". '
+        'what is Medusa llm model?". '
         'Explain it in one simple sentence.\n'
         '### Response:\n'
     )
