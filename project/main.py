@@ -89,6 +89,142 @@ def measure_performance(model, tokenizer, prompt_text, max_new_tokens=20):
 
     return stats
 
+@torch.no_grad()
+def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=20):
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+
+    peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0.0
+
+    total_tokens = outputs.shape[1] * len(prompts)
+
+    return {
+        "latency": t1 - t0,
+        "throughput": total_tokens / (t1 - t0),
+        "peak_vram_mb": peak_vram,
+    }
+
+@torch.no_grad()
+def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_tokens=20):
+    request_ids = []
+    block_tables = []
+
+    # 1) 요청별 block 할당
+    for i, prompt in enumerate(prompts):
+        rid = f"multi_req_{i}"
+        request_ids.append(rid)
+
+        prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
+        total_tokens = prompt_len + max_new_tokens
+
+        bt = scheduler.allocate_for_request(rid, total_tokens)
+        block_tables.append(bt)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
+    results = []
+
+    # 2) 각 요청 실행
+    for i, prompt in enumerate(prompts):
+        model = patch_model_with_paged_attention(
+            model=model,
+            page_pool=pool,
+            block_table=block_tables[i],
+        )
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        generated = inputs["input_ids"]
+
+        # prefill
+        seq_len = generated.shape[1]
+        attention_mask = torch.ones_like(generated, device=generated.device)
+        position_ids = torch.arange(seq_len, device=generated.device).unsqueeze(0)
+
+        outputs = model(
+            input_ids=generated,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            past_key_values=None,
+        )
+
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+
+        # decode
+        for _ in range(max_new_tokens - 1):
+            cur_len = generated.shape[1]
+
+            last_token = generated[:, -1:]
+            attention_mask = torch.ones((1, cur_len), dtype=torch.long, device=generated.device)
+            position_ids = torch.tensor([[cur_len - 1]], device=generated.device)
+
+            outputs = model(
+                input_ids=last_token,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                past_key_values=None,
+            )
+
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+
+            if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+                break
+
+        results.append(generated)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+
+    peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0.0
+    total_tokens = sum(r.shape[1] for r in results)
+
+    used_blocks = 0
+    for bt in block_tables:
+        if hasattr(bt, "to_tensor"):
+            used_blocks += bt.to_tensor(device="cpu").shape[1]
+        else:
+            used_blocks += len(bt.block_table[0])
+
+    block_utilization = used_blocks / pool.num_blocks if pool.num_blocks > 0 else 0.0
+
+    # 3) 요청 반납
+    for rid in request_ids:
+        scheduler.release_request(rid)
+
+    return {
+        "latency": t1 - t0,
+        "throughput": total_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
+        "peak_vram_mb": peak_vram,
+        "used_blocks": used_blocks,
+        "block_utilization": block_utilization,
+    }
 
 # -----------------------------
 # PagedAttention 정확성 테스트
@@ -316,6 +452,13 @@ def main():
         '### Response:\n'
     )
 
+    prompts = [
+        "Explain what LLM is in one sentence.",
+        "Explain what Medusa LLM is in one sentence.",
+        "Describe how attention works in transformers.",
+        "Explain KV cache in simple terms."
+    ]
+
     # -------------------------
     # Baseline
     # -------------------------
@@ -351,12 +494,15 @@ def main():
     max_new_tokens = 20
     block_size = 16
 
-    prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
-    needed_tokens = prompt_len + max_new_tokens
-    needed_blocks = (needed_tokens + block_size - 1) // block_size
+    all_needed_blocks = 0
+    for p in prompts:
+        prompt_len = tokenizer(p, return_tensors="pt")["input_ids"].shape[1]
+        needed_tokens = prompt_len + max_new_tokens
+        needed_blocks = (needed_tokens + block_size - 1) // block_size
+        all_needed_blocks += needed_blocks
 
-    # 여유분 2~4블록만 추가
-    num_blocks = needed_blocks + 4
+    # 여유분 조금 추가
+    num_blocks = all_needed_blocks + 4
 
     pool = PagePool(
         num_blocks=num_blocks,
@@ -429,7 +575,6 @@ def main():
     else:
         print("block_table has no to_tensor()")
     
-    scheduler.release_request(request_id)
 
     print("\n" + "=" * 60)
     print("[OUTPUT] PagedAttention Generation Result")
@@ -451,6 +596,44 @@ def main():
     print(f"{'Context Switch':<25} | {stats_base['ctx_switches']:<15} | {stats_paged['ctx_switches']:<15} |")
     print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged['used_blocks']:<15} |")
     print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged['block_utilization']:<15.2%} |")
+
+
+
+    scheduler.release_request(request_id)
+
+    print("\n>>> Multi-request 실험 시작")
+
+    # -------------------------
+    # Baseline multi
+    # -------------------------
+    model_base_multi = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    ).to(device)
+
+    stats_base_multi = measure_baseline_multi(
+        model_base_multi, tokenizer, prompts, max_new_tokens=20
+    )
+
+    del model_base_multi
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # -------------------------
+    # Paged multi
+    # -------------------------
+    stats_paged_multi = measure_paged_multi(
+        model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=20
+    )
+
+    print("\n=== Multi Request Result ===")
+    print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged':<15}")
+    print(f"{'Latency':<25} | {stats_base_multi['latency']:<15.4f} | {stats_paged_multi['latency']:<15.4f}")
+    print(f"{'Throughput':<25} | {stats_base_multi['throughput']:<15.2f} | {stats_paged_multi['throughput']:<15.2f}")
+    print(f"{'Peak VRAM':<25} | {stats_base_multi['peak_vram_mb']:<15.1f} | {stats_paged_multi['peak_vram_mb']:<15.1f}")
+    print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged_multi['used_blocks']:<15}")
+    print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged_multi['block_utilization']:<15.2%}")
 
 
 if __name__ == "__main__":
