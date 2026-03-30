@@ -524,12 +524,22 @@ def main():
     )
 
     prompts = [
-        "Explain what LLM is in one sentence.",
-        "Explain what Medusa LLM is in one sentence.",
-        "Describe how attention works in transformers.",
-        "Explain KV cache in simple terms."
+        "### Instruction:\nExplain what LLM is in one sentence.\n### Response:",
+        "### Instruction:\nExplain Medusa LLM in one simple sentence.\n### Response:",
+        "### Instruction:\nDescribe how attention works in transformers in one sentence.\n### Response:",
+        "### Instruction:\nExplain KV cache in simple terms in one sentence.\n### Response:",
+        "### Instruction:\nWhat is a transformer model? Answer in one sentence.\n### Response:",
+        "### Instruction:\nExplain the difference between training and inference in LLMs.\n### Response:",
+        "### Instruction:\nWhat is self-attention and why is it important?\n### Response:",
+        "### Instruction:\nExplain what tokenization is in natural language processing.\n### Response:",
+        "### Instruction:\nWhat is the purpose of positional encoding in transformers?\n### Response:",
+        "### Instruction:\nExplain what fine-tuning means for language models.\n### Response:",
+        "### Instruction:\nWhat is the role of embeddings in LLMs?\n### Response:",
+        "### Instruction:\nExplain what beam search is in text generation.\n### Response:",
+        "### Instruction:\nWhat is greedy decoding and how does it work?\n### Response:",
+        "### Instruction:\nExplain why KV cache improves inference speed.\n### Response:",
+        "### Instruction:\nWhat is the difference between encoder-only and decoder-only models?\n### Response:",
     ]
-
     # -------------------------
     # Baseline
     # -------------------------
@@ -538,7 +548,7 @@ def main():
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
 
-    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=20)
+    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=50)
 
     del model_base
     gc.collect()
