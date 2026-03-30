@@ -91,12 +91,16 @@ def measure_performance(model, tokenizer, prompt_text, max_new_tokens=20):
 
 @torch.no_grad()
 def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=20):
+    process = psutil.Process(os.getpid())
     inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
 
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+    ram_start = process.memory_info().rss / 1024 / 1024
+    ctx_start = process.num_ctx_switches()
 
     t0 = time.time()
 
@@ -113,22 +117,44 @@ def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=20):
         torch.cuda.synchronize()
     t1 = time.time()
 
-    peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0.0
+    ram_end = process.memory_info().rss / 1024 / 1024
+    ctx_end = process.num_ctx_switches()
 
-    total_tokens = outputs.shape[1] * len(prompts)
+    generated_tokens = (outputs.shape[1] - inputs["input_ids"].shape[1]) * inputs["input_ids"].shape[0]
+
+    if device == "cuda":
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        current_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+        current_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+        max_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024
+    else:
+        peak_allocated = 0.0
+        current_allocated = 0.0
+        current_reserved = 0.0
+        max_reserved = 0.0
 
     return {
         "latency": t1 - t0,
-        "throughput": total_tokens / (t1 - t0),
-        "peak_vram_mb": peak_vram,
+        "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
+        "ram_mb": ram_end - ram_start,
+        "ctx_switches": (ctx_end.voluntary - ctx_start.voluntary)
+        + (ctx_end.involuntary - ctx_start.involuntary),
+        "peak_vram_mb": peak_allocated,
+        "alloc_vram_mb": current_allocated,
+        "reserved_vram_mb": current_reserved,
+        "max_reserved_vram_mb": max_reserved,
+        "vram_per_token_kb": (peak_allocated * 1024 / generated_tokens) if generated_tokens > 0 else 0.0,
+        "used_blocks": 0,
+        "block_utilization": 0.0,
     }
 
 @torch.no_grad()
 def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_tokens=20):
+    process = psutil.Process(os.getpid())
+
     request_ids = []
     block_tables = []
 
-    # 1) 요청별 block 할당
     for i, prompt in enumerate(prompts):
         rid = f"multi_req_{i}"
         request_ids.append(rid)
@@ -144,10 +170,12 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+    ram_start = process.memory_info().rss / 1024 / 1024
+    ctx_start = process.num_ctx_switches()
+
     t0 = time.time()
     results = []
 
-    # 2) 각 요청 실행
     for i, prompt in enumerate(prompts):
         model = patch_model_with_paged_attention(
             model=model,
@@ -202,8 +230,21 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         torch.cuda.synchronize()
     t1 = time.time()
 
-    peak_vram = torch.cuda.max_memory_allocated() / 1024 / 1024 if device == "cuda" else 0.0
-    total_tokens = sum(r.shape[1] for r in results)
+    ram_end = process.memory_info().rss / 1024 / 1024
+    ctx_end = process.num_ctx_switches()
+
+    generated_tokens = sum((r.shape[1] - tokenizer(prompts[i], return_tensors="pt")["input_ids"].shape[1]) for i, r in enumerate(results))
+
+    if device == "cuda":
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        current_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+        current_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+        max_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024
+    else:
+        peak_allocated = 0.0
+        current_allocated = 0.0
+        current_reserved = 0.0
+        max_reserved = 0.0
 
     used_blocks = 0
     for bt in block_tables:
@@ -214,17 +255,40 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
     block_utilization = used_blocks / pool.num_blocks if pool.num_blocks > 0 else 0.0
 
-    # 3) 요청 반납
     for rid in request_ids:
         scheduler.release_request(rid)
 
     return {
         "latency": t1 - t0,
-        "throughput": total_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
-        "peak_vram_mb": peak_vram,
+        "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
+        "ram_mb": ram_end - ram_start,
+        "ctx_switches": (ctx_end.voluntary - ctx_start.voluntary)
+        + (ctx_end.involuntary - ctx_start.involuntary),
+        "peak_vram_mb": peak_allocated,
+        "alloc_vram_mb": current_allocated,
+        "reserved_vram_mb": current_reserved,
+        "max_reserved_vram_mb": max_reserved,
+        "vram_per_token_kb": (peak_allocated * 1024 / generated_tokens) if generated_tokens > 0 else 0.0,
         "used_blocks": used_blocks,
         "block_utilization": block_utilization,
     }
+
+def print_stats_table(title, stats_base, stats_paged, include_blocks=False):
+    print(f"\n=== {title} ===")
+    print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged':<15} |")
+    print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
+    print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
+    print(f"{'RAM Increase (MB)':<25} | {stats_base['ram_mb']:<15.1f} | {stats_paged['ram_mb']:<15.1f} |")
+    print(f"{'Peak VRAM (MB)':<25} | {stats_base['peak_vram_mb']:<15.1f} | {stats_paged['peak_vram_mb']:<15.1f} |")
+    print(f"{'Alloc VRAM (MB)':<25} | {stats_base['alloc_vram_mb']:<15.1f} | {stats_paged['alloc_vram_mb']:<15.1f} |")
+    print(f"{'Reserved VRAM (MB)':<25} | {stats_base['reserved_vram_mb']:<15.1f} | {stats_paged['reserved_vram_mb']:<15.1f} |")
+    print(f"{'Max Reserved VRAM (MB)':<25} | {stats_base['max_reserved_vram_mb']:<15.1f} | {stats_paged['max_reserved_vram_mb']:<15.1f} |")
+    print(f"{'VRAM/token (KB)':<25} | {stats_base['vram_per_token_kb']:<15.2f} | {stats_paged['vram_per_token_kb']:<15.2f} |")
+    print(f"{'Context Switch':<25} | {stats_base['ctx_switches']:<15} | {stats_paged['ctx_switches']:<15} |")
+
+    if include_blocks:
+        print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged['used_blocks']:<15} |")
+        print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged['block_utilization']:<15.2%} |")
 
 # -----------------------------
 # PagedAttention 정확성 테스트
@@ -444,6 +508,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     prompt = (
         '### Instruction:\n'
@@ -584,18 +649,7 @@ def main():
     # -------------------------
     # 결과 출력
     # -------------------------
-    print(f"{'Metric':<25} | {'normal':<15} | {'Paged':<15} |")
-    print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
-    print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
-    print(f"{'RAM Increase (MB)':<25} | {stats_base['ram_mb']:<15.1f} | {stats_paged['ram_mb']:<15.1f} |")
-    print(f"{'Peak VRAM (MB)':<25} | {stats_base['peak_vram_mb']:<15.1f} | {stats_paged['peak_vram_mb']:<15.1f} |")
-    print(f"{'Alloc VRAM (MB)':<25} | {stats_base['alloc_vram_mb']:<15.1f} | {stats_paged['alloc_vram_mb']:<15.1f} |")
-    print(f"{'Reserved VRAM (MB)':<25} | {stats_base['reserved_vram_mb']:<15.1f} | {stats_paged['reserved_vram_mb']:<15.1f} |")
-    print(f"{'Max Reserved VRAM (MB)':<25} | {stats_base['max_reserved_vram_mb']:<15.1f} | {stats_paged['max_reserved_vram_mb']:<15.1f} |")
-    print(f"{'VRAM/token (KB)':<25} | {stats_base['vram_per_token_kb']:<15.2f} | {stats_paged['vram_per_token_kb']:<15.2f} |")
-    print(f"{'Context Switch':<25} | {stats_base['ctx_switches']:<15} | {stats_paged['ctx_switches']:<15} |")
-    print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged['used_blocks']:<15} |")
-    print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged['block_utilization']:<15.2%} |")
+    print_stats_table("Single Request Result", stats_base, stats_paged, include_blocks=True)
 
 
 
@@ -627,13 +681,7 @@ def main():
         model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=20
     )
 
-    print("\n=== Multi Request Result ===")
-    print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged':<15}")
-    print(f"{'Latency':<25} | {stats_base_multi['latency']:<15.4f} | {stats_paged_multi['latency']:<15.4f}")
-    print(f"{'Throughput':<25} | {stats_base_multi['throughput']:<15.2f} | {stats_paged_multi['throughput']:<15.2f}")
-    print(f"{'Peak VRAM':<25} | {stats_base_multi['peak_vram_mb']:<15.1f} | {stats_paged_multi['peak_vram_mb']:<15.1f}")
-    print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged_multi['used_blocks']:<15}")
-    print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged_multi['block_utilization']:<15.2%}")
+    print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
 
 
 if __name__ == "__main__":
