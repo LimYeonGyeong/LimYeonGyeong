@@ -518,7 +518,7 @@ def main():
 
     prompt = (
         '### Instruction:\n'
-        'what is Medusa llm model?". '
+        'Explain the difference between training and inference in LLMs.'
         'Explain it in one simple sentence.\n'
         '### Response:\n'
     )
