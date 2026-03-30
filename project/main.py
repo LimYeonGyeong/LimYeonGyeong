@@ -258,6 +258,11 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     for rid in request_ids:
         scheduler.release_request(rid)
 
+    decoded_texts = [
+        tokenizer.decode(r[0], skip_special_tokens=True)
+        for r in results
+    ]
+
     return {
         "latency": t1 - t0,
         "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
@@ -271,11 +276,12 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         "vram_per_token_kb": (peak_allocated * 1024 / generated_tokens) if generated_tokens > 0 else 0.0,
         "used_blocks": used_blocks,
         "block_utilization": block_utilization,
+        "texts": decoded_texts,
     }
 
 def print_stats_table(title, stats_base, stats_paged, include_blocks=False):
     print(f"\n=== {title} ===")
-    print(f"{'Metric':<25} | {'Baseline':<15} | {'Paged':<15} |")
+    print(f"{'Metric':<25} | {'nomal':<15} | {'Paged':<15} |")
     print(f"{'Latency (sec)':<25} | {stats_base['latency']:<15.4f} | {stats_paged['latency']:<15.4f} |")
     print(f"{'Throughput (tok/s)':<25} | {stats_base['throughput']:<15.2f} | {stats_paged['throughput']:<15.2f} |")
     print(f"{'RAM Increase (MB)':<25} | {stats_base['ram_mb']:<15.1f} | {stats_paged['ram_mb']:<15.1f} |")
@@ -680,6 +686,10 @@ def main():
     stats_paged_multi = measure_paged_multi(
         model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=20
     )
+    print("\n[OUTPUT] Multi Request Generation Results")
+    for i, text in enumerate(stats_paged_multi["texts"]):
+        print(f"\n--- Request {i+1} ---")
+        print(text)
 
     print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
 
