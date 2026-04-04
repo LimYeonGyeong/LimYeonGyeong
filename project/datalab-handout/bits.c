@@ -17,8 +17,6 @@
  * STEP 1: Read the following instructions carefully.
  */
 
-// ... (중략: STEP 1의 규칙 내용은 원본 그대로 유지됨)
-
 #endif
 
 /* * bitNor - ~(x|y) using only ~ and & 
