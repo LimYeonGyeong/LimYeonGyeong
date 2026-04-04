@@ -47,10 +47,9 @@ int bitAnd(int x, int y) {
  * Rating: 1
  */
 int thirdBits(void) {
-  /* Construct 0x49249249 using 8-bit constants and shifts */
-  int x = 0x49;
-  x = (x << 9) | 0x49;
-  x = (x << 18) | (x >> 9);
+  int x = 0x49; 
+  x = (x << 9) | x;  
+  x = (x << 18) | (x >> 9); 
   return x;
 }
 
