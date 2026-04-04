@@ -47,9 +47,10 @@ int bitAnd(int x, int y) {
  * Rating: 1
  */
 int thirdBits(void) {
-  int x = 0x49;           
-  int shift9 = (x << 9) | x; 
-  return (shift9 << 18) | (shift9 >> 9);
+  int a = 0x49;           
+  int b = (a << 9) | a; 
+  int c = (a << 18);       
+  return b | c;        
 }
 
 /* * bitMatch - Create mask indicating which bits in x match those in y
