@@ -154,14 +154,21 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
     request_ids = []
     block_tables = []
-    prompt_lengths = []
+    encoded_prompts = []
 
-    for i, prompt in enumerate(prompts):
+    # 토크나이징을 루프 밖에서 1회만 수행
+    for prompt in prompts:
+        enc = tokenizer(prompt, return_tensors="pt")
+        encoded_prompts.append({
+            "input_ids": enc["input_ids"].to(model.device),
+            "prompt_len": enc["input_ids"].shape[1],
+        })
+
+    for i, item in enumerate(encoded_prompts):
         rid = f"multi_req_{i}"
         request_ids.append(rid)
 
-        prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
-        prompt_lengths.append(prompt_len)
+        prompt_len = item["prompt_len"]
         total_tokens = prompt_len + max_new_tokens
 
         bt = scheduler.allocate_for_request(rid, total_tokens)
@@ -178,13 +185,13 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     t0 = time.time()
     results = []
 
-    for i, prompt in enumerate(prompts):
+    for i, item in enumerate(encoded_prompts):
         for layer in model.model.layers:
             layer.self_attn.block_table = block_tables[i]
         model.model.block_table = block_tables[i]
 
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        generated = inputs["input_ids"]
+        generated = item["input_ids"].clone()
+        prompt_len = item["prompt_len"]
 
         # prefill
         seq_len = generated.shape[1]
@@ -224,7 +231,7 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
                 break
 
-        results.append((generated, prompt_lengths[i]))
+        results.append((generated, prompt_len))
 
     if device == "cuda":
         torch.cuda.synchronize()
