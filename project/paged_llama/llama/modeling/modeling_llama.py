@@ -123,25 +123,17 @@ class PagedCacheShim:
     HF generate()가 요구하는 최소 cache 인터페이스만 흉내내는 객체.
     실제 KV는 저장하지 않고, '현재까지 본 토큰 수'만 관리한다.
     """
-    def __init__(self, config=None, page_pool=None, block_table=None, request_state=None, seen_tokens: int = 0):
-        self.config = config
-        self.page_pool = page_pool
-        self.block_table = block_table
-        self.request_state = request_state
-        self.seen_tokens = seen_tokens if request_state is None else int(request_state.get("seq_len", 0))
+    def __init__(self, seen_tokens: int = 0):
+        self.seen_tokens = seen_tokens
 
     def get_seq_length(self):
-        if self.request_state is not None:
-            return int(self.request_state.get("seq_len", 0))
         return self.seen_tokens
 
     def update_seen_tokens(self, new_len: int):
         self.seen_tokens = new_len
-        if self.request_state is not None:
-            self.request_state["seq_len"] = int(new_len)
 
     def __repr__(self):
-        return f"PagedCacheShim(seen_tokens={self.get_seq_length()})"
+        return f"PagedCacheShim(seen_tokens={self.seen_tokens})"
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -451,7 +443,7 @@ class PagedLlamaAttention(nn.Module):
         else:
             block_table_tensor = target_block_table.to(device=target_device)
 
-                # 4. q, k, v projection
+        # 4. q, k, v projection
         query_states = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -465,7 +457,7 @@ class PagedLlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if self.debug_verbose:
-            _tensor_debug("hidden_states", hidden_states, self.layer_idx, f"start_pos={position_ids.reshape(-1)[0].item() if position_ids is not None else 0}")
+            _tensor_debug("hidden_states", hidden_states, self.layer_idx)
             _tensor_debug("query_states(after q_proj)", query_states, self.layer_idx)
             _tensor_debug("key_states(after k_proj)", key_states, self.layer_idx)
             _tensor_debug("value_states(after v_proj)", value_states, self.layer_idx)
@@ -477,7 +469,7 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
             _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
             _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
-            
+
         # 5. RoPE
         if position_embeddings is None and "position_embeddings" in kwargs:
             position_embeddings = kwargs["position_embeddings"]
@@ -509,11 +501,23 @@ class PagedLlamaAttention(nn.Module):
         else:
             start_pos = 0
 
-        if self.debug:
-            print(f"[DBG][Layer {self.layer_idx}] start_pos={start_pos}, q_len={q_len}, bsz={bsz}")
-
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
+
+        if self.debug and self.layer_idx == 0:
+            print(f"\n[POS][Layer {self.layer_idx}] ====================")
+            print(f"[POS] q_len={q_len}")
+            print(f"[POS] start_pos={start_pos}")
+            print(f"[POS] total_seq_len={total_seq_len}")
+
+            if cache_position is not None:
+                print(f"[POS] cache_position={cache_position.detach().cpu().tolist()}")
+
+            if position_ids is not None:
+                print(f"[POS] position_ids={position_ids.detach().cpu().tolist()}")
+
+            if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
+                print(f"[POS] past_seq_len={past_key_values.get_seq_length()}")
 
         # 7. WRITE
         for i in range(q_len):
@@ -529,18 +533,30 @@ class PagedLlamaAttention(nn.Module):
 
             physical_block_idx = block_table_tensor[0, block_idx_logic].item()
 
-            if getattr(self, "debug", False):
+            if self.debug and self.layer_idx == 0:
                 if i == 0 or abs_pos % pool.block_size == 0:
                     print(
                         f"[VERIFY-WRITE] Layer {self.layer_idx} | "
                         f"Pos {abs_pos} (Logic {block_idx_logic}) -> Physical {physical_block_idx}"
                     )
 
-            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
-                key_states[0, :, i, :].to(pool.k_cache.dtype)
+            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] =                 key_states[0, :, i, :].to(pool.k_cache.dtype)
 
-            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = \
-                value_states[0, :, i, :].to(pool.v_cache.dtype)
+            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] =                 value_states[0, :, i, :].to(pool.v_cache.dtype)
+
+            if self.debug and self.layer_idx == 0 and i == q_len - 1:
+                written_k_dbg = pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :]
+                written_v_dbg = pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :]
+
+                src_k_dbg = key_states[0, :, i, :]
+                src_v_dbg = value_states[0, :, i, :]
+
+                write_k_diff_dbg = (written_k_dbg.float() - src_k_dbg.float()).abs().max().item()
+                write_v_diff_dbg = (written_v_dbg.float() - src_v_dbg.float()).abs().max().item()
+
+                print(f"[WRITE][Layer {self.layer_idx}] abs_pos={abs_pos} "
+                      f"logic_block={block_idx_logic} physical_block={physical_block_idx} offset={block_offset}")
+                print(f"[WRITE] k_diff={write_k_diff_dbg:.10f} v_diff={write_v_diff_dbg:.10f}")
 
         # 8. block table 크기 확인
         if num_needed_blocks > block_table_tensor.size(1):
@@ -552,18 +568,11 @@ class PagedLlamaAttention(nn.Module):
         # 9. READ 준비
         active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
 
-        layer_k_cache = pool.k_cache[self.layer_idx]   # [num_blocks, num_kv_heads, block_size, head_dim]
+        layer_k_cache = pool.k_cache[self.layer_idx]
         layer_v_cache = pool.v_cache[self.layer_idx]
 
         k_blocks = layer_k_cache.index_select(0, active_indices)
         v_blocks = layer_v_cache.index_select(0, active_indices)
-
-        #print(f"[VERIFY-READ-1] Layer {self.layer_idx}")
-        #print(f"  active_indices = {active_indices.tolist()}")
-        #print(f"  k_blocks.shape = {k_blocks.shape}")
-        #print(f"  v_blocks.shape = {v_blocks.shape}")
-        #print(f"  total_seq_len = {total_seq_len}")
-        #print(f"  num_needed_blocks = {num_needed_blocks}")
 
         # 10. flatten
         k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
@@ -572,12 +581,6 @@ class PagedLlamaAttention(nn.Module):
         # repeat 전 상태 보관 (검증용)
         full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
         full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
-
-        #print(f"[VERIFY-READ-2] Layer {self.layer_idx}")
-        #print(f"  k_flat.shape = {k_flat.shape}")
-        #print(f"  v_flat.shape = {v_flat.shape}")
-        #print(f"  full_key_states_before_repeat.shape = {full_key_states_before_repeat.shape}")
-        #print(f"  full_value_states_before_repeat.shape = {full_value_states_before_repeat.shape}")
 
         # 11. WRITE vs READ 직접 비교
         check_pos = total_seq_len - 1
@@ -588,41 +591,20 @@ class PagedLlamaAttention(nn.Module):
         written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
         written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
 
-        if self.debug_verbose and q_len > 0:
-            last_abs_pos = start_pos + q_len - 1
-            last_logic_block = last_abs_pos // pool.block_size
-            last_offset = last_abs_pos % pool.block_size
-            last_physical_block = block_table_tensor[0, last_logic_block].item()
-
-            cached_k = pool.k_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-            cached_v = pool.v_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-
-            _tensor_debug("cached_k(last written)", cached_k, self.layer_idx)
-            _tensor_debug("cached_v(last written)", cached_v, self.layer_idx)
-
-            write_k_diff = (cached_k.float() - key_states[0, :, -1, :].float()).abs().max().item()
-            write_v_diff = (cached_v.float() - value_states[0, :, -1, :].float()).abs().max().item()
-            print(f"[DBG][Layer {self.layer_idx}] write_k_diff={write_k_diff:.8f} write_v_diff={write_v_diff:.8f}")
-        #print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
-        #print(f"  check_pos = {check_pos}")
-        #print(f"  logic_block = {check_logic_block}")
-        #print(f"  physical_block = {check_physical_block}")
-        #print(f"  offset = {check_offset}")
-        #print(f"  written_k sample = {written_k[0, :8].detach().cpu()}")
-        #print(f"  written_v sample = {written_v[0, :8].detach().cpu()}")
-
         read_k = full_key_states_before_repeat[0, :, check_pos, :]
         read_v = full_value_states_before_repeat[0, :, check_pos, :]
 
-        #print(f"[VERIFY-READ-4] Layer {self.layer_idx}")
-        #print(f"  read_k sample = {read_k[0, :8].detach().cpu()}")
-        #print(f"  read_v sample = {read_v[0, :8].detach().cpu()}")
+        k_diff = (written_k.float() - read_k.float()).abs().max().item()
+        v_diff = (written_v.float() - read_v.float()).abs().max().item()
 
-        k_diff = (written_k - read_k).abs().max().item()
-        v_diff = (written_v - read_v).abs().max().item()
-
-        #print(f"  max |written_k - read_k| = {k_diff}")
-        #print(f"  max |written_v - read_v| = {v_diff}")
+        if self.debug and self.layer_idx == 0:
+            print(f"[READ][Layer {self.layer_idx}] ====================")
+            print(f"[READ] check_pos={check_pos}")
+            print(f"[READ] logic_block={check_logic_block}")
+            print(f"[READ] physical_block={check_physical_block}")
+            print(f"[READ] offset={check_offset}")
+            print(f"[READ] k_diff={k_diff:.10f}")
+            print(f"[READ] v_diff={v_diff:.10f}")
 
         if self.debug_verbose:
             _tensor_debug("k_flat", k_flat, self.layer_idx)
@@ -649,6 +631,9 @@ class PagedLlamaAttention(nn.Module):
         k_for_scores = full_key_states.float()
         v_for_attn = full_value_states.float()
 
+        if self.debug and self.layer_idx == 0:
+            print(f"[ATTN][Layer {self.layer_idx}] q_len={q_len} total_seq_len={total_seq_len}")
+
         if self.debug_verbose:
             _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
             _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
@@ -663,7 +648,7 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
 
         causal_mask = torch.full(
             (q_len, total_seq_len),
@@ -682,7 +667,7 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
 
         attn_weights = torch.softmax(attn_weights, dim=-1)
 
@@ -691,7 +676,7 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
         attn_output = torch.matmul(attn_weights, v_for_attn)
 
@@ -700,27 +685,15 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
-        _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
+            _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
 
         attn_output = attn_output.to(query_states.dtype)
-
-        #print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
-        #print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
-        #print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
-        #print(f"  attn_output nan = {torch.isnan(attn_output).any().item()}")
-        #print(f"  attn_output inf = {torch.isinf(attn_output).any().item()}")
-        #print(f"  attn_output abs max = {attn_output.abs().max().item()}")
 
         # 14. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
-        #print(f"[VERIFY-O-PROJ] Layer {self.layer_idx}")
-        #print(f"  output nan = {torch.isnan(attn_output).any().item()}")
-        #print(f"  output inf = {torch.isinf(attn_output).any().item()}")
-        #print(f"  output abs max = {attn_output.abs().max().item()}")
 
         return attn_output, None
-    
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
@@ -804,7 +777,6 @@ class LlamaModel(LlamaPreTrainedModel):
         self.gradient_checkpointing = False
         self.page_pool = None
         self.block_table = None
-        self.active_request_state = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -834,7 +806,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     config=self.config,
                     page_pool=self.page_pool,
                     block_table=self.block_table,
-                    request_state=self.active_request_state,
                 )
             else:
                 past_key_values = DynamicCache(config=self.config)
@@ -848,17 +819,14 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if use_cache and self.page_pool is not None and self.block_table is not None:
-            causal_mask = None
-        else:
-            causal_mask = create_causal_mask(
-                config=self.config,
-                input_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
