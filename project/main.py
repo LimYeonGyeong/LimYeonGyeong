@@ -210,10 +210,10 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         # 1) prefill
         print("\n[MAIN-PREFILL] before call")
         print(f"[CACHE-ID] before prefill id={id(past_key_values) if past_key_values is not None else None}")
-        print(f"[REQ-STATE] before prefill = {model_paged.model.active_request_state}")
-        print(f"[REQ-STATE-ID] before prefill = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+        print(f"[REQ-STATE] before prefill = {model.model.active_request_state}")
+        print(f"[REQ-STATE-ID] before prefill = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
 
-        outputs = model_paged(
+        outputs = model(
             input_ids=generated,
             use_cache=True,
             past_key_values=None,
@@ -225,12 +225,12 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         print(f"[CACHE-TYPE] after prefill = {type(past_key_values)}")
         print(f"[CACHE-SEQ] after prefill = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
-        print(f"[REQ-STATE] after prefill = {model_paged.model.active_request_state}")
-        print(f"[REQ-STATE-ID] after prefill = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+        print(f"[REQ-STATE] after prefill = {model.model.active_request_state}")
+        print(f"[REQ-STATE-ID] after prefill = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
 
         scheduler.set_seq_len(request_id, prompt_len)
 
-        print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model_paged.model.active_request_state}")
+        print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model.model.active_request_state}")
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -245,7 +245,8 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             print(f"[CACHE-SEQ] before call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
             print(f"[REQ-STATE] before call = {model.model.active_request_state}")
             print(f"[REQ-STATE-ID] before call = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
-
+            print("[CHECK] pkv seq =", past_key_values.get_seq_length())
+            print("[CHECK] req seq =", model.model.active_request_state["seq_len"])
             outputs = model(
                 input_ids=last_token,
                 use_cache=True,
@@ -258,8 +259,8 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
             print(f"[CACHE-TYPE] after call = {type(past_key_values)}")
             print(f"[CACHE-SEQ] after call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
-            print(f"[REQ-STATE] after call = {model_paged.model.active_request_state}")
-            print(f"[REQ-STATE-ID] after call = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+            print(f"[REQ-STATE] after call = {model.model.active_request_state}")
+            print(f"[REQ-STATE-ID] after call = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
