@@ -24,7 +24,7 @@ paged past_seq_len_after    = 0
 [MAIN-PREFILL] before call
 [CACHE-ID] before prefill id=None
 [REQ-STATE] before prefill = {'block_table': BlockTable(size=4, blocks=[0, 1, 2, 3]), 'seq_len': 0, 'total_tokens': 53}
-[REQ-STATE-ID] before prefill = 140695287793920
+[REQ-STATE-ID] before prefill = 140544954431744
 
 [POS][Layer 0] ====================
 [POS] q_len=33
@@ -46,19 +46,19 @@ paged past_seq_len_after    = 0
 [READ] k_diff=0.0000000000
 [READ] v_diff=0.0000000000
 [ATTN][Layer 0] q_len=33 total_seq_len=33
-[CACHE-ID] after prefill call id=140695299039984
+[CACHE-ID] after prefill call id=140544991813088
 [CACHE-TYPE] after prefill = <class 'transformers.cache_utils.DynamicCache'>
 [CACHE-SEQ] after prefill = 0
 [REQ-STATE] after prefill = {'block_table': BlockTable(size=4, blocks=[0, 1, 2, 3]), 'seq_len': 0, 'total_tokens': 53}
-[REQ-STATE-ID] after prefill = 140695287793920
+[REQ-STATE-ID] after prefill = 140544954431744
 [REQ-STATE] after scheduler.set_seq_len(prompt_len) = {'block_table': BlockTable(size=4, blocks=[0, 1, 2, 3]), 'seq_len': 33, 'total_tokens': 53}
 
 [MAIN-DECODE STEP 1] before call
-[CACHE-ID] before call id=140695299039984
+[CACHE-ID] before call id=140544991813088
 [CACHE-TYPE] before call = <class 'transformers.cache_utils.DynamicCache'>
 [CACHE-SEQ] before call = 0
 [REQ-STATE] before call = {'block_table': BlockTable(size=4, blocks=[0, 1, 2, 3]), 'seq_len': 33, 'total_tokens': 53}
-[REQ-STATE-ID] before call = 140695287793920
+[REQ-STATE-ID] before call = 140544954431744
 
 [POS][Layer 0] ====================
 [POS] q_len=1
@@ -78,11 +78,11 @@ paged past_seq_len_after    = 0
 [READ] k_diff=0.0000000000
 [READ] v_diff=0.0000000000
 [ATTN][Layer 0] q_len=1 total_seq_len=1
-[CACHE-ID] after call  id=140695299039984
+[CACHE-ID] after call  id=140544991813088
 [CACHE-TYPE] after call = <class 'transformers.cache_utils.DynamicCache'>
 [CACHE-SEQ] after call = 0
 [REQ-STATE] after call = {'block_table': BlockTable(size=4, blocks=[0, 1, 2, 3]), 'seq_len': 33, 'total_tokens': 53}
-[REQ-STATE-ID] after call = 140695287793920
+[REQ-STATE-ID] after call = 140544954431744
 [DEBUG] PagePool / BlockTable 확인
 pool.k_cache.shape = torch.Size([22, 49, 4, 16, 64])
 pool.v_cache.shape = torch.Size([22, 49, 4, 16, 64])
@@ -116,15 +116,15 @@ Tracker, and the
 
 === Single Request Result ===
 Metric                    | nomal           | Paged           |
-Latency (sec)             | 0.9980          | 2.0003          |
-Throughput (tok/s)        | 10.02           | 10.00           |
-RAM Increase (MB)         | 179.0           | 0.0             |
+Latency (sec)             | 0.9074          | 2.5973          |
+Throughput (tok/s)        | 11.02           | 7.70            |
+RAM Increase (MB)         | 63.6            | 0.0             |
 Peak VRAM (MB)            | 2111.2          | 4227.5          |
 Alloc VRAM (MB)           | 2108.3          | 4225.4          |
 Reserved VRAM (MB)        | 2212.0          | 4440.0          |
 Max Reserved VRAM (MB)    | 2212.0          | 4440.0          |
 VRAM/token (KB)           | 216189.55       | 216449.52       |
-Context Switch            | 4               | 13              |
+Context Switch            | 3               | 14              |
 Used Blocks               | -               | 4               |
 Block Utilization         | -               | 8.16%           |
 
@@ -132,13 +132,21 @@ Block Utilization         | -               | 8.16%           |
 
 [MAIN-PREFILL] before call
 [CACHE-ID] before prefill id=None
+[REQ-STATE] before prefill = {'block_table': BlockTable(size=3, blocks=[4, 5, 6]), 'seq_len': 0, 'total_tokens': 41}
+[REQ-STATE-ID] before prefill = 140544954301952
+[CACHE-ID] after prefill call id=140544990111120
+[CACHE-TYPE] after prefill = <class 'transformers.cache_utils.DynamicCache'>
+[CACHE-SEQ] after prefill = 0
+[REQ-STATE] after prefill = {'block_table': BlockTable(size=3, blocks=[4, 5, 6]), 'seq_len': 0, 'total_tokens': 41}
+[REQ-STATE-ID] after prefill = 140544954301952
+[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {'block_table': BlockTable(size=3, blocks=[4, 5, 6]), 'seq_len': 21, 'total_tokens': 41}
 Traceback (most recent call last):
-  File "/LimYeonGyeong/project/main.py", line 1020, in <module>
+  File "/LimYeonGyeong/project/main.py", line 1021, in <module>
     main()
-  File "/LimYeonGyeong/project/main.py", line 1008, in main
+  File "/LimYeonGyeong/project/main.py", line 1009, in main
     stats_paged_multi = measure_paged_multi(
   File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 116, in decorate_context
     return func(*args, **kwargs)
-  File "/LimYeonGyeong/project/main.py", line 213, in measure_paged_multi
-    print(f"[REQ-STATE] before prefill = {model_paged.model.active_request_state}")
-NameError: name 'model_paged' is not defined
+  File "/LimYeonGyeong/project/main.py", line 239, in measure_paged_multi
+    for step in range(1, divergence_step + 1):
+NameError: name 'divergence_step' is not defined
