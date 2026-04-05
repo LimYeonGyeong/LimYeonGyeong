@@ -14,11 +14,11 @@ class PagedCache(Cache):
         self.page_pool = page_pool
         self.block_table = block_table
         self.request_state = request_state
-        self.seq_len = 0
+        self.seq_len = 0 if request_state is None else int(request_state.get("seq_len", 0))
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         if self.request_state is not None:
-            return int(self.request_state.get("seq_len", self.seq_len))
+            return int(self.request_state.get("seq_len", 0))
         return self.seq_len
 
     def get_max_cache_shape(self):
@@ -40,16 +40,15 @@ class PagedCache(Cache):
         if cache_kwargs is not None and "cache_position" in cache_kwargs:
             cp = cache_kwargs["cache_position"]
             if cp is not None and cp.numel() > 0:
-                new_len = max(self.get_seq_length(layer_idx), int(cp[-1].item()) + 1)
-                self.seq_len = new_len
+                new_len = int(cp[-1].item()) + 1
+                self.seq_len = max(self.seq_len, new_len)
                 if self.request_state is not None:
-                    self.request_state["seq_len"] = new_len
+                    self.request_state["seq_len"] = max(int(self.request_state.get("seq_len", 0)), new_len)
         else:
             if key_states is not None:
-                new_len = self.get_seq_length(layer_idx) + key_states.shape[-2]
-                self.seq_len = new_len
+                self.seq_len += key_states.shape[-2]
                 if self.request_state is not None:
-                    self.request_state["seq_len"] = new_len
+                    self.request_state["seq_len"] = max(int(self.request_state.get("seq_len", 0)), self.seq_len)
 
         return key_states, value_states
 

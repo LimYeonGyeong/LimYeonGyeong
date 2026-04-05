@@ -29,7 +29,7 @@ if TOKEN:
 # Baseline 성능 측정
 # -----------------------------
 @torch.no_grad()
-def measure_performance(model, tokenizer, prompt_text, max_new_tokens=20):
+def measure_performance(model, tokenizer, prompt_text, max_new_tokens=3):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
@@ -196,17 +196,17 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         generated = item["input_ids"].clone()
         prompt_len = item["prompt_len"]
-        scheduler.set_seq_len(request_id, 0)
+        past_key_values = None
 
         # prefill
+        scheduler.set_seq_len(request_id, 0)
         outputs = model(
             input_ids=generated,
             use_cache=True,
             past_key_values=None,
         )
-
-        scheduler.set_seq_len(request_id, prompt_len)
         past_key_values = outputs.past_key_values
+        scheduler.set_seq_len(request_id, prompt_len)
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -267,8 +267,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     for rid in request_ids:
         scheduler.release_request(rid)
 
-    model.model.active_request_state = None
-
     decoded_texts = [
         tokenizer.decode(gen[0], skip_special_tokens=True)
         for gen, _ in results
@@ -312,27 +310,29 @@ def print_stats_table(title, stats_base, stats_paged, include_blocks=False):
 # HF cache OFF + PagePool only
 # -----------------------------
 @torch.no_grad()
-def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_tokens=20):
+def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler, request_id, max_new_tokens=20):
     model.eval()
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
     generated = inputs["input_ids"].clone()
+    prompt_len = generated.shape[1]
+    past_key_values = None
+    request_state = scheduler.get_request_state(request_id)
+    model.model.active_request_state = request_state
+    scheduler.set_seq_len(request_id, 0)
 
     # 1) prefill
-    seq_len = generated.shape[1]
-    attention_mask = torch.ones_like(generated, device=generated.device)
-    position_ids = torch.arange(seq_len, device=generated.device).unsqueeze(0)
-
     outputs = model(
         input_ids=generated,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        use_cache=True,
         past_key_values=None,
     )
+    past_key_values = outputs.past_key_values
+    scheduler.set_seq_len(request_id, prompt_len)
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
+    scheduler.advance_seq_len(request_id, 1)
 
     print(
         f"[STEP 0] token_id = {next_token.item()} | "
@@ -341,22 +341,18 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_to
 
     # 2) decode
     for step in range(1, max_new_tokens):
-        cur_len = generated.shape[1]
-
         last_token = generated[:, -1:]
-        attention_mask = torch.ones((1, cur_len), dtype=torch.long, device=generated.device)
-        position_ids = torch.tensor([[cur_len - 1]], device=generated.device)
 
         outputs = model(
             input_ids=last_token,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            past_key_values=None,
+            use_cache=True,
+            past_key_values=past_key_values,
         )
+        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
+        scheduler.advance_seq_len(request_id, 1)
 
         token_id = next_token.item()
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
@@ -374,13 +370,12 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_to
 
     return final_text
 
-
 # -----------------------------
 # PagedAttention 성능 측정
 # HF cache OFF + PagePool only
 # -----------------------------
 @torch.no_grad()
-def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new_tokens=20, scheduler=None, request_id=None):
+def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, scheduler, request_id, max_new_tokens=20):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
@@ -392,10 +387,11 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
     ctx_start = process.num_ctx_switches()
 
     generated = inputs["input_ids"].clone()
-
-    if scheduler is not None and request_id is not None:
-        scheduler.set_seq_len(request_id, 0)
-        model.model.active_request_state = scheduler.get_request_state(request_id)
+    prompt_len = generated.shape[1]
+    past_key_values = None
+    request_state = scheduler.get_request_state(request_id)
+    model.model.active_request_state = request_state
+    scheduler.set_seq_len(request_id, 0)
 
     t0 = time.time()
 
@@ -405,16 +401,12 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
         use_cache=True,
         past_key_values=None,
     )
-
-    if scheduler is not None and request_id is not None:
-        scheduler.set_seq_len(request_id, generated.shape[1])
-
     past_key_values = outputs.past_key_values
+    scheduler.set_seq_len(request_id, prompt_len)
+
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
-
-    if scheduler is not None and request_id is not None:
-        scheduler.advance_seq_len(request_id, 1)
+    scheduler.advance_seq_len(request_id, 1)
 
     # 2) decode
     for _ in range(max_new_tokens - 1):
@@ -425,13 +417,11 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
             use_cache=True,
             past_key_values=past_key_values,
         )
-
         past_key_values = outputs.past_key_values
+
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
-
-        if scheduler is not None and request_id is not None:
-            scheduler.advance_seq_len(request_id, 1)
+        scheduler.advance_seq_len(request_id, 1)
 
         if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
             break
@@ -466,8 +456,6 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
     total_blocks = pool.num_blocks
     block_utilization = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
-    model.model.active_request_state = None
-
     stats = {
         "text": generated_text,
         "latency": t1 - t0,
@@ -486,11 +474,14 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
     return stats
 
-
 # -----------------------------
 # Attention patch
 # -----------------------------
-def patch_model_with_paged_attention(model, page_pool, block_table):
+def patch_model_with_paged_attention(model, page_pool, block_table, debug=False, debug_verbose=False):
+    # model-level cache info 연결
+    model.model.page_pool = page_pool
+    model.model.block_table = block_table
+
     for layer_idx, layer in enumerate(model.model.layers):
         old_attn = layer.self_attn
 
@@ -500,17 +491,15 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
             page_pool=page_pool,
         )
 
-        # 기존 weight 복사
         new_attn.q_proj.weight.data.copy_(old_attn.q_proj.weight.data)
         new_attn.k_proj.weight.data.copy_(old_attn.k_proj.weight.data)
         new_attn.v_proj.weight.data.copy_(old_attn.v_proj.weight.data)
         new_attn.o_proj.weight.data.copy_(old_attn.o_proj.weight.data)
 
-        # block table 연결
         new_attn.block_table = block_table
-
-        # 디버그 출력 비활성화
-        new_attn.debug = False
+        new_attn.debug = debug
+        new_attn.debug_verbose = debug_verbose
+        new_attn.debug_stop_on_nonfinite = False
 
         ref_param = next(old_attn.parameters())
         new_attn = new_attn.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -563,7 +552,7 @@ def main():
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
 
-    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=50)
+    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=10)
 
     del model_base
     gc.collect()
@@ -625,6 +614,8 @@ def main():
         model=model_paged,
         page_pool=pool,
         block_table=block_table,
+        debug=False,
+        debug_verbose=False,
     )
 
     # PagePool 초기화
@@ -652,12 +643,12 @@ def main():
         prompt_text=prompt,
         block_table=block_table,
         pool=pool,
-        max_new_tokens=max_new_tokens,
         scheduler=scheduler,
         request_id=request_id,
+        max_new_tokens=max_new_tokens,
     )
 
-    
+
 
     # -------------------------
     # 디버그 정보
@@ -672,7 +663,7 @@ def main():
         print("block_table[0, :10] =", bt[0, :10])
     else:
         print("block_table has no to_tensor()")
-    
+
 
     print("\n" + "=" * 60)
     print("[OUTPUT] PagedAttention Generation Result")

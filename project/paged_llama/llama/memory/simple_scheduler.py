@@ -34,10 +34,10 @@ class SimpleScheduler:
         return self.request_states[request_id]["seq_len"]
 
     def set_seq_len(self, request_id, seq_len):
-        self.request_states[request_id]["seq_len"] = seq_len
+        self.request_states[request_id]["seq_len"] = int(seq_len)
 
-    def advance_seq_len(self, request_id, amount):
-        self.request_states[request_id]["seq_len"] += amount
+    def advance_seq_len(self, request_id, delta):
+        self.request_states[request_id]["seq_len"] += int(delta)
 
     def release_request(self, request_id):
         block_table = self.request_tables[request_id]
@@ -51,3 +51,5 @@ class SimpleScheduler:
             self.page_pool.free(bid)
 
         del self.request_tables[request_id]
+        if request_id in self.request_states:
+            del self.request_states[request_id]
