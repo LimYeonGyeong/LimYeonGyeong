@@ -464,11 +464,11 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("query_states(after q_proj)", query_states, self.layer_idx)
-        _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
+            _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
             _assert_no_nan("key_states(after k_proj)", key_states, self.layer_idx)
-        _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
+            _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
             _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
-        _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
+            _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
             
         # 5. RoPE
         if position_embeddings is None and "position_embeddings" in kwargs:
