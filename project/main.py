@@ -154,12 +154,14 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
     request_ids = []
     block_tables = []
+    prompt_lengths = []
 
     for i, prompt in enumerate(prompts):
         rid = f"multi_req_{i}"
         request_ids.append(rid)
 
         prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
+        prompt_lengths.append(prompt_len)
         total_tokens = prompt_len + max_new_tokens
 
         bt = scheduler.allocate_for_request(rid, total_tokens)
@@ -176,8 +178,9 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     t0 = time.time()
     results = []
 
-    for layer in model.model.layers:
-        layer.self_attn.block_table = block_tables[i]
+    for i, prompt in enumerate(prompts):
+        for layer in model.model.layers:
+            layer.self_attn.block_table = block_tables[i]
         model.model.block_table = block_tables[i]
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -221,7 +224,7 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
                 break
 
-        results.append(generated)
+        results.append((generated, prompt_lengths[i]))
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -230,7 +233,10 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     ram_end = process.memory_info().rss / 1024 / 1024
     ctx_end = process.num_ctx_switches()
 
-    generated_tokens = sum((r.shape[1] - tokenizer(prompts[i], return_tensors="pt")["input_ids"].shape[1]) for i, r in enumerate(results))
+    generated_tokens = sum(
+        gen.shape[1] - prompt_len
+        for gen, prompt_len in results
+    )
 
     if device == "cuda":
         peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
@@ -256,8 +262,8 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         scheduler.release_request(rid)
 
     decoded_texts = [
-        tokenizer.decode(r[0], skip_special_tokens=True)
-        for r in results
+        tokenizer.decode(gen[0], skip_special_tokens=True)
+        for gen, _ in results
     ]
 
     return {
@@ -641,7 +647,7 @@ def main():
         max_new_tokens=max_new_tokens,
     )
 
-    
+
 
     # -------------------------
     # 디버그 정보
@@ -656,7 +662,7 @@ def main():
         print("block_table[0, :10] =", bt[0, :10])
     else:
         print("block_table has no to_tensor()")
-    
+
 
     print("\n" + "=" * 60)
     print("[OUTPUT] PagedAttention Generation Result")
