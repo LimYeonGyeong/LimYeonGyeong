@@ -133,19 +133,52 @@ class PagedCacheShim:
         if self.request_state is not None:
             self.seen_tokens = int(self.request_state.get("seq_len", self.seen_tokens))
 
+        print(
+            f"[PagedCacheShim.__init__] id={id(self)} "
+            f"seen_tokens={self.seen_tokens} "
+            f"request_state_id={id(self.request_state) if self.request_state is not None else None} "
+            f"request_state={self.request_state}"
+        )
+
     def get_seq_length(self):
         if self.request_state is not None:
-            return int(self.request_state.get("seq_len", self.seen_tokens))
+            seq = int(self.request_state.get("seq_len", self.seen_tokens))
+            print(
+                f"[PagedCacheShim.get_seq_length] id={id(self)} "
+                f"return(request_state)={seq} "
+                f"request_state_id={id(self.request_state)}"
+            )
+            return seq
+
+        print(f"[PagedCacheShim.get_seq_length] id={id(self)} return(seen_tokens)={self.seen_tokens}")
         return self.seen_tokens
 
     def update_seen_tokens(self, new_len: int):
+        print(
+            f"[PagedCacheShim.update_seen_tokens] id={id(self)} "
+            f"before seen_tokens={self.seen_tokens} "
+            f"new_len={int(new_len)} "
+            f"request_state_before={self.request_state}"
+        )
+
         self.seen_tokens = int(new_len)
+
         if self.request_state is not None:
             self.request_state["seq_len"] = int(new_len)
 
-    def __repr__(self):
-        return f"PagedCacheShim(seen_tokens={self.get_seq_length()})"
+        print(
+            f"[PagedCacheShim.update_seen_tokens] id={id(self)} "
+            f"after seen_tokens={self.seen_tokens} "
+            f"request_state_after={self.request_state}"
+        )
 
+    def __repr__(self):
+        return (
+            f"PagedCacheShim(id={id(self)}, "
+            f"seen_tokens={self.seen_tokens}, "
+            f"seq_len={self.get_seq_length()})"
+        )
+    
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -812,6 +845,12 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
+            print("[FORWARD] use_cache=True and past_key_values=None -> create cache")
+            print(f"[FORWARD] self.page_pool is None? {self.page_pool is None}")
+            print(f"[FORWARD] self.block_table is None? {self.block_table is None}")
+            print(f"[FORWARD] active_request_state={getattr(self, 'active_request_state', None)}")
+            print(f"[FORWARD] active_request_state_id={id(getattr(self, 'active_request_state', None)) if getattr(self, 'active_request_state', None) is not None else None}")
+
             # 강제로 PagedCacheShim 사용
             past_key_values = PagedCacheShim(
                 config=self.config,
@@ -820,11 +859,16 @@ class LlamaModel(LlamaPreTrainedModel):
                 request_state=getattr(self, "active_request_state", None),
             )
 
+            print(f"[FORWARD] created past_key_values type={type(past_key_values)} id={id(past_key_values)}")
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            print(f"[CACHE-POS] pkv_type={type(past_key_values)} pkv_id={id(past_key_values) if past_key_values is not None else None}")
+            print(f"[CACHE-POS] past_seen_tokens={past_seen_tokens}, input_len={inputs_embeds.shape[1]}")
             cache_position: torch.Tensor = (
                 torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             )
+            print(f"[CACHE-POS] cache_position={cache_position.detach().cpu().tolist()}")
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
@@ -852,18 +896,24 @@ class LlamaModel(LlamaPreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
-
+            
         hidden_states = self.norm(hidden_states)
+
+        print(f"[CACHE-UPDATE] use_cache={use_cache}, pkv_type={type(past_key_values)}, pkv_id={id(past_key_values) if past_key_values is not None else None}")
+
         if use_cache and isinstance(past_key_values, PagedCacheShim):
-            # 이번 forward까지 처리한 총 길이 기록
+            print(f"[CACHE-UPDATE] before={past_key_values.get_seq_length()}")
             new_seen_tokens = int(cache_position[-1].item()) + 1
-            print(f"[CACHE-UPDATE] before={past_key_values.get_seq_length()} new={new_seen_tokens}")
+            print(f"[CACHE-UPDATE] new_seen_tokens={new_seen_tokens}")
+
             past_key_values.update_seen_tokens(new_seen_tokens)
+
             print(f"[CACHE-UPDATE] after={past_key_values.get_seq_length()}")
 
             if getattr(self, "active_request_state", None) is not None:
+                print(f"[CACHE-UPDATE] active_request_state before sync = {self.active_request_state}")
                 self.active_request_state["seq_len"] = new_seen_tokens
-                print(f"[CACHE-UPDATE] request_state.seq_len={self.active_request_state['seq_len']}")
+                print(f"[CACHE-UPDATE] active_request_state after sync = {self.active_request_state}")
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,

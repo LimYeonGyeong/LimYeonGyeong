@@ -201,27 +201,65 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         # prefill
         scheduler.set_seq_len(request_id, 0)
 
-        outputs = model(
+        # 1) prefill
+        print("\n[MAIN-PREFILL] before call")
+        print(f"[CACHE-ID] before prefill id={id(past_key_values) if past_key_values is not None else None}")
+        print(f"[REQ-STATE] before prefill = {model_paged.model.active_request_state}")
+        print(f"[REQ-STATE-ID] before prefill = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+
+        outputs = model_paged(
             input_ids=generated,
             use_cache=True,
             past_key_values=None,
         )
+
+        print(f"[CACHE-ID] after prefill call id={id(outputs.past_key_values) if outputs.past_key_values is not None else None}")
+
         past_key_values = outputs.past_key_values
-        print(f"[MAIN] past_key_values seq_len = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
+
+        print(f"[CACHE-TYPE] after prefill = {type(past_key_values)}")
+        print(f"[CACHE-SEQ] after prefill = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
+        print(f"[REQ-STATE] after prefill = {model_paged.model.active_request_state}")
+        print(f"[REQ-STATE-ID] after prefill = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+
+        scheduler.set_seq_len(request_id, prompt_len)
+
+        print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model_paged.model.active_request_state}")
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
 
-        # decode
-        for _ in range(max_new_tokens - 1):
+        # 2) decode
+        for step in range(1, divergence_step + 1):
             last_token = generated[:, -1:]
+
+            print(f"\n[MAIN-DECODE STEP {step}] before call")
+            print(f"[CACHE-ID] before call id={id(past_key_values) if past_key_values is not None else None}")
+            print(f"[CACHE-TYPE] before call = {type(past_key_values)}")
+            print(f"[CACHE-SEQ] before call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
+            print(f"[REQ-STATE] before call = {model.model.active_request_state}")
+            print(f"[REQ-STATE-ID] before call = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
 
             outputs = model(
                 input_ids=last_token,
                 use_cache=True,
                 past_key_values=past_key_values,
-            )
+)
+
+            print(f"[CACHE-ID] after call  id={id(outputs.past_key_values) if outputs.past_key_values is not None else None}")
+
             past_key_values = outputs.past_key_values
+
+            print(f"[CACHE-TYPE] after call = {type(past_key_values)}")
+            print(f"[CACHE-SEQ] after call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
+            print(f"[REQ-STATE] after call = {model_paged.model.active_request_state}")
+            print(f"[REQ-STATE-ID] after call = {id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}")
+
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+
+            if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+                break
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
@@ -398,6 +436,7 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
     print("\n>>> Baseline vs Paged token-by-token 비교 시작")
 
     set_layer0_debug(model_paged, debug=False, debug_verbose=False)
+
     paged_trace = collect_greedy_trace(
         model=model_paged,
         tokenizer=tokenizer,
@@ -458,18 +497,46 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
     generated = inputs["input_ids"].clone()
     prompt_len = generated.shape[1]
     past_key_values = None
+
     request_state = scheduler.get_request_state(request_id)
     model_paged.model.active_request_state = request_state
     scheduler.set_seq_len(request_id, 0)
 
     # 1) prefill
+    print("\n[MAIN-PREFILL] before call")
+    print(f"[CACHE-ID] before prefill id={id(past_key_values) if past_key_values is not None else None}")
+    print(f"[REQ-STATE] before prefill = {model_paged.model.active_request_state}")
+    print(
+        f"[REQ-STATE-ID] before prefill = "
+        f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
+    )
+
     outputs = model_paged(
         input_ids=generated,
         use_cache=True,
         past_key_values=None,
     )
+
+    print(
+        f"[CACHE-ID] after prefill call id="
+        f"{id(outputs.past_key_values) if outputs.past_key_values is not None else None}"
+    )
+
     past_key_values = outputs.past_key_values
+
+    print(f"[CACHE-TYPE] after prefill = {type(past_key_values)}")
+    print(
+        f"[CACHE-SEQ] after prefill = "
+        f"{past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}"
+    )
+    print(f"[REQ-STATE] after prefill = {model_paged.model.active_request_state}")
+    print(
+        f"[REQ-STATE-ID] after prefill = "
+        f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
+    )
+
     scheduler.set_seq_len(request_id, prompt_len)
+    print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model_paged.model.active_request_state}")
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -478,12 +545,42 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
     for step in range(1, divergence_step + 1):
         last_token = generated[:, -1:]
 
+        print(f"\n[MAIN-DECODE STEP {step}] before call")
+        print(f"[CACHE-ID] before call id={id(past_key_values) if past_key_values is not None else None}")
+        print(f"[CACHE-TYPE] before call = {type(past_key_values)}")
+        print(
+            f"[CACHE-SEQ] before call = "
+            f"{past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}"
+        )
+        print(f"[REQ-STATE] before call = {model_paged.model.active_request_state}")
+        print(
+            f"[REQ-STATE-ID] before call = "
+            f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
+        )
+
         outputs = model_paged(
             input_ids=last_token,
             use_cache=True,
             past_key_values=past_key_values,
         )
+
+        print(
+            f"[CACHE-ID] after call  id="
+            f"{id(outputs.past_key_values) if outputs.past_key_values is not None else None}"
+        )
+
         past_key_values = outputs.past_key_values
+
+        print(f"[CACHE-TYPE] after call = {type(past_key_values)}")
+        print(
+            f"[CACHE-SEQ] after call = "
+            f"{past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}"
+        )
+        print(f"[REQ-STATE] after call = {model_paged.model.active_request_state}")
+        print(
+            f"[REQ-STATE-ID] after call = "
+            f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
+        )
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -498,7 +595,6 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
         "baseline_trace": base_trace,
         "paged_trace": paged_trace,
     }
-
 
 # -----------------------------
 # PagedAttention 정확성 테스트
