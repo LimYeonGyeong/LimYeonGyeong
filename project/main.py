@@ -210,7 +210,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
-        scheduler.advance_seq_len(request_id, 1)
 
         # decode
         for _ in range(max_new_tokens - 1):
@@ -225,7 +224,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
-            scheduler.advance_seq_len(request_id, 1)
 
             if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
                 break
@@ -332,7 +330,6 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler,
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
-    scheduler.advance_seq_len(request_id, 1)
 
     print(
         f"[STEP 0] token_id = {next_token.item()} | "
@@ -352,7 +349,6 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler,
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
-        scheduler.advance_seq_len(request_id, 1)
 
         token_id = next_token.item()
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
@@ -406,7 +402,6 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
-    scheduler.advance_seq_len(request_id, 1)
 
     # 2) decode
     for _ in range(max_new_tokens - 1):
@@ -421,7 +416,6 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
-        scheduler.advance_seq_len(request_id, 1)
 
         if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
             break
