@@ -475,7 +475,7 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 # -----------------------------
 # Attention patch
 # -----------------------------
-def patch_model_with_paged_attention(model, page_pool, block_table):
+def patch_model_with_paged_attention(model, page_pool, block_table, debug=False, debug_verbose=False):
     for layer_idx, layer in enumerate(model.model.layers):
         old_attn = layer.self_attn
 
@@ -485,17 +485,15 @@ def patch_model_with_paged_attention(model, page_pool, block_table):
             page_pool=page_pool,
         )
 
-        # 기존 weight 복사
         new_attn.q_proj.weight.data.copy_(old_attn.q_proj.weight.data)
         new_attn.k_proj.weight.data.copy_(old_attn.k_proj.weight.data)
         new_attn.v_proj.weight.data.copy_(old_attn.v_proj.weight.data)
         new_attn.o_proj.weight.data.copy_(old_attn.o_proj.weight.data)
 
-        # block table 연결
         new_attn.block_table = block_table
-
-        # 디버그 출력 비활성화
-        new_attn.debug = False
+        new_attn.debug = debug
+        new_attn.debug_verbose = debug_verbose
+        new_attn.debug_stop_on_nonfinite = True
 
         ref_param = next(old_attn.parameters())
         new_attn = new_attn.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -610,7 +608,9 @@ def main():
         model=model_paged,
         page_pool=pool,
         block_table=block_table,
-    )
+        debug=True,
+        debug_verbose=True,
+)
 
     # PagePool 초기화
     pool.k_cache.zero_()
