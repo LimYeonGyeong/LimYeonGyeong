@@ -72,68 +72,30 @@ from ..config.configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
-def _tensor_debug(name, x, layer_idx=None, step_info=""):
-    if x is None:
-        print(f"[DBG] {name}: None")
-        return
-
-    with torch.no_grad():
-        x_detached = x.detach()
-        is_floating = torch.is_floating_point(x_detached)
-
-        nan_count = torch.isnan(x_detached).sum().item() if is_floating else 0
-        inf_count = torch.isinf(x_detached).sum().item() if is_floating else 0
-
-        if x_detached.numel() > 0:
-            x_float = x_detached.float() if is_floating else x_detached.to(torch.float32)
-            min_val = x_float.min().item()
-            max_val = x_float.max().item()
-            mean_val = x_float.mean().item()
-            abs_max = x_float.abs().max().item()
-        else:
-            min_val = max_val = mean_val = abs_max = 0.0
-
-        prefix = f"[DBG][Layer {layer_idx}] " if layer_idx is not None else "[DBG] "
-        print(
-            f"{prefix}{name} {step_info}"
-            f" | shape={tuple(x_detached.shape)} dtype={x_detached.dtype} device={x_detached.device}"
-            f" | min={min_val:.6f} max={max_val:.6f} mean={mean_val:.6f} absmax={abs_max:.6f}"
-            f" | nan={nan_count} inf={inf_count}"
-        )
-
-
-def _assert_no_nan(name, x, layer_idx=None, step_info=""):
-    if x is None or not torch.is_floating_point(x):
-        return
-    if torch.isnan(x).any():
-        _tensor_debug(name, x, layer_idx=layer_idx, step_info=step_info)
-        raise RuntimeError(f"[NUMERIC ERROR] {name} has NaN at layer={layer_idx} {step_info}")
-
-
-def _assert_no_posinf(name, x, layer_idx=None, step_info=""):
-    if x is None or not torch.is_floating_point(x):
-        return
-    if torch.isposinf(x).any():
-        _tensor_debug(name, x, layer_idx=layer_idx, step_info=step_info)
-        raise RuntimeError(f"[NUMERIC ERROR] {name} has +Inf at layer={layer_idx} {step_info}")
-
-    
 class PagedCacheShim:
     """
     HF generate()가 요구하는 최소 cache 인터페이스만 흉내내는 객체.
     실제 KV는 저장하지 않고, '현재까지 본 토큰 수'만 관리한다.
     """
-    def __init__(self, seen_tokens: int = 0):
+    def __init__(self, config=None, page_pool=None, block_table=None, request_state=None, seen_tokens: int = 0):
+        self.config = config
+        self.page_pool = page_pool
+        self.block_table = block_table
+        self.request_state = request_state
         self.seen_tokens = seen_tokens
 
     def get_seq_length(self):
+        if self.request_state is not None:
+            return int(self.request_state.get("seq_len", self.seen_tokens))
         return self.seen_tokens
 
     def update_seen_tokens(self, new_len: int):
         self.seen_tokens = new_len
+        if self.request_state is not None:
+            self.request_state["seq_len"] = new_len
 
     def __repr__(self):
-        return f"PagedCacheShim(seen_tokens={self.seen_tokens})"
+        return f"PagedCacheShim(seen_tokens={self.get_seq_length()})"
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -393,16 +355,14 @@ class PagedLlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
+        # 외부에서 주입받을 PagedPool
         self.page_pool = page_pool
 
+        # projections
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-        self.debug = False
-        self.debug_verbose = False
-        self.debug_stop_on_nonfinite = True
 
     def forward(
         self,
@@ -443,33 +403,19 @@ class PagedLlamaAttention(nn.Module):
         else:
             block_table_tensor = target_block_table.to(device=target_device)
 
-                # 4. q, k, v projection
+        # 4. q, k, v projection
         query_states = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        ).transpose(1, 2)  # [bsz, num_heads, q_len, head_dim]
 
         key_states = self.k_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
 
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        ).transpose(1, 2)  # [bsz, num_kv_heads, q_len, head_dim]
 
-        if self.debug_verbose:
-            _tensor_debug("hidden_states", hidden_states, self.layer_idx, f"start_pos={position_ids.reshape(-1)[0].item() if position_ids is not None else 0}")
-            _tensor_debug("query_states(after q_proj)", query_states, self.layer_idx)
-            _tensor_debug("key_states(after k_proj)", key_states, self.layer_idx)
-            _tensor_debug("value_states(after v_proj)", value_states, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("query_states(after q_proj)", query_states, self.layer_idx)
-            _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
-            _assert_no_nan("key_states(after k_proj)", key_states, self.layer_idx)
-            _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
-            _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
-            _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
-            
         # 5. RoPE
         if position_embeddings is None and "position_embeddings" in kwargs:
             position_embeddings = kwargs["position_embeddings"]
@@ -483,22 +429,13 @@ class PagedLlamaAttention(nn.Module):
                 sin.to(target_device),
             )
 
-        if self.debug_verbose:
-            _tensor_debug("query_states(after rope)", query_states, self.layer_idx)
-            _tensor_debug("key_states(after rope)", key_states, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("query_states(after rope)", query_states, self.layer_idx)
-            _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
-            _assert_no_nan("key_states(after rope)", key_states, self.layer_idx)
-            _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
-
         # 6. 현재 step 위치 정보
-        start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
-
-        if self.debug:
-            print(f"[DBG][Layer {self.layer_idx}] start_pos={start_pos}, q_len={q_len}, bsz={bsz}")
-
+        if cache_position is not None and cache_position.numel() > 0:
+            start_pos = int(cache_position.reshape(-1)[0].item())
+        elif position_ids is not None:
+            start_pos = int(position_ids.reshape(-1)[0].item())
+        else:
+            start_pos = 0
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
 
@@ -575,21 +512,6 @@ class PagedLlamaAttention(nn.Module):
         written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
         written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
 
-        if self.debug_verbose and q_len > 0:
-            last_abs_pos = start_pos + q_len - 1
-            last_logic_block = last_abs_pos // pool.block_size
-            last_offset = last_abs_pos % pool.block_size
-            last_physical_block = block_table_tensor[0, last_logic_block].item()
-
-            cached_k = pool.k_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-            cached_v = pool.v_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-
-            _tensor_debug("cached_k(last written)", cached_k, self.layer_idx)
-            _tensor_debug("cached_v(last written)", cached_v, self.layer_idx)
-
-            write_k_diff = (cached_k.float() - key_states[0, :, -1, :].float()).abs().max().item()
-            write_v_diff = (cached_v.float() - value_states[0, :, -1, :].float()).abs().max().item()
-            print(f"[DBG][Layer {self.layer_idx}] write_k_diff={write_k_diff:.8f} write_v_diff={write_v_diff:.8f}")
         #print(f"[VERIFY-READ-3] Layer {self.layer_idx}")
         #print(f"  check_pos = {check_pos}")
         #print(f"  logic_block = {check_logic_block}")
@@ -611,16 +533,6 @@ class PagedLlamaAttention(nn.Module):
         #print(f"  max |written_k - read_k| = {k_diff}")
         #print(f"  max |written_v - read_v| = {v_diff}")
 
-        if self.debug_verbose:
-            _tensor_debug("k_flat", k_flat, self.layer_idx)
-            _tensor_debug("v_flat", v_flat, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("k_flat", k_flat, self.layer_idx)
-            _assert_no_posinf("k_flat", k_flat, self.layer_idx)
-            _assert_no_nan("v_flat", v_flat, self.layer_idx)
-            _assert_no_posinf("v_flat", v_flat, self.layer_idx)
-
         # 12. GQA 확장
         full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
         full_value_states = full_value_states_before_repeat.to(dtype=query_states.dtype)
@@ -632,65 +544,42 @@ class PagedLlamaAttention(nn.Module):
         full_value_states = full_value_states.to(dtype=query_states.dtype)
 
         # 13. attention
-        q_for_scores = query_states.float()
-        k_for_scores = full_key_states.float()
-        v_for_attn = full_value_states.float()
-
-        if self.debug_verbose:
-            _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
-            _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
-
+        # 13. attention
         attn_weights = torch.matmul(
-            q_for_scores, k_for_scores.transpose(2, 3)
+            query_states, full_key_states.transpose(2, 3)
         )
+
+        attn_weights = attn_weights.float()
         attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
+        if attention_mask is None:
+            #print(f"[DEBUG] Layer {self.layer_idx} attention_mask is None -> make local causal mask")
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
+            # query 길이 = 현재 step에서 들어온 토큰 수
+            # key 길이 = 지금까지 누적 전체 토큰 수
+            causal_mask = torch.full(
+                (q_len, total_seq_len),
+                float("-inf"),
+                device=target_device,
+                dtype=torch.float32,
+            )
 
-        causal_mask = torch.full(
-            (q_len, total_seq_len),
-            float("-inf"),
-            device=target_device,
-            dtype=torch.float32,
-        )
-        for i in range(q_len):
-            abs_pos = start_pos + i
-            causal_mask[i, : abs_pos + 1] = 0.0
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-        attn_weights = attn_weights + causal_mask
+            # start_pos를 고려해서 현재 query가 볼 수 있는 key만 허용
+            for i in range(q_len):
+                abs_pos = start_pos + i
+                causal_mask[i, : abs_pos + 1] = 0.0
 
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, total_seq_len]
+            attn_weights = attn_weights + causal_mask
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
+        else:
+            mask_slice = attention_mask[:, :, :, :total_seq_len].float()
+            attn_weights = attn_weights + mask_slice
 
         attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(query_states.dtype)
 
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
-        _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
-
-        attn_output = torch.matmul(attn_weights, v_for_attn)
-
-        if self.debug_verbose:
-            _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
-        _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
-
-        attn_output = attn_output.to(query_states.dtype)
-
+        attn_output = torch.matmul(attn_weights, full_value_states)
         #print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
         #print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
         #print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")
@@ -791,6 +680,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.gradient_checkpointing = False
         self.page_pool = None
         self.block_table = None
+        self.active_request_state = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -820,6 +710,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     config=self.config,
                     page_pool=self.page_pool,
                     block_table=self.block_table,
+                    request_state=self.active_request_state,
                 )
             else:
                 past_key_values = DynamicCache(config=self.config)
@@ -833,14 +724,17 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        causal_mask = None
+
+        if not (use_cache and self.page_pool is not None and self.block_table is not None):
+            causal_mask = create_causal_mask(
+                config=self.config,
+                input_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

@@ -6,6 +6,7 @@ class SimpleScheduler:
         self.page_pool = page_pool
         self.block_size = block_size
         self.request_tables = {}  # request_id -> BlockTable
+        self.request_states = {}  # request_id -> {"block_table": BlockTable, "seq_len": int, "total_tokens": int}
 
     def allocate_for_request(self, request_id, total_tokens):
         needed_blocks = (total_tokens + self.block_size - 1) // self.block_size
@@ -16,10 +17,27 @@ class SimpleScheduler:
             block_table.add_block(physical_block)
 
         self.request_tables[request_id] = block_table
+        self.request_states[request_id] = {
+            "block_table": block_table,
+            "seq_len": 0,
+            "total_tokens": total_tokens,
+        }
         return block_table
 
     def get_block_table(self, request_id):
         return self.request_tables[request_id]
+
+    def get_request_state(self, request_id):
+        return self.request_states[request_id]
+
+    def get_seq_len(self, request_id):
+        return self.request_states[request_id]["seq_len"]
+
+    def set_seq_len(self, request_id, seq_len):
+        self.request_states[request_id]["seq_len"] = seq_len
+
+    def advance_seq_len(self, request_id, amount):
+        self.request_states[request_id]["seq_len"] += amount
 
     def release_request(self, request_id):
         block_table = self.request_tables[request_id]
