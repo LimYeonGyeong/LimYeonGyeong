@@ -123,17 +123,28 @@ class PagedCacheShim:
     HF generate()가 요구하는 최소 cache 인터페이스만 흉내내는 객체.
     실제 KV는 저장하지 않고, '현재까지 본 토큰 수'만 관리한다.
     """
-    def __init__(self, seen_tokens: int = 0):
-        self.seen_tokens = seen_tokens
+    def __init__(self, config=None, page_pool=None, block_table=None, request_state=None, seen_tokens: int = 0):
+        self.config = config
+        self.page_pool = page_pool
+        self.block_table = block_table
+        self.request_state = request_state
+        self.seen_tokens = int(seen_tokens)
+
+        if self.request_state is not None:
+            self.seen_tokens = int(self.request_state.get("seq_len", self.seen_tokens))
 
     def get_seq_length(self):
+        if self.request_state is not None:
+            return int(self.request_state.get("seq_len", self.seen_tokens))
         return self.seen_tokens
 
     def update_seen_tokens(self, new_len: int):
-        self.seen_tokens = new_len
+        self.seen_tokens = int(new_len)
+        if self.request_state is not None:
+            self.request_state["seq_len"] = int(new_len)
 
     def __repr__(self):
-        return f"PagedCacheShim(seen_tokens={self.seen_tokens})"
+        return f"PagedCacheShim(seen_tokens={self.get_seq_length()})"
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -806,6 +817,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     config=self.config,
                     page_pool=self.page_pool,
                     block_table=self.block_table,
+                    request_state=getattr(self, "active_request_state", None),
                 )
             else:
                 past_key_values = DynamicCache(config=self.config)
@@ -846,7 +858,12 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if use_cache and isinstance(past_key_values, PagedCacheShim):
             # 이번 forward까지 처리한 총 길이 기록
-            past_key_values.update_seen_tokens(int(cache_position[-1].item()) + 1)
+            new_seen_tokens = int(cache_position[-1].item()) + 1
+            past_key_values.update_seen_tokens(new_seen_tokens)
+
+            if getattr(self, "active_request_state", None) is not None:
+                self.active_request_state["seq_len"] = new_seen_tokens
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
