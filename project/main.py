@@ -176,7 +176,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
     if device == "cuda":
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
     ram_start = process.memory_info().rss / 1024 / 1024
@@ -192,38 +191,29 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         generated = item["input_ids"].clone()
         prompt_len = item["prompt_len"]
+        past_key_values = None
 
         # prefill
-        seq_len = generated.shape[1]
-        attention_mask = torch.ones_like(generated, device=generated.device)
-        position_ids = torch.arange(seq_len, device=generated.device).unsqueeze(0)
-
         outputs = model(
             input_ids=generated,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
+            use_cache=True,
             past_key_values=None,
         )
+        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
 
         # decode
         for _ in range(max_new_tokens - 1):
-            cur_len = generated.shape[1]
-
             last_token = generated[:, -1:]
-            attention_mask = torch.ones((1, cur_len), dtype=torch.long, device=generated.device)
-            position_ids = torch.tensor([[cur_len - 1]], device=generated.device)
 
             outputs = model(
                 input_ids=last_token,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                past_key_values=None,
+                use_cache=True,
+                past_key_values=past_key_values,
             )
+            past_key_values = outputs.past_key_values
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
@@ -316,19 +306,15 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_to
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
     generated = inputs["input_ids"].clone()
+    past_key_values = None
 
     # 1) prefill
-    seq_len = generated.shape[1]
-    attention_mask = torch.ones_like(generated, device=generated.device)
-    position_ids = torch.arange(seq_len, device=generated.device).unsqueeze(0)
-
     outputs = model(
         input_ids=generated,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        use_cache=True,
         past_key_values=None,
     )
+    past_key_values = outputs.past_key_values
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -340,19 +326,14 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, max_new_to
 
     # 2) decode
     for step in range(1, max_new_tokens):
-        cur_len = generated.shape[1]
-
         last_token = generated[:, -1:]
-        attention_mask = torch.ones((1, cur_len), dtype=torch.long, device=generated.device)
-        position_ids = torch.tensor([[cur_len - 1]], device=generated.device)
 
         outputs = model(
             input_ids=last_token,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            past_key_values=None,
+            use_cache=True,
+            past_key_values=past_key_values,
         )
+        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -385,47 +366,37 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
     if device == "cuda":
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
     ram_start = process.memory_info().rss / 1024 / 1024
     ctx_start = process.num_ctx_switches()
 
     generated = inputs["input_ids"].clone()
+    past_key_values = None
 
     t0 = time.time()
 
     # 1) prefill
-    seq_len = generated.shape[1]
-    attention_mask = torch.ones_like(generated, device=generated.device)
-    position_ids = torch.arange(seq_len, device=generated.device).unsqueeze(0)
-
     outputs = model(
         input_ids=generated,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        use_cache=True,
         past_key_values=None,
     )
+    past_key_values = outputs.past_key_values
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
 
     # 2) decode
     for _ in range(max_new_tokens - 1):
-        cur_len = generated.shape[1]
-
         last_token = generated[:, -1:]
-        attention_mask = torch.ones((1, cur_len), dtype=torch.long, device=generated.device)
-        position_ids = torch.tensor([[cur_len - 1]], device=generated.device)
 
         outputs = model(
             input_ids=last_token,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            past_key_values=None,
+            use_cache=True,
+            past_key_values=past_key_values,
         )
+        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -578,9 +549,9 @@ def main():
     ).to(device)
 
     # HF 기본 cache 끄기
-    model_paged.config.use_cache = False
+    model_paged.config.use_cache = True
     if hasattr(model_paged, "generation_config"):
-        model_paged.generation_config.use_cache = False
+        model_paged.generation_config.use_cache = True
 
     config = model_paged.config
 
