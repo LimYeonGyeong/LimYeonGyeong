@@ -392,10 +392,11 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
     outputs = model(
         input_ids=generated,
-        use_cache=True,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
         past_key_values=None,
     )
-    past_key_values = outputs.past_key_values
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -410,10 +411,11 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
         outputs = model(
             input_ids=last_token,
-            use_cache=True,
-            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            past_key_values=None,
         )
-        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -548,7 +550,7 @@ def main():
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
 
-    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=50)
+    stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=10)
 
     del model_base
     gc.collect()
