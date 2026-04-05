@@ -140,7 +140,7 @@ class PagedCacheShim:
             f"request_state={self.request_state}"
         )
 
-    def get_seq_length(self):
+    def get_seq_length(self, layer_idx: int = 0):
         if self.request_state is not None:
             seq = int(self.request_state.get("seq_len", self.seen_tokens))
             print(
@@ -152,6 +152,15 @@ class PagedCacheShim:
 
         print(f"[PagedCacheShim.get_seq_length] id={id(self)} return(seen_tokens)={self.seen_tokens}")
         return self.seen_tokens
+
+    def get_max_cache_shape(self):
+        return None
+
+    def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
+
+    def reorder_cache(self, beam_idx):
+        return self
 
     def update_seen_tokens(self, new_len: int):
         print(
@@ -178,7 +187,7 @@ class PagedCacheShim:
             f"seen_tokens={self.seen_tokens}, "
             f"seq_len={self.get_seq_length()})"
         )
-    
+
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -845,7 +854,7 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            print("FORCE PAGED CACHE ")
+            print("🔥 FORCE PAGED CACHE 🔥")
 
             past_key_values = PagedCacheShim(
                 config=self.config,
@@ -857,8 +866,10 @@ class LlamaModel(LlamaPreTrainedModel):
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             print(f"[CACHE-POS] pkv_type={type(past_key_values)} pkv_id={id(past_key_values) if past_key_values is not None else None}")
             print(f"[CACHE-POS] past_seen_tokens={past_seen_tokens}, input_len={inputs_embeds.shape[1]}")
-            cache_position: torch.Tensor = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
             )
             print(f"[CACHE-POS] cache_position={cache_position.detach().cpu().tolist()}")
 
