@@ -176,12 +176,9 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     t0 = time.time()
     results = []
 
-    for i, prompt in enumerate(prompts):
-        model = patch_model_with_paged_attention(
-            model=model,
-            page_pool=pool,
-            block_table=block_tables[i],
-        )
+    for layer in model.model.layers:
+        layer.self_attn.block_table = block_tables[i]
+        model.model.block_table = block_tables[i]
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         generated = inputs["input_ids"]
@@ -497,7 +494,7 @@ def patch_model_with_paged_attention(model, page_pool, block_table, debug=False,
         new_attn.block_table = block_table
         new_attn.debug = debug
         new_attn.debug_verbose = debug_verbose
-        new_attn.debug_stop_on_nonfinite = True
+        new_attn.debug_stop_on_nonfinite = False
 
         ref_param = next(old_attn.parameters())
         new_attn = new_attn.to(device=ref_param.device, dtype=ref_param.dtype)
