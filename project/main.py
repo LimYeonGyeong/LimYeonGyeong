@@ -200,13 +200,13 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         # prefill
         scheduler.set_seq_len(request_id, 0)
+
         outputs = model(
             input_ids=generated,
             use_cache=True,
             past_key_values=None,
         )
         past_key_values = outputs.past_key_values
-        scheduler.set_seq_len(request_id, prompt_len)
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -302,6 +302,202 @@ def print_stats_table(title, stats_base, stats_paged, include_blocks=False):
     if include_blocks:
         print(f"{'Used Blocks':<25} | {'-':<15} | {stats_paged['used_blocks']:<15} |")
         print(f"{'Block Utilization':<25} | {'-':<15} | {stats_paged['block_utilization']:<15.2%} |")
+
+
+def set_layer0_debug(model, debug=False, debug_verbose=False):
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.debug = bool(debug and layer_idx == 0)
+            layer.self_attn.debug_verbose = bool(debug_verbose and layer_idx == 0)
+
+
+@torch.no_grad()
+def collect_greedy_trace(model, tokenizer, prompt_text, max_new_tokens=20, scheduler=None, request_id=None):
+    model.eval()
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+    generated = inputs["input_ids"].clone()
+    prompt_len = generated.shape[1]
+    past_key_values = None
+
+    if scheduler is not None and request_id is not None:
+        request_state = scheduler.get_request_state(request_id)
+        model.model.active_request_state = request_state
+        scheduler.set_seq_len(request_id, 0)
+
+    trace = {
+        "prompt_len": prompt_len,
+        "steps": [],
+        "final_text": "",
+    }
+
+    # 1) prefill
+    outputs = model(
+        input_ids=generated,
+        use_cache=True,
+        past_key_values=None,
+    )
+    past_key_values = outputs.past_key_values
+
+    if scheduler is not None and request_id is not None:
+        scheduler.set_seq_len(request_id, prompt_len)
+
+    logits = outputs.logits[:, -1, :]
+    topk = torch.topk(logits[0], k=5)
+    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+    trace["steps"].append({
+        "step": 0,
+        "input_ids": generated[0].detach().cpu().tolist(),
+        "next_token_id": int(next_token.item()),
+        "next_token_text": tokenizer.decode([int(next_token.item())], skip_special_tokens=False),
+        "topk_ids": topk.indices.detach().cpu().tolist(),
+        "topk_vals": topk.values.detach().cpu().float().tolist(),
+        "past_seq_len_after": int(past_key_values.get_seq_length()) if past_key_values is not None and hasattr(past_key_values, "get_seq_length") else None,
+    })
+
+    generated = torch.cat([generated, next_token], dim=1)
+
+    # 2) decode
+    for step in range(1, max_new_tokens):
+        last_token = generated[:, -1:]
+
+        outputs = model(
+            input_ids=last_token,
+            use_cache=True,
+            past_key_values=past_key_values,
+        )
+        past_key_values = outputs.past_key_values
+
+        logits = outputs.logits[:, -1, :]
+        topk = torch.topk(logits[0], k=5)
+        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+        trace["steps"].append({
+            "step": step,
+            "input_ids": last_token[0].detach().cpu().tolist(),
+            "next_token_id": int(next_token.item()),
+            "next_token_text": tokenizer.decode([int(next_token.item())], skip_special_tokens=False),
+            "topk_ids": topk.indices.detach().cpu().tolist(),
+            "topk_vals": topk.values.detach().cpu().float().tolist(),
+            "past_seq_len_after": int(past_key_values.get_seq_length()) if past_key_values is not None and hasattr(past_key_values, "get_seq_length") else None,
+        })
+
+        generated = torch.cat([generated, next_token], dim=1)
+
+        if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
+            break
+
+    trace["final_text"] = tokenizer.decode(generated[0], skip_special_tokens=True)
+    return trace
+
+
+@torch.no_grad()
+def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, scheduler, request_id, max_new_tokens=20):
+    print("\n>>> Baseline vs Paged token-by-token 비교 시작")
+
+    set_layer0_debug(model_paged, debug=False, debug_verbose=False)
+    paged_trace = collect_greedy_trace(
+        model=model_paged,
+        tokenizer=tokenizer,
+        prompt_text=prompt_text,
+        max_new_tokens=max_new_tokens,
+        scheduler=scheduler,
+        request_id=request_id,
+    )
+
+    base_trace = collect_greedy_trace(
+        model=model_base,
+        tokenizer=tokenizer,
+        prompt_text=prompt_text,
+        max_new_tokens=max_new_tokens,
+        scheduler=None,
+        request_id=None,
+    )
+
+    divergence_step = None
+    num_steps = min(len(base_trace["steps"]), len(paged_trace["steps"]))
+
+    print("\n=== Token Compare ===")
+    for step in range(num_steps):
+        b = base_trace["steps"][step]
+        p = paged_trace["steps"][step]
+
+        same = (b["next_token_id"] == p["next_token_id"])
+        print(
+            f"[STEP {step}] "
+            f"baseline={b['next_token_id']} ({repr(b['next_token_text'])}) | "
+            f"paged={p['next_token_id']} ({repr(p['next_token_text'])}) | "
+            f"{'MATCH' if same else 'DIFF'}"
+        )
+
+        if not same:
+            divergence_step = step
+            print("\n[FOUND] 첫 divergence step =", divergence_step)
+            print("baseline topk ids  =", b["topk_ids"])
+            print("baseline topk vals =", [round(v, 6) for v in b["topk_vals"]])
+            print("paged topk ids     =", p["topk_ids"])
+            print("paged topk vals    =", [round(v, 6) for v in p["topk_vals"]])
+            print("baseline past_seq_len_after =", b["past_seq_len_after"])
+            print("paged past_seq_len_after    =", p["past_seq_len_after"])
+            break
+
+    if divergence_step is None:
+        print("\n[RESULT] max_new_tokens 범위 내에서는 divergence가 발견되지 않음")
+        print("[BASELINE FINAL]")
+        print(base_trace["final_text"])
+        print("\n[PAGED FINAL]")
+        print(paged_trace["final_text"])
+        return None
+
+    print("\n>>> divergence step에서 layer 0 debug 재실행")
+    set_layer0_debug(model_paged, debug=True, debug_verbose=False)
+
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model_paged.device)
+    generated = inputs["input_ids"].clone()
+    prompt_len = generated.shape[1]
+    past_key_values = None
+    request_state = scheduler.get_request_state(request_id)
+    model_paged.model.active_request_state = request_state
+    scheduler.set_seq_len(request_id, 0)
+
+    # 1) prefill
+    outputs = model_paged(
+        input_ids=generated,
+        use_cache=True,
+        past_key_values=None,
+    )
+    past_key_values = outputs.past_key_values
+    scheduler.set_seq_len(request_id, prompt_len)
+
+    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    generated = torch.cat([generated, next_token], dim=1)
+
+    # 2) decode
+    for step in range(1, divergence_step + 1):
+        last_token = generated[:, -1:]
+
+        outputs = model_paged(
+            input_ids=last_token,
+            use_cache=True,
+            past_key_values=past_key_values,
+        )
+        past_key_values = outputs.past_key_values
+
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+
+        if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+            break
+
+    set_layer0_debug(model_paged, debug=False, debug_verbose=False)
+
+    return {
+        "divergence_step": divergence_step,
+        "baseline_trace": base_trace,
+        "paged_trace": paged_trace,
+    }
+
 
 # -----------------------------
 # PagedAttention 정확성 테스트
@@ -548,6 +744,12 @@ def main():
 
     stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=10)
 
+    # divergence 확인용 baseline trace
+    baseline_debug_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    ).to(device)
+
     del model_base
     gc.collect()
     if device == "cuda":
@@ -593,7 +795,6 @@ def main():
         dtype=model_paged.dtype,
     )
 
-
     scheduler = SimpleScheduler(page_pool=pool, block_size=16)
 
     request_id = "req_1"
@@ -621,16 +822,23 @@ def main():
     # -------------------------
     print(">>> HF cache OFF + PagePool only 테스트 중...")
 
-    #test_text = test_paged_generation_step_by_step(
-    #    model=model_paged,
-    #    tokenizer=tokenizer,
-    #    prompt_text=prompt,
-    #    max_new_tokens=20,
-    #)
+    debug_result = debug_first_divergence(
+        model_base=baseline_debug_model,
+        model_paged=model_paged,
+        tokenizer=tokenizer,
+        prompt_text=prompt,
+        scheduler=scheduler,
+        request_id=request_id,
+        max_new_tokens=10,
+    )
 
     # -------------------------
     # 2단계 성능 측정
     # -------------------------
+    pool.k_cache.zero_()
+    pool.v_cache.zero_()
+    scheduler.set_seq_len(request_id, 0)
+
     stats_paged = measure_paged_only(
         model=model_paged,
         tokenizer=tokenizer,
@@ -641,8 +849,6 @@ def main():
         request_id=request_id,
         max_new_tokens=max_new_tokens,
     )
-
-
 
     # -------------------------
     # 디버그 정보
@@ -658,6 +864,8 @@ def main():
     else:
         print("block_table has no to_tensor()")
 
+    if debug_result is not None:
+        print("\n[DEBUG] divergence_step =", debug_result["divergence_step"])
 
     print("\n" + "=" * 60)
     print("[OUTPUT] PagedAttention Generation Result")
@@ -668,8 +876,6 @@ def main():
     # 결과 출력
     # -------------------------
     print_stats_table("Single Request Result", stats_base, stats_paged, include_blocks=True)
-
-
 
     scheduler.release_request(request_id)
 
@@ -688,6 +894,7 @@ def main():
     )
 
     del model_base_multi
+    del baseline_debug_model
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
