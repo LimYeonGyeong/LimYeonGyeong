@@ -812,15 +812,13 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            if self.page_pool is not None and self.block_table is not None:
-                past_key_values = PagedCacheShim(
-                    config=self.config,
-                    page_pool=self.page_pool,
-                    block_table=self.block_table,
-                    request_state=getattr(self, "active_request_state", None),
-                )
-            else:
-                past_key_values = DynamicCache(config=self.config)
+            # 강제로 PagedCacheShim 사용
+            past_key_values = PagedCacheShim(
+                config=self.config,
+                page_pool=self.page_pool,
+                block_table=self.block_table,
+                request_state=getattr(self, "active_request_state", None),
+            )
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
