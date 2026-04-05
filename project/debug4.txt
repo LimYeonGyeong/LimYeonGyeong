@@ -91,19 +91,34 @@ Tracker, and the
 
 === Single Request Result ===
 Metric                    | nomal           | Paged           |
-Latency (sec)             | 0.9927          | 1.9512          |
-Throughput (tok/s)        | 10.07           | 10.25           |
-RAM Increase (MB)         | 169.7           | 0.0             |
+Latency (sec)             | 1.0059          | 2.0157          |
+Throughput (tok/s)        | 9.94            | 9.92            |
+RAM Increase (MB)         | 173.1           | 0.0             |
 Peak VRAM (MB)            | 2111.2          | 4227.5          |
 Alloc VRAM (MB)           | 2108.3          | 4225.4          |
 Reserved VRAM (MB)        | 2212.0          | 4440.0          |
 Max Reserved VRAM (MB)    | 2212.0          | 4440.0          |
 VRAM/token (KB)           | 216189.55       | 216449.52       |
-Context Switch            | 5               | 18              |
+Context Switch            | 5               | 13              |
 Used Blocks               | -               | 4               |
 Block Utilization         | -               | 8.16%           |
 
 >>> Multi-request 실험 시작
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
+[MAIN] past_key_values seq_len = 0
 
 [OUTPUT] Multi Request Generation Results
 
@@ -474,14 +489,14 @@ What is the difference between encoder-only and decoder-only models?
 
 === Multi Request Result ===
 Metric                    | nomal           | Paged           |
-Latency (sec)             | 1.5603          | 28.5318         |
-Throughput (tok/s)        | 192.26          | 10.51           |
-RAM Increase (MB)         | 6.3             | 0.1             |
+Latency (sec)             | 1.6107          | 29.3376         |
+Throughput (tok/s)        | 186.25          | 10.23           |
+RAM Increase (MB)         | 5.3             | 0.1             |
 Peak VRAM (MB)            | 6354.1          | 2127.0          |
 Alloc VRAM (MB)           | 6325.5          | 2125.2          |
 Reserved VRAM (MB)        | 6646.0          | 2274.0          |
 Max Reserved VRAM (MB)    | 6646.0          | 2274.0          |
 VRAM/token (KB)           | 21688.73        | 7260.14         |
-Context Switch            | 4               | 248             |
+Context Switch            | 6               | 235             |
 Used Blocks               | -               | 45              |
 Block Utilization         | -               | 91.84%          |
