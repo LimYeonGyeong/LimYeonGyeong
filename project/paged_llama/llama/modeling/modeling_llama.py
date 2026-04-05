@@ -489,9 +489,9 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("query_states(after rope)", query_states, self.layer_idx)
-        _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
+            _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
             _assert_no_nan("key_states(after rope)", key_states, self.layer_idx)
-        _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
+            _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
 
         # 6. 현재 step 위치 정보
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
@@ -617,9 +617,9 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("k_flat", k_flat, self.layer_idx)
-        _assert_no_posinf("k_flat", k_flat, self.layer_idx)
+            _assert_no_posinf("k_flat", k_flat, self.layer_idx)
             _assert_no_nan("v_flat", v_flat, self.layer_idx)
-        _assert_no_posinf("v_flat", v_flat, self.layer_idx)
+            _assert_no_posinf("v_flat", v_flat, self.layer_idx)
 
         # 12. GQA 확장
         full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
