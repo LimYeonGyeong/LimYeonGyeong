@@ -26,7 +26,7 @@ import math
 from typing import Optional, Callable, Any, Union, List
 
 from ..activations import ACT2FN
-from ..memory.cache_utils import Cache, DynamicCache
+from ..memory.cache_utils import Cache
 from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
 from ..memory.page_cache import PagedCache
@@ -845,22 +845,14 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            print("[FORWARD] use_cache=True and past_key_values=None -> create cache")
-            print(f"[FORWARD] self.page_pool is None? {self.page_pool is None}")
-            print(f"[FORWARD] self.block_table is None? {self.block_table is None}")
-            print(f"[FORWARD] active_request_state={getattr(self, 'active_request_state', None)}")
-            print(f"[FORWARD] active_request_state_id={id(getattr(self, 'active_request_state', None)) if getattr(self, 'active_request_state', None) is not None else None}")
+            print("FORCE PAGED CACHE ")
 
-            # 강제로 PagedCacheShim 사용
             past_key_values = PagedCacheShim(
                 config=self.config,
                 page_pool=self.page_pool,
                 block_table=self.block_table,
                 request_state=getattr(self, "active_request_state", None),
             )
-
-            print(f"[FORWARD] created past_key_values type={type(past_key_values)} id={id(past_key_values)}")
-
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             print(f"[CACHE-POS] pkv_type={type(past_key_values)} pkv_id={id(past_key_values) if past_key_values is not None else None}")
@@ -896,7 +888,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
-            
+
         hidden_states = self.norm(hidden_states)
 
         print(f"[CACHE-UPDATE] use_cache={use_cache}, pkv_type={type(past_key_values)}, pkv_id={id(past_key_values) if past_key_values is not None else None}")
