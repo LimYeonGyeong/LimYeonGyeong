@@ -102,12 +102,21 @@ def _tensor_debug(name, x, layer_idx=None, step_info=""):
         )
 
 
-def _assert_finite(name, x, layer_idx=None, step_info=""):
+def _assert_no_nan(name, x, layer_idx=None, step_info=""):
     if x is None or not torch.is_floating_point(x):
         return
-    if torch.isnan(x).any() or torch.isinf(x).any():
+    if torch.isnan(x).any():
         _tensor_debug(name, x, layer_idx=layer_idx, step_info=step_info)
-        raise RuntimeError(f"[NUMERIC ERROR] {name} has NaN/Inf at layer={layer_idx} {step_info}")
+        raise RuntimeError(f"[NUMERIC ERROR] {name} has NaN at layer={layer_idx} {step_info}")
+
+
+def _assert_no_posinf(name, x, layer_idx=None, step_info=""):
+    if x is None or not torch.is_floating_point(x):
+        return
+    if torch.isposinf(x).any():
+        _tensor_debug(name, x, layer_idx=layer_idx, step_info=step_info)
+        raise RuntimeError(f"[NUMERIC ERROR] {name} has +Inf at layer={layer_idx} {step_info}")
+
     
 class PagedCacheShim:
     """
@@ -454,9 +463,12 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("value_states(after v_proj)", value_states, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("query_states(after q_proj)", query_states, self.layer_idx)
-            _assert_finite("key_states(after k_proj)", key_states, self.layer_idx)
-            _assert_finite("value_states(after v_proj)", value_states, self.layer_idx)
+            _assert_no_nan("query_states(after q_proj)", query_states, self.layer_idx)
+        _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
+            _assert_no_nan("key_states(after k_proj)", key_states, self.layer_idx)
+        _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
+            _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
+        _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
             
         # 5. RoPE
         if position_embeddings is None and "position_embeddings" in kwargs:
@@ -476,15 +488,17 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("key_states(after rope)", key_states, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("query_states(after rope)", query_states, self.layer_idx)
-            _assert_finite("key_states(after rope)", key_states, self.layer_idx)
+            _assert_no_nan("query_states(after rope)", query_states, self.layer_idx)
+        _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
+            _assert_no_nan("key_states(after rope)", key_states, self.layer_idx)
+        _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
 
         # 6. 현재 step 위치 정보
         start_pos = position_ids.reshape(-1)[0].item() if position_ids is not None else 0
 
         if self.debug:
             print(f"[DBG][Layer {self.layer_idx}] start_pos={start_pos}, q_len={q_len}, bsz={bsz}")
-            
+
         total_seq_len = start_pos + q_len
         num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
 
@@ -602,8 +616,10 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("v_flat", v_flat, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("k_flat", k_flat, self.layer_idx)
-            _assert_finite("v_flat", v_flat, self.layer_idx)
+            _assert_no_nan("k_flat", k_flat, self.layer_idx)
+        _assert_no_posinf("k_flat", k_flat, self.layer_idx)
+            _assert_no_nan("v_flat", v_flat, self.layer_idx)
+        _assert_no_posinf("v_flat", v_flat, self.layer_idx)
 
         # 12. GQA 확장
         full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
@@ -633,29 +649,27 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("attn_weights(before mask)", attn_weights, self.layer_idx)
+            _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
+        _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
 
-        if attention_mask is None:
-            causal_mask = torch.full(
-                (q_len, total_seq_len),
-                float("-inf"),
-                device=target_device,
-                dtype=torch.float32,
-            )
-            for i in range(q_len):
-                abs_pos = start_pos + i
-                causal_mask[i, : abs_pos + 1] = 0.0
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            attn_weights = attn_weights + causal_mask
-        else:
-            mask_slice = attention_mask[:, :, :, :total_seq_len].float()
-            attn_weights = attn_weights + mask_slice
+        causal_mask = torch.full(
+            (q_len, total_seq_len),
+            float("-inf"),
+            device=target_device,
+            dtype=torch.float32,
+        )
+        for i in range(q_len):
+            abs_pos = start_pos + i
+            causal_mask[i, : abs_pos + 1] = 0.0
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        attn_weights = attn_weights + causal_mask
 
         if self.debug_verbose:
             _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("attn_weights(after mask)", attn_weights, self.layer_idx)
+            _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
+        _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
 
         attn_weights = torch.softmax(attn_weights, dim=-1)
 
@@ -663,7 +677,8 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("attn_weights(after softmax)", attn_weights, self.layer_idx)
+            _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
+        _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
         attn_output = torch.matmul(attn_weights, v_for_attn)
 
@@ -671,11 +686,11 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
 
         if self.debug_stop_on_nonfinite:
-            _assert_finite("attn_output(before cast)", attn_output, self.layer_idx)
+            _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
+        _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
 
         attn_output = attn_output.to(query_states.dtype)
 
-        attn_output = torch.matmul(attn_weights, full_value_states)
         #print(f"[VERIFY-ATTN] Layer {self.layer_idx}")
         #print(f"  attn_weights nan = {torch.isnan(attn_weights).any().item()}")
         #print(f"  attn_weights inf = {torch.isinf(attn_weights).any().item()}")

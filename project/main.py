@@ -29,7 +29,7 @@ if TOKEN:
 # Baseline 성능 측정
 # -----------------------------
 @torch.no_grad()
-def measure_performance(model, tokenizer, prompt_text, max_new_tokens=20):
+def measure_performance(model, tokenizer, prompt_text, max_new_tokens=3):
     process = psutil.Process(os.getpid())
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
 
@@ -610,7 +610,7 @@ def main():
         block_table=block_table,
         debug=True,
         debug_verbose=True,
-)
+    )
 
     # PagePool 초기화
     pool.k_cache.zero_()
