@@ -859,10 +859,13 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache and isinstance(past_key_values, PagedCacheShim):
             # 이번 forward까지 처리한 총 길이 기록
             new_seen_tokens = int(cache_position[-1].item()) + 1
+            print(f"[CACHE-UPDATE] before={past_key_values.get_seq_length()} new={new_seen_tokens}")
             past_key_values.update_seen_tokens(new_seen_tokens)
+            print(f"[CACHE-UPDATE] after={past_key_values.get_seq_length()}")
 
             if getattr(self, "active_request_state", None) is not None:
                 self.active_request_state["seq_len"] = new_seen_tokens
+                print(f"[CACHE-UPDATE] request_state.seq_len={self.active_request_state['seq_len']}")
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,

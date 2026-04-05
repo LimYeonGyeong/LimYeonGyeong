@@ -207,6 +207,7 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             past_key_values=None,
         )
         past_key_values = outputs.past_key_values
+        print(f"[MAIN] past_key_values seq_len = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
