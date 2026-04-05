@@ -847,21 +847,38 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        print(
+            f"[MODEL-ENTRY] use_cache={use_cache} "
+            f"pkv_type={type(past_key_values)} "
+            f"pkv_id={id(past_key_values) if past_key_values is not None else None}"
+        )
+        print(
+            f"[MODEL-ENTRY] active_request_state_id="
+            f"{id(getattr(self, 'active_request_state', None)) if getattr(self, 'active_request_state', None) is not None else None} "
+            f"active_request_state={getattr(self, 'active_request_state', None)}"
+        )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            print("🔥 FORCE PAGED CACHE 🔥")
+        if use_cache:
+            if past_key_values is None:
+                print("🔥 FORCE PAGED CACHE 🔥")
 
-            past_key_values = PagedCacheShim(
-                config=self.config,
-                page_pool=self.page_pool,
-                block_table=self.block_table,
-                request_state=getattr(self, "active_request_state", None),
-            )
+                past_key_values = PagedCacheShim(
+                    config=self.config,
+                    page_pool=self.page_pool,
+                    block_table=self.block_table,
+                    request_state=getattr(self, "active_request_state", None),
+                )
+            elif not isinstance(past_key_values, PagedCacheShim):
+                raise RuntimeError(
+                    f"[CACHE ERROR] expected PagedCacheShim, got {type(past_key_values)}"
+                )
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             print(f"[CACHE-POS] pkv_type={type(past_key_values)} pkv_id={id(past_key_values) if past_key_values is not None else None}")
@@ -918,6 +935,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 self.active_request_state["seq_len"] = new_seen_tokens
                 print(f"[CACHE-UPDATE] active_request_state after sync = {self.active_request_state}")
 
+        print(
+            f"[MODEL-EXIT] pkv_type={type(past_key_values)} "
+            f"pkv_id={id(past_key_values) if past_key_values is not None else None}"
+        )
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -971,6 +993,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        print(
+            f"[LM-HEAD-ENTRY] use_cache={use_cache} "
+            f"pkv_type={type(past_key_values)} "
+            f"pkv_id={id(past_key_values) if past_key_values is not None else None}"
+        )
+
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -980,6 +1008,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             cache_position=cache_position,
             **kwargs,
+        )
+
+        print(
+            f"[LM-HEAD-EXIT] pkv_type={type(outputs.past_key_values)} "
+            f"pkv_id={id(outputs.past_key_values) if outputs.past_key_values is not None else None}"
         )
 
         hidden_states = outputs.last_hidden_state
