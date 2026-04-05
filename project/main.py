@@ -392,11 +392,10 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
     outputs = model(
         input_ids=generated,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        use_cache=True,
         past_key_values=None,
     )
+    past_key_values = outputs.past_key_values
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -411,11 +410,10 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 
         outputs = model(
             input_ids=last_token,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            past_key_values=None,
+            use_cache=True,
+            past_key_values=past_key_values,
         )
+        past_key_values = outputs.past_key_values
 
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
@@ -476,6 +474,10 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, max_new
 # Attention patch
 # -----------------------------
 def patch_model_with_paged_attention(model, page_pool, block_table, debug=False, debug_verbose=False):
+    # model-level cache info 연결
+    model.model.page_pool = page_pool
+    model.model.block_table = block_table
+
     for layer_idx, layer in enumerate(model.model.layers):
         old_attn = layer.self_attn
 
@@ -608,8 +610,8 @@ def main():
         model=model_paged,
         page_pool=pool,
         block_table=block_table,
-        debug=True,
-        debug_verbose=True,
+        debug=False,
+        debug_verbose=False,
     )
 
     # PagePool 초기화
