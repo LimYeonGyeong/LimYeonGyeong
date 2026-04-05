@@ -1,0 +1,429 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+>>> 측정 시작 (Baseline 로딩 중...)
+>>> PagedAttention 로딩 및 패치 중...
+>>> HF cache OFF + PagePool only 테스트 중...
+[DEBUG] PagePool / BlockTable 확인
+pool.k_cache.shape = torch.Size([22, 49, 4, 16, 64])
+pool.v_cache.shape = torch.Size([22, 49, 4, 16, 64])
+block_table.shape = torch.Size([1, 4])
+block_table[0, :10] = tensor([0, 1, 2, 3], device='cuda:0')
+
+============================================================
+[OUTPUT] PagedAttention Generation Result
+### Instruction:
+Explain the difference between training and inference in LLMs.Explain it in one simple sentence.
+### Response:
+Tracker, and the 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============================================================
+
+
+=== Single Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 1.0138          | 2.5829          |
+Throughput (tok/s)        | 9.86            | 7.74            |
+RAM Increase (MB)         | 173.9           | 1.6             |
+Peak VRAM (MB)            | 2111.2          | 2127.4          |
+Alloc VRAM (MB)           | 2108.3          | 2125.2          |
+Reserved VRAM (MB)        | 2212.0          | 2252.0          |
+Max Reserved VRAM (MB)    | 2212.0          | 2252.0          |
+VRAM/token (KB)           | 216189.55       | 108920.50       |
+Context Switch            | 3               | 17              |
+Used Blocks               | -               | 4               |
+Block Utilization         | -               | 8.16%           |
+
+>>> Multi-request 실험 시작
+
+[OUTPUT] Multi Request Generation Results
+
+--- Request 1 ---
+### Instruction:
+Explain what LLM is in one sentence.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 2 ---
+### Instruction:
+Explain Medusa LLM in one simple sentence.
+### Response: Meditation and the 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 3 ---
+### Instruction:
+Describe how attention works in transformers in one sentence.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 4 ---
+### Instruction:
+Explain KV cache in simple terms in one sentence.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 5 ---
+### Instruction:
+What is a transformer model? Answer in one sentence.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 6 ---
+### Instruction:
+Explain the difference between training and inference in LLMs.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 7 ---
+### Instruction:
+What is self-attention and why is it important?
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 8 ---
+### Instruction:
+Explain what tokenization is in natural language processing.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 9 ---
+### Instruction:
+What is the purpose of positional encoding in transformers?
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 10 ---
+### Instruction:
+Explain what fine-tuning means for language models.
+### Response: Fine Arts and the 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 11 ---
+### Instruction:
+What is the role of embeddings in LLMs?
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 12 ---
+### Instruction:
+Explain what beam search is in text generation.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 13 ---
+### Instruction:
+What is greedy decoding and how does it work?
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 14 ---
+### Instruction:
+Explain why KV cache improves inference speed.
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Request 15 ---
+### Instruction:
+What is the difference between encoder-only and decoder-only models?
+### Response:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+=== Multi Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 1.5832          | 29.5344         |
+Throughput (tok/s)        | 189.48          | 10.16           |
+RAM Increase (MB)         | 10.2            | 0.0             |
+Peak VRAM (MB)            | 4253.9          | 2127.0          |
+Alloc VRAM (MB)           | 4225.3          | 2125.2          |
+Reserved VRAM (MB)        | 4458.0          | 2252.0          |
+Max Reserved VRAM (MB)    | 4458.0          | 2252.0          |
+VRAM/token (KB)           | 14520.13        | 7260.14         |
+Context Switch            | 3               | 190             |
+Used Blocks               | -               | 45              |
+Block Utilization         | -               | 91.84%          |
