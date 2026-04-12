@@ -44,10 +44,11 @@ def paged_main():
     print(">>> 모델 로딩 중...")
 
     model = PagedLlamaForCausalLM.from_pretrained(MODEL_ID)
-    model = model.to(
-        device=device,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
+
+    if device == "cuda":
+        model = model.half()
+
+    model = model.to(device)
 
     model.config.use_cache = True
     if hasattr(model, "generation_config"):
