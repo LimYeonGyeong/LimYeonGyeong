@@ -872,11 +872,15 @@ def main():
 
     stats_base = measure_performance(model_base, tokenizer, prompt, max_new_tokens=10)
 
+    del model_base
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
     # divergence 확인용 baseline trace
-    baseline_debug_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
+    #baseline_debug_model = AutoModelForCausalLM.from_pretrained(
+    #    MODEL_ID,
+    #    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    #)
 
     del model_base
     gc.collect()
@@ -952,16 +956,18 @@ def main():
     print(">>> HF cache OFF + PagePool only 테스트 중...")
     if device == "cuda":
         baseline_debug_model = baseline_debug_model.to(device)
+    
+    debug_result = None
 
-    debug_result = debug_first_divergence(
-        model_base=baseline_debug_model,
-        model_paged=model_paged,
-        tokenizer=tokenizer,
-        prompt_text=prompt,
-        scheduler=scheduler,
-        request_id=request_id,
-        max_new_tokens=3,
-    )
+    #debug_result = debug_first_divergence(
+    #    model_base=baseline_debug_model,
+    #    model_paged=model_paged,
+    #    tokenizer=tokenizer,
+    #    prompt_text=prompt,
+    #    scheduler=scheduler,
+    #    request_id=request_id,
+    #    max_new_tokens=3,
+    #)
     if device == "cuda":
         baseline_debug_model = baseline_debug_model.to("cpu")
         torch.cuda.empty_cache()
