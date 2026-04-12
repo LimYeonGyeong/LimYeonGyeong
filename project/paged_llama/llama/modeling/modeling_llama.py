@@ -344,7 +344,7 @@ def eager_attention_forward(
     attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -396,7 +396,7 @@ class LlamaAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -766,7 +766,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -844,7 +844,7 @@ class LlamaModel(LlamaPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> BaseModelOutputWithPast:
         print(
             f"[MODEL-ENTRY] use_cache={use_cache} "
@@ -973,7 +973,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
         Example:
@@ -997,7 +997,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             f"pkv_type={type(past_key_values)} "
             f"pkv_id={id(past_key_values) if past_key_values is not None else None}"
         )
-        llll
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
