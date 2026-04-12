@@ -12,7 +12,10 @@ from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.block_table import BlockTable
 
-import transformers.models.llama.modeling_llama as llama_mod
+import sys
+sys.path.append("/LimYeonGyeong/project")
+
+from paged_llama.llama.modeling import modeling_llama as llama_mod
 import inspect
 
 print("🔥 실제 사용 파일 =", llama_mod.__file__)
