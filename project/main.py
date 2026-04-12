@@ -5,10 +5,14 @@ import psutil
 import torch
 
 from huggingface_hub import login
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
-from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from paged_llama.llama.modeling.modeling_llama import (
+    PagedLlamaAttention,
+    LlamaForCausalLM as PagedLlamaForCausalLM,
+)
+
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.block_table import BlockTable
 
@@ -884,7 +888,7 @@ def main():
     # -------------------------
     print(">>> PagedAttention 로딩 및 패치 중...")
 
-    model_paged = AutoModelForCausalLM.from_pretrained(
+    model_paged = PagedLlamaForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
