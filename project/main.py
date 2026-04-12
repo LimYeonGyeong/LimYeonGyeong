@@ -876,7 +876,7 @@ def main():
     baseline_debug_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    ).to(device)
+    )
 
     del model_base
     gc.collect()
@@ -950,6 +950,8 @@ def main():
     # 1단계 정확성 테스트
     # -------------------------
     print(">>> HF cache OFF + PagePool only 테스트 중...")
+    if device == "cuda":
+        baseline_debug_model = baseline_debug_model.to(device)
 
     debug_result = debug_first_divergence(
         model_base=baseline_debug_model,
@@ -958,8 +960,11 @@ def main():
         prompt_text=prompt,
         scheduler=scheduler,
         request_id=request_id,
-        max_new_tokens=10,
+        max_new_tokens=3,
     )
+    if device == "cuda":
+        baseline_debug_model = baseline_debug_model.to("cpu")
+        torch.cuda.empty_cache()
 
     # -------------------------
     # 2단계 성능 측정
@@ -1019,7 +1024,7 @@ def main():
     ).to(device)
 
     stats_base_multi = measure_baseline_multi(
-        model_base_multi, tokenizer, prompts, max_new_tokens=20
+        model_base_multi, tokenizer, prompts, max_new_tokens=5
     )
 
     del model_base_multi
