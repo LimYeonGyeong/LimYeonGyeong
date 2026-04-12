@@ -888,10 +888,11 @@ def main():
     # -------------------------
     print(">>> PagedAttention 로딩 및 패치 중...")
 
-    model_paged = PagedLlamaForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    ).to(device)
+    model_paged = PagedLlamaForCausalLM.from_pretrained(MODEL_ID)
+    model_paged = model_paged.to(
+        device=device,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
 
     # HF 기본 cache 끄기
     model_paged.config.use_cache = True
