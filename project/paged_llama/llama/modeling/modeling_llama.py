@@ -848,7 +848,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.block_table = None
 
         # Initialize weights and apply final processing
-        self.post_init()
+        if hasattr(self, "post_init"):
+            self.post_init()
 
     @check_model_inputs
     @auto_docstring
@@ -975,7 +976,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
-        self.post_init()
+        if hasattr(self, "post_init"):
+            self.post_init()
 
     @can_return_tuple
     @auto_docstring
