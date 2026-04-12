@@ -25,13 +25,16 @@ from torch import nn
 import math
 from typing import Optional, Callable, Any, Union, List
 
+# llama 바로 아래
 from ..activations import ACT2FN
+
+# memory / generation
 from ..memory.cache_utils import Cache
-from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
 from ..memory.page_cache import PagedCache
+from ..generation.generation import GenerationMixin
 
-# 같은 modeling 폴더 내 파일 참조
+# modeling 내부
 from .modeling_layers import (
     GenericForQuestionAnswering,
     GenericForSequenceClassification,
@@ -44,20 +47,30 @@ from .modeling_rope_utils import (
 )
 from .modeling_utils import PreTrainedModel
 
-# Transformers 표준 출력 사용
+# transformers 표준 출력
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
 
-try:
-    from typing import Unpack
-except ImportError:
-    from typing_extensions import Unpack
+# utils (llama/utils)
+from ..utils.processing_utils import Unpack
+from ..utils.utils import (
+    TransformersKwargs,
+    auto_docstring,
+    can_return_tuple,
+    use_kernel_forward_from_hub,
+    use_kernelized_func,
+    use_kernel_func_from_hub,
+    check_model_inputs,
+)
+from ..utils import logging
 
+# config
 from ..config.configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
+
 def _tensor_debug(name, x, layer_idx=None, step_info=""):
     if x is None:
         print(f"[DBG] {name}: None")
