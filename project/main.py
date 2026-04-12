@@ -882,11 +882,6 @@ def main():
     #    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     #)
 
-    del model_base
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
     # -------------------------
     # Paged
     # -------------------------
