@@ -95,6 +95,17 @@ def measure_performance(model, tokenizer, prompt_text, max_new_tokens=3):
 
     return stats
 
+def build_decode_positions(model):
+    request_state = getattr(model.model, "active_request_state", None)
+    if request_state is None:
+        raise RuntimeError("[POSITION ERROR] active_request_state is None")
+
+    current_pos = int(request_state["seq_len"])
+    cache_position = torch.tensor([current_pos], device=model.device, dtype=torch.long)
+    position_ids = cache_position.unsqueeze(0)
+
+    return cache_position, position_ids
+
 @torch.no_grad()
 def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=20):
     process = psutil.Process(os.getpid())
@@ -228,16 +239,13 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         print(f"[REQ-STATE] after prefill = {model.model.active_request_state}")
         print(f"[REQ-STATE-ID] after prefill = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
 
-        scheduler.set_seq_len(request_id, prompt_len)
-
-        print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model.model.active_request_state}")
-
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
 
         # 2) decode
-        for step in range(1, divergence_step + 1):
+        for step in range(1, max_new_tokens):
             last_token = generated[:, -1:]
+            cache_position, position_ids = build_decode_positions(model)
 
             print(f"\n[MAIN-DECODE STEP {step}] before call")
             print(f"[CACHE-ID] before call id={id(past_key_values) if past_key_values is not None else None}")
@@ -245,13 +253,18 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             print(f"[CACHE-SEQ] before call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
             print(f"[REQ-STATE] before call = {model.model.active_request_state}")
             print(f"[REQ-STATE-ID] before call = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
+            print(f"[CACHE-POS] before call = {cache_position.detach().cpu().tolist()}")
+            print(f"[POSITION-IDS] before call = {position_ids.detach().cpu().tolist()}")
             print("[CHECK] pkv seq =", past_key_values.get_seq_length())
             print("[CHECK] req seq =", model.model.active_request_state["seq_len"])
+
             outputs = model(
                 input_ids=last_token,
                 use_cache=True,
                 past_key_values=past_key_values,
-)
+                cache_position=cache_position,
+                position_ids=position_ids,
+            )
 
             print(f"[CACHE-ID] after call  id={id(outputs.past_key_values) if outputs.past_key_values is not None else None}")
 
@@ -261,12 +274,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             print(f"[CACHE-SEQ] after call = {past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 'N/A'}")
             print(f"[REQ-STATE] after call = {model.model.active_request_state}")
             print(f"[REQ-STATE-ID] after call = {id(model.model.active_request_state) if model.model.active_request_state is not None else None}")
-
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token], dim=1)
-
-            if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
-                break
 
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
@@ -304,7 +311,7 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         if hasattr(bt, "to_tensor"):
             used_blocks += bt.to_tensor(device="cpu").shape[1]
         else:
-            used_blocks += len(bt.block_table[0])
+            used_blocks += len(bt)
 
     block_utilization = used_blocks / pool.num_blocks if pool.num_blocks > 0 else 0.0
 
@@ -385,9 +392,6 @@ def collect_greedy_trace(model, tokenizer, prompt_text, max_new_tokens=20, sched
     )
     past_key_values = outputs.past_key_values
 
-    if scheduler is not None and request_id is not None:
-        scheduler.set_seq_len(request_id, prompt_len)
-
     logits = outputs.logits[:, -1, :]
     topk = torch.topk(logits[0], k=5)
     next_token = torch.argmax(logits, dim=-1, keepdim=True)
@@ -408,10 +412,19 @@ def collect_greedy_trace(model, tokenizer, prompt_text, max_new_tokens=20, sched
     for step in range(1, max_new_tokens):
         last_token = generated[:, -1:]
 
+        if scheduler is not None and request_id is not None:
+            cache_position, position_ids = build_decode_positions(model)
+        else:
+            current_pos = int(past_key_values.get_seq_length()) if hasattr(past_key_values, "get_seq_length") else generated.shape[1] - 1
+            cache_position = torch.tensor([current_pos], device=model.device, dtype=torch.long)
+            position_ids = cache_position.unsqueeze(0)
+
         outputs = model(
             input_ids=last_token,
             use_cache=True,
             past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_ids=position_ids,
         )
         past_key_values = outputs.past_key_values
 
@@ -436,7 +449,6 @@ def collect_greedy_trace(model, tokenizer, prompt_text, max_new_tokens=20, sched
 
     trace["final_text"] = tokenizer.decode(generated[0], skip_special_tokens=True)
     return trace
-
 
 @torch.no_grad()
 def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, scheduler, request_id, max_new_tokens=20):
@@ -502,7 +514,6 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
 
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model_paged.device)
     generated = inputs["input_ids"].clone()
-    prompt_len = generated.shape[1]
     past_key_values = None
 
     request_state = scheduler.get_request_state(request_id)
@@ -542,15 +553,13 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
         f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
     )
 
-    scheduler.set_seq_len(request_id, prompt_len)
-    print(f"[REQ-STATE] after scheduler.set_seq_len(prompt_len) = {model_paged.model.active_request_state}")
-
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
 
     # 2) decode
     for step in range(1, divergence_step + 1):
         last_token = generated[:, -1:]
+        cache_position, position_ids = build_decode_positions(model_paged)
 
         print(f"\n[MAIN-DECODE STEP {step}] before call")
         print(f"[CACHE-ID] before call id={id(past_key_values) if past_key_values is not None else None}")
@@ -564,11 +573,15 @@ def debug_first_divergence(model_base, model_paged, tokenizer, prompt_text, sche
             f"[REQ-STATE-ID] before call = "
             f"{id(model_paged.model.active_request_state) if model_paged.model.active_request_state is not None else None}"
         )
+        print(f"[CACHE-POS] before call = {cache_position.detach().cpu().tolist()}")
+        print(f"[POSITION-IDS] before call = {position_ids.detach().cpu().tolist()}")
 
         outputs = model_paged(
             input_ids=last_token,
             use_cache=True,
             past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_ids=position_ids,
         )
 
         print(
@@ -626,7 +639,6 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler,
         past_key_values=None,
     )
     past_key_values = outputs.past_key_values
-    scheduler.set_seq_len(request_id, prompt_len)
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -639,11 +651,14 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler,
     # 2) decode
     for step in range(1, max_new_tokens):
         last_token = generated[:, -1:]
+        cache_position, position_ids = build_decode_positions(model)
 
         outputs = model(
             input_ids=last_token,
             use_cache=True,
             past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_ids=position_ids,
         )
         past_key_values = outputs.past_key_values
 
@@ -666,6 +681,10 @@ def test_paged_generation_step_by_step(model, tokenizer, prompt_text, scheduler,
 
     return final_text
 
+# -----------------------------
+# PagedAttention 성능 측정
+# HF cache OFF + PagePool only
+# -----------------------------
 # -----------------------------
 # PagedAttention 성능 측정
 # HF cache OFF + PagePool only
@@ -698,7 +717,6 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
         past_key_values=None,
     )
     past_key_values = outputs.past_key_values
-    scheduler.set_seq_len(request_id, prompt_len)
 
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = torch.cat([generated, next_token], dim=1)
@@ -706,11 +724,14 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
     # 2) decode
     for _ in range(max_new_tokens - 1):
         last_token = generated[:, -1:]
+        cache_position, position_ids = build_decode_positions(model)
 
         outputs = model(
             input_ids=last_token,
             use_cache=True,
             past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_ids=position_ids,
         )
         past_key_values = outputs.past_key_values
 
@@ -742,15 +763,13 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
         max_reserved = 0.0
 
     if hasattr(block_table, "to_tensor"):
-        bt = block_table.to_tensor(device="cpu")
-        used_blocks = bt.shape[1]
+        used_blocks = block_table.to_tensor(device="cpu").shape[1]
     else:
-        used_blocks = len(block_table.block_table[0])
+        used_blocks = len(block_table)
 
-    total_blocks = pool.num_blocks
-    block_utilization = used_blocks / total_blocks if total_blocks > 0 else 0.0
+    block_utilization = used_blocks / pool.num_blocks if pool.num_blocks > 0 else 0.0
 
-    stats = {
+    return {
         "text": generated_text,
         "latency": t1 - t0,
         "throughput": generated_tokens / (t1 - t0) if (t1 - t0) > 0 else 0.0,
@@ -765,8 +784,6 @@ def measure_paged_only(model, tokenizer, prompt_text, block_table, pool, schedul
         "used_blocks": used_blocks,
         "block_utilization": block_utilization,
     }
-
-    return stats
 
 # -----------------------------
 # Attention patch
