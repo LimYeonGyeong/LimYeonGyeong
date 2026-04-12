@@ -25,7 +25,7 @@ from torch import nn
 import math
 from typing import Optional, Callable, Any, Union, List
 
-from ..activations import ACT2FN
+from ..utils.activations import ACT2FN
 from ..memory.cache_utils import Cache
 from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
@@ -50,28 +50,14 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
-# utils 폴더로 이동된 파일 참조
-from ..utils.processing_utils import Unpack
-# modeling_llama.py 상단 수정 (이전에 드린 것과 동일)
-
-from ..utils.utils import (
-    TransformersKwargs,
-    auto_docstring,
-    can_return_tuple,
-    logging,
-    use_kernel_forward_from_hub,
-    use_kernelized_func,
-    use_kernel_func_from_hub,
-    check_model_inputs,
-)
 try:
     from typing import Unpack
 except ImportError:
     from typing_extensions import Unpack
+
 from ..config.configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
-
 def _tensor_debug(name, x, layer_idx=None, step_info=""):
     if x is None:
         print(f"[DBG] {name}: None")
