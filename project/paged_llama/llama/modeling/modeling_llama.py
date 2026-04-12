@@ -218,10 +218,22 @@ class LlamaRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_params = getattr(self.config, "rope_parameters", None)
+        if rope_params is None:
+            rope_params = {
+                "rope_type": "default",
+                "rope_theta": getattr(self.config, "rope_theta", 10000.0),
+            }
+
+        self.rope_type = rope_params.get("rope_type", "default")
+
+        # config 안에도 넣어둬서 아래 compute_default_rope_parameters에서 그대로 쓰게 함
+        self.config.rope_parameters = rope_params
+
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
         inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -245,8 +257,12 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
             post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_parameters["rope_theta"]
+        """     
+        rope_params = getattr(config, "rope_parameters", None)
+        if rope_params is None:
+            base = getattr(config, "rope_theta", 10000.0)
+        else:
+            base = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0))
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
         attention_factor = 1.0  # Unused in this type of RoPE
