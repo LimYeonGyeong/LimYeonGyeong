@@ -44,10 +44,10 @@ class ModuleUtilsMixin:
 
 
 class PreTrainedModel(nn.Module, ModuleUtilsMixin):
-    r"
+    r"""
     모든 모델의 기본이 되는 클래스입니다.
     설정(Config) 관리, 가중치 저장/로드 등의 기능을 담당합니다.
-    "
+    """
     config_class = None
     base_model_prefix = ""
     main_input_name = "input_ids"
