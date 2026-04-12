@@ -1,6 +1,6 @@
 Traceback (most recent call last):
   File "/LimYeonGyeong/project/main.py", line 11, in <module>
     from paged_llama.llama.modeling.modeling_llama import PagedLlamaAttention
-  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 60, in <module>
-    logger = logging.get_logger(__name__)
-NameError: name 'logging' is not defined
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 347, in <module>
+    **kwargs: Unpack[TransformersKwargs],
+TypeError: 'type' object is not subscriptable
