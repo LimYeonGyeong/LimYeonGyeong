@@ -25,7 +25,7 @@ from torch import nn
 import math
 from typing import Optional, Callable, Any, Union, List
 
-from ..utils.activations import ACT2FN
+from ..activations import ACT2FN
 from ..memory.cache_utils import Cache
 from ..generation.generation import GenerationMixin
 from ..memory.masking_utils import create_causal_mask
