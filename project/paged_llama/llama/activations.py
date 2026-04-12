@@ -18,4 +18,5 @@ ACT2FN = {
     "gelu": gelu,
     "gelu_new": gelu_new,
     "swish": swish,
+    "silu": F.silu,
 }
