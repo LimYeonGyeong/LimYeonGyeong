@@ -102,7 +102,7 @@ def paged_main():
 
     print(">>> PagePool 생성")
 
-    max_new_tokens = 1
+    max_new_tokens = 10
     block_size = 16
     request_id = "req_1"
 
