@@ -1,6 +1,9 @@
 import os
 import gc
+import sys
 import torch
+
+sys.path.append("/LimYeonGyeong/project")
 
 from transformers import AutoTokenizer
 
@@ -8,10 +11,8 @@ from paged_llama.llama.modeling.modeling_llama import (
     LlamaForCausalLM as PagedLlamaForCausalLM,
 )
 from paged_llama.llama.memory.page_pool import PagePool
-from paged_llama.llama.memory.block_table import BlockTable
 from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
-# 너 기존 코드에서 쓰던 함수
 from main import patch_model_with_paged_attention, measure_paged_only
 
 # 메모리 fragmentation 방지
@@ -30,25 +31,24 @@ def paged_main():
     tokenizer.padding_side = "left"
 
     prompt = (
-        '### Instruction:\n'
-        'Explain the difference between training and inference in LLMs.\n'
-        'Explain it in one simple sentence.\n'
-        '### Response:\n'
+        "### Instruction:\n"
+        "Explain the difference between training and inference in LLMs.\n"
+        "Explain it in one simple sentence.\n"
+        "### Response:\n"
     )
 
-    # 메모리 초기화
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
 
     print(">>> 모델 로딩 중...")
 
-    model = PagedLlamaForCausalLM.from_pretrained(MODEL_ID)
-
-    if device == "cuda":
-        model = model.half()
-
-    model = model.to(device)
+    # 🔥 핵심: 여기서 바로 GPU + fp16
+    model = PagedLlamaForCausalLM.from_pretrained(
+        MODEL_ID,
+        device=device,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
 
     model.config.use_cache = True
     if hasattr(model, "generation_config"):
@@ -56,13 +56,12 @@ def paged_main():
 
     print(">>> PagePool 생성")
 
-    max_new_tokens = 3
+    max_new_tokens = 1   # 🔥 메모리 안정화
     block_size = 16
     request_id = "req_1"
 
     prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
     total_tokens = prompt_len + max_new_tokens
-
     num_blocks = ((total_tokens + block_size - 1) // block_size) + 2
 
     config = model.config
@@ -86,7 +85,7 @@ def paged_main():
         model=model,
         page_pool=pool,
         block_table=block_table,
-        debug=False,
+        debug=True,
         debug_verbose=False,
     )
 
