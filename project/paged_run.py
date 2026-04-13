@@ -5,21 +5,42 @@ import torch
 
 sys.path.append("/LimYeonGyeong/project")
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 from paged_llama.llama.modeling.modeling_llama import (
     LlamaForCausalLM as PagedLlamaForCausalLM,
 )
+from paged_llama.llama.config.configuration_llama import LlamaConfig
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
 from main import patch_model_with_paged_attention, measure_paged_only
 
-# 메모리 fragmentation 방지
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def build_local_config_from_hf(hf_config):
+    return LlamaConfig(
+        vocab_size=hf_config.vocab_size,
+        hidden_size=hf_config.hidden_size,
+        intermediate_size=hf_config.intermediate_size,
+        num_hidden_layers=hf_config.num_hidden_layers,
+        num_attention_heads=hf_config.num_attention_heads,
+        num_key_value_heads=getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads),
+        max_position_embeddings=hf_config.max_position_embeddings,
+        rms_norm_eps=hf_config.rms_norm_eps,
+        rope_theta=getattr(hf_config, "rope_theta", 10000.0),
+        hidden_act=hf_config.hidden_act,
+        pad_token_id=hf_config.pad_token_id,
+        bos_token_id=hf_config.bos_token_id,
+        eos_token_id=hf_config.eos_token_id,
+        attention_bias=getattr(hf_config, "attention_bias", False),
+        mlp_bias=getattr(hf_config, "mlp_bias", False),
+        attention_dropout=getattr(hf_config, "attention_dropout", 0.0),
+    )
 
 
 def paged_main():
@@ -41,14 +62,39 @@ def paged_main():
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    print(">>> 모델 로딩 중...")
+    print(">>> HF config / state_dict 로딩 중...")
 
-    # 🔥 핵심: 여기서 바로 GPU + fp16
-    model = PagedLlamaForCausalLM.from_pretrained(
+    # HF의 실제 TinyLlama config 가져오기
+    hf_config = AutoConfig.from_pretrained(MODEL_ID)
+
+    # HF 원본 모델은 CPU에서만 로드해서 state_dict 추출
+    hf_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        device=device,
         dtype=torch.float16 if device == "cuda" else torch.float32,
     )
+    hf_model = hf_model.to("cpu")
+    state_dict = hf_model.state_dict()
+
+    print(">>> 로컬 paged 모델 생성 중...")
+
+    local_config = build_local_config_from_hf(hf_config)
+    model = PagedLlamaForCausalLM(local_config)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"[LOAD] missing keys: {len(missing)}")
+    print(f"[LOAD] unexpected keys: {len(unexpected)}")
+
+    del hf_model
+    del state_dict
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    print(">>> 로컬 paged 모델 GPU 이동 중...")
+
+    if device == "cuda":
+        model = model.half()
+    model = model.to(device)
 
     model.config.use_cache = True
     if hasattr(model, "generation_config"):
@@ -56,7 +102,7 @@ def paged_main():
 
     print(">>> PagePool 생성")
 
-    max_new_tokens = 1   # 🔥 메모리 안정화
+    max_new_tokens = 1
     block_size = 16
     request_id = "req_1"
 
