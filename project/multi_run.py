@@ -104,7 +104,7 @@ def multi_only_main():
         "### Instruction:\nExplain KV cache in simple terms in one sentence.\n### Response:",
     ]
 
-    max_new_tokens = 5
+    max_new_tokens = 20
     block_size = 16
 
     gc.collect()
