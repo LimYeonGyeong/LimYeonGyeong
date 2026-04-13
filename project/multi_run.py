@@ -88,6 +88,83 @@ def load_paged_model():
     return model
 
 
+def make_prompt(topic: str, detail_level: str) -> str:
+    if detail_level == "short":
+        return (
+            "### Instruction:\n"
+            f"Explain {topic} in one short sentence.\n"
+            "### Response:\n"
+        )
+
+    if detail_level == "medium":
+        return (
+            "### Instruction:\n"
+            f"Explain {topic} clearly for a beginner.\n"
+            "Use 3 to 4 simple sentences and include one example.\n"
+            "### Response:\n"
+        )
+
+    if detail_level == "long":
+        return (
+            "### Instruction:\n"
+            f"Explain {topic} in detail for a student who is learning LLM systems.\n"
+            "Your answer should include:\n"
+            "1. a simple definition,\n"
+            "2. why it matters,\n"
+            "3. one technical detail,\n"
+            "4. one practical example,\n"
+            "5. one limitation.\n"
+            "Write around 8 to 10 sentences.\n"
+            "### Response:\n"
+        )
+
+    raise ValueError(f"Unknown detail_level: {detail_level}")
+
+
+def build_mixed_prompts(n_requests: int = 20):
+    topics = [
+        "LLM",
+        "transformer attention",
+        "KV cache",
+        "paged attention",
+        "multi-head attention",
+        "inference",
+        "training",
+        "prefill and decode",
+        "block table",
+        "page pool",
+        "GPU memory fragmentation",
+        "sequence length",
+        "context window",
+        "RoPE embeddings",
+        "beam search",
+        "greedy decoding",
+        "tokenization",
+        "causal mask",
+        "batch inference",
+        "dynamic cache",
+        "static cache",
+        "request scheduling",
+        "latency",
+        "throughput",
+        "memory efficiency",
+    ]
+
+    detail_pattern = (
+        ["short"] * (n_requests // 3)
+        + ["medium"] * (n_requests // 3)
+        + ["long"] * (n_requests - 2 * (n_requests // 3))
+    )
+
+    prompts = []
+    for i in range(n_requests):
+        topic = topics[i % len(topics)]
+        detail = detail_pattern[i]
+        prompts.append(make_prompt(topic, detail))
+
+    return prompts
+
+
 def multi_only_main():
     print(">>> Multi Request 비교 실행")
 
@@ -95,14 +172,11 @@ def multi_only_main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
-    # 메모리 안정성을 위해 우선 4개 질문만 사용
-    prompts = [
-        "### Instruction:\nExplain what LLM is in one sentence.\n### Response:",
-        "### Instruction:\nExplain Medusa LLM in one simple sentence.\n### Response:",
-        "### Instruction:\nDescribe how attention works in transformers in one sentence.\n### Response:",
-        "### Instruction:\nExplain KV cache in simple terms in one sentence.\n### Response:",
-    ]
+    # paged가 유리한 조건:
+    # - 요청 수 많음
+    # - 길이 제각각
+    num_requests = 20
+    prompts = build_mixed_prompts(n_requests=num_requests)
 
     max_new_tokens = 20
     block_size = 16
@@ -182,10 +256,10 @@ def multi_only_main():
         model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
     )
 
-    print("\n[OUTPUT] Multi Request Generation Results")
-    for i, text in enumerate(stats_paged_multi["texts"]):
+    print("\n[OUTPUT] Multi Request Generation Results (first 5 only)")
+    for i, text in enumerate(stats_paged_multi["texts"][:5]):
         print(f"\n--- Request {i+1} ---")
-        print(text)
+        print(text[:500])
 
     print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
 
