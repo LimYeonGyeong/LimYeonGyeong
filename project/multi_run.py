@@ -142,48 +142,31 @@ def load_paged_model():
 def make_prompt(topic: str, detail_level: str) -> str:
     if detail_level == "short":
         return (
-            "### Instruction:
-"
-            f"Explain {topic} in one short sentence.
-"
-            "### Response:
-"
+            "### Instruction:\n"
+            f"Explain {topic} in one short sentence.\n"
+            "### Response:\n"
         )
 
     if detail_level == "medium":
         return (
-            "### Instruction:
-"
-            f"Explain {topic} clearly for a beginner.
-"
-            "Use 3 to 4 simple sentences and include one example.
-"
-            "### Response:
-"
+            "### Instruction:"
+            f"Explain {topic} clearly for a beginner."
+            "Use 3 to 4 simple sentences and include one example."
+            "### Response:"
         )
 
     if detail_level == "long":
         return (
-            "### Instruction:
-"
-            f"Explain {topic} in detail for a student who is learning LLM systems.
-"
-            "Your answer should include:
-"
-            "1. a simple definition,
-"
-            "2. why it matters,
-"
-            "3. one technical detail,
-"
-            "4. one practical example,
-"
-            "5. one limitation.
-"
-            "Write around 8 to 10 sentences.
-"
-            "### Response:
-"
+            "### Instruction:\n"
+            f"Explain {topic} in detail for a student who is learning LLM systems.\n"
+            "Your answer should include:\n"
+            "1. a simple definition,\n"
+            "2. why it matters,\n"
+            "3. one technical detail,\n"
+            "4. one practical example,\n"
+            "5. one limitation.\n"
+            "Write around 8 to 10 sentences.\n"
+            "### Response:\n"
         )
 
     raise ValueError(f"Unknown detail_level: {detail_level}")
