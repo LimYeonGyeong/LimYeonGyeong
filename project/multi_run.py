@@ -11,7 +11,7 @@ import psutil
 
 sys.path.append("/LimYeonGyeong/project")
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, GenerationConfig
 
 from paged_llama.llama.modeling.modeling_llama import (
     PagedLlamaAttention,
@@ -155,11 +155,22 @@ def load_paged_model():
     model = model.to(device)
 
     model.config.use_cache = True
-    if hasattr(model, "generation_config"):
-        model.generation_config.use_cache = True
+
+    # transformers.generate() 호환을 위해 generation_config를 명시적으로 보장
+    try:
+        model.generation_config = GenerationConfig.from_pretrained(MODEL_ID)
+    except Exception:
+        model.generation_config = GenerationConfig.from_model_config(hf_config)
+
+    model.generation_config.use_cache = True
+    if model.generation_config.pad_token_id is None:
+        model.generation_config.pad_token_id = local_config.pad_token_id
+    if model.generation_config.eos_token_id is None:
+        model.generation_config.eos_token_id = local_config.eos_token_id
+    if model.generation_config.bos_token_id is None:
+        model.generation_config.bos_token_id = local_config.bos_token_id
 
     return model
-
 
 def make_prompt(topic: str, detail_level: str) -> str:
     if detail_level == "short":
@@ -335,7 +346,7 @@ def measure_paged_multi(
         peak_vram = alloc_vram = reserved_vram = max_reserved_vram = 0.0
 
     used_blocks = int(pool.num_blocks - len(pool.free_blocks))
-    block_utilization = (used_blocks / max(pool.num_blocks, 1)) * 100.0
+    block_utilization = used_blocks / max(pool.num_blocks, 1)
     vram_per_token_kb = (peak_vram * 1024.0) / max(total_generated_tokens, 1)
 
     stats = {
