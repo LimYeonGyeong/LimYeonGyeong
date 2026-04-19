@@ -1,0 +1,24 @@
+🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
+🔥 LlamaModel.forward 위치 = /LimYeonGyeong/project/paged_llama/llama/utils/utils.py
+>>> Multi Request 비교 실행
+>>> Baseline multi 로딩 중...
+>>> Paged multi 로딩 중...
+>>> HF config / state_dict 로딩 중...
+>>> 로컬 paged 모델 생성 중...
+[LOAD] missing keys: 0
+[LOAD] unexpected keys: 0
+>>> 로컬 paged 모델 GPU 이동 중...
+Traceback (most recent call last):
+  File "/LimYeonGyeong/project/multi_run.py", line 548, in <module>
+    multi_only_main()
+  File "/LimYeonGyeong/project/multi_run.py", line 520, in multi_only_main
+    stats_paged_multi = measure_paged_multi(
+  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/LimYeonGyeong/project/multi_run.py", line 268, in measure_paged_multi
+    bt = scheduler.allocate_for_request(rid, shared_total_tokens)
+  File "/LimYeonGyeong/project/paged_llama/llama/memory/simple_scheduler.py", line 16, in allocate_for_request
+    physical_block = self.page_pool.allocate()
+  File "/LimYeonGyeong/project/paged_llama/llama/memory/page_pool.py", line 39, in allocate
+    raise RuntimeError("PagePool에 남은 블록이 없습니다.")
+RuntimeError: PagePool에 남은 블록이 없습니다.
