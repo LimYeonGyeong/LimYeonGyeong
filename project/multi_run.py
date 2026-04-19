@@ -477,13 +477,17 @@ def multi_only_main():
 
     config = model_paged.config
 
-    # 전체 multi prompt 기준으로 pool 크기 계산
-    all_needed_blocks = 0
+    # batch 기준 최대 길이
+    max_prompt_len = 0
     for p in prompts:
         prompt_len = tokenizer(p, return_tensors="pt")["input_ids"].shape[1]
-        needed_tokens = prompt_len + max_new_tokens
-        needed_blocks = (needed_tokens + block_size - 1) // block_size
-        all_needed_blocks += needed_blocks
+        max_prompt_len = max(max_prompt_len, prompt_len)
+
+    shared_total_tokens = max_prompt_len + max_new_tokens
+
+    blocks_per_request = (shared_total_tokens + block_size - 1) // block_size
+
+    all_needed_blocks = blocks_per_request * len(prompts)
 
     # 필요한 블록 수에 작은 여유만 둔다.
     safety_margin = 4
@@ -544,5 +548,5 @@ def multi_only_main():
     if device == "cuda":
         torch.cuda.empty_cache()
 if __name__ == "__main__":
-    
+
     multi_only_main()
