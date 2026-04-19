@@ -539,6 +539,7 @@ def multi_only_main():
         "Multi Request Result",
         stats_base_multi,
         stats_paged_multi,
+        include_blocks=True,
     )
 
     del model_paged
