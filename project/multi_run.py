@@ -1,6 +1,8 @@
 import os
 import gc
 import sys
+import time
+import psutil
 import torch
 import builtins
 from contextlib import contextmanager
@@ -20,7 +22,6 @@ from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 # 기존 main.py에서 검증된 helper 재사용
 from main import (
     measure_baseline_multi,
-    measure_paged_multi,
     patch_model_with_paged_attention,
     print_stats_table,
 )
@@ -149,10 +150,10 @@ def make_prompt(topic: str, detail_level: str) -> str:
 
     if detail_level == "medium":
         return (
-            "### Instruction:"
-            f"Explain {topic} clearly for a beginner."
-            "Use 3 to 4 simple sentences and include one example."
-            "### Response:"
+            "### Instruction:\n"
+            f"Explain {topic} clearly for a beginner.\n"
+            "Use 3 to 4 simple sentences and include one example.\n"
+            "### Response:\n"
         )
 
     if detail_level == "long":
@@ -214,6 +215,182 @@ def build_mixed_prompts(n_requests: int = 20):
         prompts.append(make_prompt(topic, detail))
 
     return prompts
+
+
+def _get_ram_mb() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+
+def _get_ctx_switches() -> int:
+    cs = psutil.Process(os.getpid()).num_ctx_switches()
+    return int(cs.voluntary + cs.involuntary)
+
+
+def _build_request_entries(tokenizer, prompts, scheduler, max_new_tokens):
+    entries = []
+    for i, prompt in enumerate(prompts):
+        req_id = f"req_{i}"
+        enc = tokenizer(prompt, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        attention_mask = attention_mask.to(device)
+
+        prompt_len = input_ids.shape[1]
+        total_tokens = prompt_len + max_new_tokens
+        block_table = scheduler.allocate_for_request(req_id, total_tokens)
+        request_state = scheduler.get_request_state(req_id)
+
+        entries.append(
+            {
+                "req_id": req_id,
+                "prompt": prompt,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "prompt_len": prompt_len,
+                "block_table": block_table,
+                "request_state": request_state,
+                "past_key_values": None,
+                "generated_token_ids": [],
+                "generated_tokens": 0,
+                "finished": False,
+            }
+        )
+    return entries
+
+
+# -------------------------
+# Step 1 구조 수정:
+# - 기존: request-major loop
+# - 변경: prefill-all -> decode step-major loop
+# 아직 attention 내부는 bsz=1 전제라 진짜 병렬 GPU batch는 아님
+# 하지만 실행 구조를 다음 단계(batch-aware attention)로 옮기기 쉽게 만든다.
+# -------------------------
+@torch.no_grad()
+def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_tokens=20):
+    model.eval()
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+    ram_before = _get_ram_mb()
+    ctx_before = _get_ctx_switches()
+    start_time = time.perf_counter()
+
+    entries = _build_request_entries(
+        tokenizer=tokenizer,
+        prompts=prompts,
+        scheduler=scheduler,
+        max_new_tokens=max_new_tokens,
+    )
+
+    # -------------------------
+    # Prefill-all
+    # -------------------------
+    for entry in entries:
+        model.active_request_state = entry["request_state"]
+        model.active_block_table = entry["block_table"]
+
+        outputs = model(
+            input_ids=entry["input_ids"],
+            attention_mask=entry["attention_mask"],
+            use_cache=True,
+            past_key_values=None,
+            return_dict=True,
+        )
+        entry["past_key_values"] = outputs.past_key_values
+
+    # -------------------------
+    # Decode step-major
+    # -------------------------
+    active_entries = [e for e in entries if not e["finished"]]
+
+    for _step in range(max_new_tokens):
+        if not active_entries:
+            break
+
+        next_active = []
+        for entry in active_entries:
+            model.active_request_state = entry["request_state"]
+            model.active_block_table = entry["block_table"]
+
+            if entry["generated_tokens"] == 0:
+                step_input_ids = entry["input_ids"][:, -1:]
+            else:
+                step_input_ids = torch.tensor(
+                    [[entry["generated_token_ids"][-1]]],
+                    device=device,
+                    dtype=entry["input_ids"].dtype,
+                )
+
+            outputs = model(
+                input_ids=step_input_ids,
+                use_cache=True,
+                past_key_values=entry["past_key_values"],
+                return_dict=True,
+            )
+            entry["past_key_values"] = outputs.past_key_values
+
+            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+            next_token = int(next_token_id.item())
+            entry["generated_token_ids"].append(next_token)
+            entry["generated_tokens"] += 1
+
+            if next_token == tokenizer.eos_token_id:
+                entry["finished"] = True
+            else:
+                next_active.append(entry)
+
+        active_entries = next_active
+
+    elapsed = time.perf_counter() - start_time
+    ram_after = _get_ram_mb()
+    ctx_after = _get_ctx_switches()
+
+    texts = []
+    total_generated_tokens = 0
+    for entry in entries:
+        total_generated_tokens += len(entry["generated_token_ids"])
+        full_ids = torch.cat(
+            [
+                entry["input_ids"][0].detach().cpu(),
+                torch.tensor(entry["generated_token_ids"], dtype=entry["input_ids"].dtype),
+            ],
+            dim=0,
+        )
+        texts.append(tokenizer.decode(full_ids, skip_special_tokens=True))
+
+    used_blocks = pool.num_blocks - len(pool.free_blocks)
+    block_util = (used_blocks / pool.num_blocks * 100.0) if pool.num_blocks > 0 else 0.0
+
+    if device == "cuda":
+        peak_vram = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        alloc_vram = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved_vram = torch.cuda.memory_reserved() / (1024 * 1024)
+        max_reserved_vram = torch.cuda.max_memory_reserved() / (1024 * 1024)
+    else:
+        peak_vram = alloc_vram = reserved_vram = max_reserved_vram = 0.0
+
+    vram_per_token_kb = 0.0
+    if total_generated_tokens > 0:
+        vram_per_token_kb = (peak_vram * 1024.0) / total_generated_tokens
+
+    return {
+        "texts": texts,
+        "latency": elapsed,
+        "throughput": (total_generated_tokens / elapsed) if elapsed > 0 else 0.0,
+        "ram_increase_mb": max(0.0, ram_after - ram_before),
+        "peak_vram_mb": peak_vram,
+        "alloc_vram_mb": alloc_vram,
+        "reserved_vram_mb": reserved_vram,
+        "max_reserved_vram_mb": max_reserved_vram,
+        "vram_per_token_kb": vram_per_token_kb,
+        "context_switch": max(0, ctx_after - ctx_before),
+        "used_blocks": used_blocks,
+        "block_utilization": block_util,
+    }
 
 
 def multi_only_main():
@@ -303,15 +480,14 @@ def multi_only_main():
     pool.k_cache.zero_()
     pool.v_cache.zero_()
 
-    # measure_paged_multi 내부의 step-by-step print는 성능 측정에 큰 방해가 되므로 막는다.
     with suppress_debug_prints(enabled=True):
         stats_paged_multi = measure_paged_multi(
             model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
         )
 
-    print("[OUTPUT] Multi Request Generation Results (first 5 only)")
+    print("\n[OUTPUT] Multi Request Generation Results (first 5 only)")
     for i, text in enumerate(stats_paged_multi["texts"][:5]):
-        print(f"--- Request {i+1} ---")
+        print(f"\n--- Request {i+1} ---")
         print(text[:500])
 
     print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
