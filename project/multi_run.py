@@ -291,36 +291,53 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
     # -------------------------------------------------
     # 2) PREFILL
-    # correctness를 위해 요청별로 그대로 진행
+    # 같은 prompt 길이끼리 batch로 묶어 correctness를 유지하면서
+    # 요청별 순차 prefill의 오버헤드를 줄인다.
     # -------------------------------------------------
+    prefill_groups = {}
     for rt in runtimes:
+        prefill_groups.setdefault(rt["prompt_len"], []).append(rt)
+
+    for prompt_len in sorted(prefill_groups.keys()):
+        group_rts = prefill_groups[prompt_len]
+
+        batch_input_ids = torch.cat(
+            [rt["generated"] for rt in group_rts],
+            dim=0,
+        )  # [batch, prompt_len]
+
+        batch_block_tables = [rt["block_table"] for rt in group_rts]
+        batch_request_states = [rt["request_state"] for rt in group_rts]
+
         for layer in model.model.layers:
-            layer.self_attn.block_table = rt["block_table"]
+            layer.self_attn.block_table = batch_block_tables
             layer.self_attn.page_pool = pool
 
-        model.model.block_table = rt["block_table"]
+        model.model.block_table = batch_block_tables
         model.model.page_pool = pool
-        model.model.active_request_state = rt["request_state"]
+        model.model.active_request_state = None
+        model.model.active_request_states = batch_request_states
 
-        if hasattr(model.model, "active_request_states"):
-            model.model.active_request_states = None
-
-        scheduler.set_seq_len(rt["request_id"], 0)
+        for rt in group_rts:
+            scheduler.set_seq_len(rt["request_id"], 0)
 
         outputs = model(
-            input_ids=rt["generated"],
+            input_ids=batch_input_ids,
             use_cache=True,
             past_key_values=None,
         )
 
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-        rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)  # [batch, 1]
 
-        # prefill 직후 seq_len 동기화
-        rt["request_state"]["seq_len"] = rt["generated"].shape[1]
+        for i, rt in enumerate(group_rts):
+            next_token = next_tokens[i:i+1]  # [1, 1]
+            rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
 
-        if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
-            rt["finished"] = True
+            # prefill 직후 seq_len 동기화
+            rt["request_state"]["seq_len"] = rt["generated"].shape[1]
+
+            if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
+                rt["finished"] = True
 
     # -------------------------------------------------
     # 3) DECODE
@@ -335,9 +352,10 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             [rt["generated"][:, -1:] for rt in active_rts],
             dim=0,
         )  # [batch, 1]
+
         for rt in active_rts:
             rt["request_state"]["seq_len"] = rt["generated"].shape[1] - 1
-        
+
         batch_cache_position = torch.tensor(
             [int(rt["request_state"]["seq_len"]) for rt in active_rts],
             device=model.device,
