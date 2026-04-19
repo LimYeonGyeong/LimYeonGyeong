@@ -8,17 +8,29 @@
 [LOAD] missing keys: 0
 [LOAD] unexpected keys: 0
 >>> 로컬 paged 모델 GPU 이동 중...
-Traceback (most recent call last):
-  File "/LimYeonGyeong/project/multi_run.py", line 539, in <module>
-    multi_only_main()
-  File "/LimYeonGyeong/project/multi_run.py", line 521, in multi_only_main
-    stats_paged_multi = measure_paged_multi(
-  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 116, in decorate_context
-    return func(*args, **kwargs)
-  File "/LimYeonGyeong/project/multi_run.py", line 271, in measure_paged_multi
-    bt = scheduler.allocate_for_request(rid, shared_total_tokens)
-  File "/LimYeonGyeong/project/paged_llama/llama/memory/simple_scheduler.py", line 16, in allocate_for_request
-    physical_block = self.page_pool.allocate()
-  File "/LimYeonGyeong/project/paged_llama/llama/memory/page_pool.py", line 39, in allocate
-    raise RuntimeError("PagePool에 남은 블록이 없습니다.")
-RuntimeError: PagePool에 남은 블록이 없습니다.
+[OUTPUT] Multi Request Generation Results (first 5 only)
+--- Request 1 ---
+### Instruction:Explain LLM in one short sentence.### Response:Lexplanation:
+The LLM is a powerful language-learning model that can learn and
+--- Request 2 ---
+### Instruction:Explain transformer attention in one short sentence.### Response:Transformerased. The sentence is a great example of the transformer attention. The sentence is a
+--- Request 3 ---
+### Instruction:Explain KV cache in one short sentence.### Response:A KV cache is a type of in-memory in-memory in-memory in-memory
+--- Request 4 ---
+### Instruction:Explain paged attention in one short sentence.### Response:Pageddresspageddresspageddresspageddresspageddress
+--- Request 5 ---
+### Instruction:Explain multi-head attention in one short sentence.### Response:Multi-Inghturned by the sentence.
+
+=== Multi Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 3.1566          | 12.8778         |
+Throughput (tok/s)        | 126.72          | 27.80           |
+RAM Increase (MB)         | 61.9            | 8.6             |
+Peak VRAM (MB)            | 2206.6          | 2233.3          |
+Alloc VRAM (MB)           | 2106.3          | 2195.7          |
+Reserved VRAM (MB)        | 2230.0          | 2250.0          |
+Max Reserved VRAM (MB)    | 2230.0          | 2250.0          |
+VRAM/token (KB)           | 5649.01         | 6387.96         |
+Context Switch            | 13              | 65              |
+Used Blocks               | -               | 120             |
+Block Utilization         | -               | 46.69%          |
