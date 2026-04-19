@@ -1,0 +1,35 @@
+🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
+🔥 LlamaModel.forward 위치 = /LimYeonGyeong/project/paged_llama/llama/utils/utils.py
+>>> Multi Request 비교 실행
+>>> Baseline multi 로딩 중...
+>>> Paged multi 로딩 중...
+>>> HF config / state_dict 로딩 중...
+>>> 로컬 paged 모델 생성 중...
+[LOAD] missing keys: 0
+[LOAD] unexpected keys: 0
+>>> 로컬 paged 모델 GPU 이동 중...
+[OUTPUT] Multi Request Generation Results (first 5 only)
+--- Request 1 ---
+### Instruction:Explain LLM in one short sentence.### Response:Lexical Linguistic Markup (LLM) is a machine learning technique that uses natural
+--- Request 2 ---
+### Instruction:Explain transformer attention in one short sentence.### Response:Transformer attention is a mechanism used in neural machine translation (NMT) to model the dependencies between
+--- Request 3 ---
+### Instruction:Explain KV cache in one short sentence.### Response:A key-value (KV) cache is a data structure that stores key-value pairs in
+--- Request 4 ---
+### Instruction:Explain paged attention in one short sentence.### Response:Paged attention is a technique used in machine learning that involves dividing a large dataset into smaller,
+--- Request 5 ---
+### Instruction:Explain multi-head attention in one short sentence.### Response:Multi-head attention is a mechanism used in neural networks to improve the performance of neural networks by allowing
+
+=== Multi Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 3.2819          | 37.7477         |
+Throughput (tok/s)        | 121.88          | 10.60           |
+RAM Increase (MB)         | 177.4           | 10.1            |
+Peak VRAM (MB)            | 2206.6          | 2148.3          |
+Alloc VRAM (MB)           | 2106.3          | 2138.7          |
+Reserved VRAM (MB)        | 2230.0          | 2170.0          |
+Max Reserved VRAM (MB)    | 2230.0          | 2170.0          |
+VRAM/token (KB)           | 5649.01         | 5499.56         |
+Context Switch            | 15              | 229             |
+Used Blocks               | -               | 90              |
+Block Utilization         | -               | 95.74%          |
