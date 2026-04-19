@@ -456,6 +456,7 @@ class LlamaAttention(nn.Module):
 
 # 기존 modeling_llama.py 상단에 있는 함수들을 활용합니다.
 # (apply_rotary_pos_emb, repeat_kv 등은 이미 파일에 있다고 가정)
+
 class PagedLlamaAttention(nn.Module):
     def __init__(self, config, layer_idx=0, page_pool=None):
         super().__init__()
@@ -477,6 +478,61 @@ class PagedLlamaAttention(nn.Module):
         self.debug = False
         self.debug_verbose = False
         self.debug_stop_on_nonfinite = True
+
+    def _resolve_block_tables(self, block_table, bsz, device):
+        target_block_table = block_table
+        if target_block_table is None:
+            target_block_table = getattr(self, "block_table", None)
+
+        if target_block_table is None:
+            raise ValueError(f"Layer {self.layer_idx} | block_table is None")
+
+        if isinstance(target_block_table, (list, tuple)):
+            if len(target_block_table) != bsz:
+                raise ValueError(
+                    f"Layer {self.layer_idx} | expected {bsz} block tables, got {len(target_block_table)}"
+                )
+            out = []
+            for bt in target_block_table:
+                if hasattr(bt, "to_tensor"):
+                    out.append(bt.to_tensor(device=device)[0])
+                else:
+                    t = bt.to(device=device)
+                    out.append(t[0] if t.dim() == 2 else t)
+            return out
+
+        if hasattr(target_block_table, "to_tensor"):
+            row = target_block_table.to_tensor(device=device)[0]
+        else:
+            t = target_block_table.to(device=device)
+            row = t[0] if t.dim() == 2 else t
+
+        return [row for _ in range(bsz)]
+
+    def _resolve_start_positions(self, cache_position, position_ids, bsz, device):
+        if cache_position is not None and cache_position.numel() > 0:
+            if cache_position.dim() == 2:
+                if cache_position.size(0) != bsz:
+                    raise ValueError(
+                        f"Layer {self.layer_idx} | cache_position batch mismatch: "
+                        f"{cache_position.size(0)} vs {bsz}"
+                    )
+                return cache_position[:, 0].to(device=device, dtype=torch.long)
+            start_pos = int(cache_position.reshape(-1)[0].item())
+            return torch.full((bsz,), start_pos, device=device, dtype=torch.long)
+
+        if position_ids is not None and position_ids.numel() > 0:
+            if position_ids.dim() == 2:
+                if position_ids.size(0) != bsz:
+                    raise ValueError(
+                        f"Layer {self.layer_idx} | position_ids batch mismatch: "
+                        f"{position_ids.size(0)} vs {bsz}"
+                    )
+                return position_ids[:, 0].to(device=device, dtype=torch.long)
+            start_pos = int(position_ids.reshape(-1)[0].item())
+            return torch.full((bsz,), start_pos, device=device, dtype=torch.long)
+
+        return torch.zeros((bsz,), device=device, dtype=torch.long)
 
     def forward(
         self,
@@ -505,17 +561,7 @@ class PagedLlamaAttention(nn.Module):
             raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
 
         # 3. block table 확보
-        target_block_table = block_table
-        if target_block_table is None:
-            target_block_table = getattr(self, "block_table", None)
-
-        if target_block_table is None:
-            raise ValueError(f"Layer {self.layer_idx} | block_table is None")
-
-        if hasattr(target_block_table, "to_tensor"):
-            block_table_tensor = target_block_table.to_tensor(device=target_device)
-        else:
-            block_table_tensor = target_block_table.to(device=target_device)
+        block_table_rows = self._resolve_block_tables(block_table, bsz, target_device)
 
         # 4. q, k, v projection
         query_states = self.q_proj(hidden_states).view(
@@ -568,216 +614,94 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
 
         # 6. 현재 step 위치 정보
-        if cache_position is not None and cache_position.numel() > 0:
-            start_pos = int(cache_position.reshape(-1)[0].item())
-        elif position_ids is not None:
-            start_pos = int(position_ids.reshape(-1)[0].item())
-        else:
-            start_pos = 0
-
-        total_seq_len = start_pos + q_len
-        num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
+        start_pos_vec = self._resolve_start_positions(cache_position, position_ids, bsz, target_device)
 
         if self.debug and self.layer_idx == 0:
-            print(f"\n[POS][Layer {self.layer_idx}] ====================")
+            print(f"
+[POS][Layer {self.layer_idx}] ====================")
             print(f"[POS] q_len={q_len}")
-            print(f"[POS] start_pos={start_pos}")
-            print(f"[POS] total_seq_len={total_seq_len}")
+            print(f"[POS] start_pos={start_pos_vec.detach().cpu().tolist()}")
 
-            if cache_position is not None:
-                print(f"[POS] cache_position={cache_position.detach().cpu().tolist()}")
+        row_outputs = []
 
-            if position_ids is not None:
-                print(f"[POS] position_ids={position_ids.detach().cpu().tolist()}")
+        # 7~13. row-wise WRITE / READ / attention
+        for b in range(bsz):
+            start_pos = int(start_pos_vec[b].item())
+            total_seq_len = start_pos + q_len
+            num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
 
-            if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
-                print(f"[POS] past_seq_len={past_key_values.get_seq_length()}")
-
-        # 7. WRITE
-        abs_pos = torch.arange(
-            start_pos,
-            start_pos + q_len,
-            device=target_device,
-            dtype=torch.long,
-        )
-        block_idx_logic = abs_pos // pool.block_size
-        block_offset = abs_pos % pool.block_size
-
-        if torch.any(block_idx_logic >= block_table_tensor.size(1)):
-            bad_block_idx = int(block_idx_logic.max().item())
-            raise IndexError(
-                f"Layer {self.layer_idx} | block_idx_logic {bad_block_idx} "
-                f"out of range (size {block_table_tensor.size(1)})"
-            )
-
-        physical_block_idx = block_table_tensor[0, block_idx_logic]
-
-        if self.debug and self.layer_idx == 0:
-            if q_len > 0:
-                print(
-                    f"[VERIFY-WRITE] Layer {self.layer_idx} | "
-                    f"Pos {int(abs_pos[0].item())} (Logic {int(block_idx_logic[0].item())}) -> "
-                    f"Physical {int(physical_block_idx[0].item())}"
+            block_row = block_table_rows[b]
+            if num_needed_blocks > block_row.numel():
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} | Block table size too small for batch row {b}! "
+                    f"Need {num_needed_blocks} blocks but only have {block_row.numel()}"
                 )
 
-        k_src = key_states[0].permute(1, 0, 2).contiguous()
-        v_src = value_states[0].permute(1, 0, 2).contiguous()
-
-        pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
-        pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
-
-        if self.debug and self.layer_idx == 0 and q_len > 0:
-            last_abs_pos = int(abs_pos[-1].item())
-            last_logic_block = int(block_idx_logic[-1].item())
-            last_physical_block = int(physical_block_idx[-1].item())
-            last_offset = int(block_offset[-1].item())
-
-            written_k_dbg = pool.k_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-            written_v_dbg = pool.v_cache[self.layer_idx, last_physical_block, :, last_offset, :]
-
-            src_k_dbg = key_states[0, :, -1, :]
-            src_v_dbg = value_states[0, :, -1, :]
-
-            write_k_diff_dbg = (written_k_dbg.float() - src_k_dbg.float()).abs().max().item()
-            write_v_diff_dbg = (written_v_dbg.float() - src_v_dbg.float()).abs().max().item()
-
-            print(f"[WRITE][Layer {self.layer_idx}] abs_pos={last_abs_pos} "
-                  f"logic_block={last_logic_block} physical_block={last_physical_block} offset={last_offset}")
-            print(f"[WRITE] k_diff={write_k_diff_dbg:.10f} v_diff={write_v_diff_dbg:.10f}")
-
-        # 8. block table 크기 확인
-        if num_needed_blocks > block_table_tensor.size(1):
-            raise RuntimeError(
-                f"Layer {self.layer_idx} | Block table size too small! "
-                f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
+            abs_pos = torch.arange(
+                start_pos,
+                start_pos + q_len,
+                device=target_device,
+                dtype=torch.long,
             )
+            block_idx_logic = abs_pos // pool.block_size
+            block_offset = abs_pos % pool.block_size
 
-        # 9. READ 준비
-        active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
+            physical_block_idx = block_row[block_idx_logic]
 
-        layer_k_cache = pool.k_cache[self.layer_idx]
-        layer_v_cache = pool.v_cache[self.layer_idx]
+            k_src = key_states[b].permute(1, 0, 2).contiguous()
+            v_src = value_states[b].permute(1, 0, 2).contiguous()
 
-        k_blocks = layer_k_cache.index_select(0, active_indices)
-        v_blocks = layer_v_cache.index_select(0, active_indices)
+            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
+            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
 
-        # 10. flatten
-        k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
-        v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+            active_indices = block_row[:num_needed_blocks].to(target_device)
 
-        # repeat 전 상태 보관 (검증용)
-        full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
-        full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
+            layer_k_cache = pool.k_cache[self.layer_idx]
+            layer_v_cache = pool.v_cache[self.layer_idx]
 
-        # 11. WRITE vs READ 직접 비교
-        if self.debug and self.layer_idx == 0:
-            check_pos = total_seq_len - 1
-            check_logic_block = check_pos // pool.block_size
-            check_offset = check_pos % pool.block_size
-            check_physical_block = block_table_tensor[0, check_logic_block].item()
+            k_blocks = layer_k_cache.index_select(0, active_indices)
+            v_blocks = layer_v_cache.index_select(0, active_indices)
 
-            written_k = pool.k_cache[self.layer_idx, check_physical_block, :, check_offset, :]
-            written_v = pool.v_cache[self.layer_idx, check_physical_block, :, check_offset, :]
+            k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
+            v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
 
-            read_k = full_key_states_before_repeat[0, :, check_pos, :]
-            read_v = full_value_states_before_repeat[0, :, check_pos, :]
+            full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
+            full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
 
-            k_diff = (written_k.float() - read_k.float()).abs().max().item()
-            v_diff = (written_v.float() - read_v.float()).abs().max().item()
+            full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
+            full_value_states = full_value_states_before_repeat.to(dtype=query_states.dtype)
 
-            print(f"[READ][Layer {self.layer_idx}] ====================")
-            print(f"[READ] check_pos={check_pos}")
-            print(f"[READ] logic_block={check_logic_block}")
-            print(f"[READ] physical_block={check_physical_block}")
-            print(f"[READ] offset={check_offset}")
-            print(f"[READ] k_diff={k_diff:.10f}")
-            print(f"[READ] v_diff={v_diff:.10f}")
+            full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
+            full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-        if self.debug_verbose:
-            _tensor_debug("k_flat", k_flat, self.layer_idx)
-            _tensor_debug("v_flat", v_flat, self.layer_idx)
+            q_for_scores = query_states[b : b + 1].float()
+            k_for_scores = full_key_states.float()
+            v_for_attn = full_value_states.float()
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("k_flat", k_flat, self.layer_idx)
-            _assert_no_posinf("k_flat", k_flat, self.layer_idx)
-            _assert_no_nan("v_flat", v_flat, self.layer_idx)
-            _assert_no_posinf("v_flat", v_flat, self.layer_idx)
+            attn_weights = torch.matmul(
+                q_for_scores, k_for_scores.transpose(2, 3)
+            )
+            attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
-        # 12. GQA 확장
-        full_key_states = full_key_states_before_repeat.to(dtype=query_states.dtype)
-        full_value_states = full_value_states_before_repeat.to(dtype=query_states.dtype)
-
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
-
-        full_key_states = full_key_states.to(dtype=query_states.dtype)
-        full_value_states = full_value_states.to(dtype=query_states.dtype)
-
-        # 13. attention
-        q_for_scores = query_states.float()
-        k_for_scores = full_key_states.float()
-        v_for_attn = full_value_states.float()
-
-        if self.debug and self.layer_idx == 0:
-            print(f"[ATTN][Layer {self.layer_idx}] q_len={q_len} total_seq_len={total_seq_len}")
-
-        if self.debug_verbose:
-            _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
-            _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
-
-        attn_weights = torch.matmul(
-            q_for_scores, k_for_scores.transpose(2, 3)
-        )
-        attn_weights *= (1.0 / math.sqrt(self.head_dim))
-
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
-
-        row_pos = start_pos + torch.arange(q_len, device=target_device).unsqueeze(1)
-        col_pos = torch.arange(total_seq_len, device=target_device).unsqueeze(0)
-        causal_mask = torch.where(
-            col_pos <= row_pos,
-            torch.tensor(0.0, device=target_device, dtype=torch.float32),
-            torch.tensor(float("-inf"), device=target_device, dtype=torch.float32),
-        ).unsqueeze(0).unsqueeze(0)
-        attn_weights = attn_weights + causal_mask
-
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
-
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
-
-        attn_output = torch.matmul(attn_weights, v_for_attn)
-
-        if self.debug_verbose:
-            _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
-            _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
-
-        attn_output = attn_output.to(query_states.dtype)
+            row_pos = start_pos + torch.arange(q_len, device=target_device).unsqueeze(1)
+            col_pos = torch.arange(total_seq_len, device=target_device).unsqueeze(0)
+            causal_mask = torch.where(
+                col_pos <= row_pos,
+                torch.tensor(0.0, device=target_device, dtype=torch.float32),
+                torch.tensor(float("-inf"), device=target_device, dtype=torch.float32),
+            ).unsqueeze(0).unsqueeze(0)
+            attn_weights = attn_weights + causal_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v_for_attn)
+            row_outputs.append(attn_output.to(query_states.dtype))
 
         # 14. output
+        attn_output = torch.cat(row_outputs, dim=0)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
@@ -887,13 +811,22 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
+        request_states = getattr(self, "active_request_states", None)
+        single_request_state = getattr(self, "active_request_state", None)
+
         if use_cache:
             if past_key_values is None:
+                cache_request_state = None
+                if isinstance(request_states, (list, tuple)) and len(request_states) > 0:
+                    cache_request_state = request_states[0]
+                else:
+                    cache_request_state = single_request_state
+
                 past_key_values = PagedCacheShim(
                     config=self.config,
                     page_pool=self.page_pool,
                     block_table=self.block_table,
-                    request_state=getattr(self, "active_request_state", None),
+                    request_state=cache_request_state,
                 )
             elif not isinstance(past_key_values, PagedCacheShim):
                 raise RuntimeError(
@@ -901,15 +834,26 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position: torch.Tensor = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
+            if isinstance(request_states, (list, tuple)) and len(request_states) == inputs_embeds.shape[0]:
+                base_positions = [int(rs.get("seq_len", 0)) for rs in request_states]
+                step_offsets = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
+                cache_position = (
+                    torch.tensor(base_positions, device=inputs_embeds.device, dtype=torch.long).unsqueeze(1)
+                    + step_offsets.unsqueeze(0)
+                )
+            else:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position = torch.arange(
+                    past_seen_tokens,
+                    past_seen_tokens + inputs_embeds.shape[1],
+                    device=inputs_embeds.device,
+                )
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            if cache_position.dim() == 2:
+                position_ids = cache_position
+            else:
+                position_ids = cache_position.unsqueeze(0)
 
         causal_mask = create_causal_mask(
             config=self.config,
@@ -938,12 +882,24 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         if use_cache and isinstance(past_key_values, PagedCacheShim):
-            new_seen_tokens = int(cache_position[-1].item()) + 1
+            if cache_position.dim() == 2:
+                row_new_seen_tokens = (cache_position[:, -1] + 1).detach().cpu().tolist()
 
-            past_key_values.update_seen_tokens(new_seen_tokens)
+                if isinstance(request_states, (list, tuple)) and len(request_states) == len(row_new_seen_tokens):
+                    for rs, new_seen_tokens in zip(request_states, row_new_seen_tokens):
+                        rs["seq_len"] = int(new_seen_tokens)
+                    past_key_values.seen_tokens = int(max(row_new_seen_tokens)) if len(row_new_seen_tokens) > 0 else 0
+                else:
+                    new_seen_tokens = int(row_new_seen_tokens[0]) if len(row_new_seen_tokens) > 0 else 0
+                    past_key_values.update_seen_tokens(new_seen_tokens)
+                    if single_request_state is not None:
+                        single_request_state["seq_len"] = new_seen_tokens
+            else:
+                new_seen_tokens = int(cache_position[-1].item()) + 1
+                past_key_values.update_seen_tokens(new_seen_tokens)
 
-            if getattr(self, "active_request_state", None) is not None:
-                self.active_request_state["seq_len"] = new_seen_tokens
+                if single_request_state is not None:
+                    single_request_state["seq_len"] = new_seen_tokens
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
