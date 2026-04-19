@@ -627,46 +627,59 @@ class PagedLlamaAttention(nn.Module):
         # 6. 현재 step 위치 정보
         if cache_position is not None:
             if cache_position.dim() == 2:
-                start_pos_list = [int(cache_position[row, 0].item()) for row in range(bsz)]
+                start_pos_tensor = cache_position[:, 0].to(device=target_device, dtype=torch.long)
             else:
-                cp_flat = cache_position.reshape(-1)
+                cp_flat = cache_position.reshape(-1).to(device=target_device, dtype=torch.long)
                 if cp_flat.numel() == bsz:
-                    start_pos_list = [int(cp_flat[row].item()) for row in range(bsz)]
+                    start_pos_tensor = cp_flat
                 else:
-                    start_pos_list = [int(cp_flat[0].item()) for _ in range(bsz)]
+                    start_pos_tensor = cp_flat[0].repeat(bsz)
         elif position_ids is not None:
             if position_ids.dim() == 2:
-                start_pos_list = [int(position_ids[row, 0].item()) for row in range(bsz)]
+                start_pos_tensor = position_ids[:, 0].to(device=target_device, dtype=torch.long)
             else:
-                pid_flat = position_ids.reshape(-1)
+                pid_flat = position_ids.reshape(-1).to(device=target_device, dtype=torch.long)
                 if pid_flat.numel() == bsz:
-                    start_pos_list = [int(pid_flat[row].item()) for row in range(bsz)]
+                    start_pos_tensor = pid_flat
                 else:
-                    start_pos_list = [int(pid_flat[0].item()) for _ in range(bsz)]
+                    start_pos_tensor = pid_flat[0].repeat(bsz)
         else:
-            start_pos_list = [0 for _ in range(bsz)]
+            start_pos_tensor = torch.zeros((bsz,), device=target_device, dtype=torch.long)
 
-        total_seq_len_list = []
-        num_needed_blocks_list = []
-        for row in range(bsz):
-            total_seq_len = start_pos_list[row] + q_len
-            total_seq_len_list.append(total_seq_len)
-            num_needed_blocks_list.append((total_seq_len + pool.block_size - 1) // pool.block_size)
+        total_seq_len_tensor = start_pos_tensor + q_len
+        total_seq_len_list = total_seq_len_tensor.tolist()
+        max_total_seq_len = int(total_seq_len_tensor.max().item()) if bsz > 0 else q_len
 
-        max_total_seq_len = max(total_seq_len_list) if total_seq_len_list else q_len
-        max_num_needed_blocks = max(num_needed_blocks_list) if num_needed_blocks_list else 1
+        num_needed_blocks_tensor = (total_seq_len_tensor + pool.block_size - 1) // pool.block_size
+        num_needed_blocks_list = num_needed_blocks_tensor.tolist()
+        max_num_needed_blocks = int(num_needed_blocks_tensor.max().item()) if bsz > 0 else 1
 
-        # 7. WRITE
+        # 7. WRITE 준비
+        abs_pos = start_pos_tensor[:, None] + torch.arange(
+            q_len,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]  # [bsz, q_len]
+
+        block_idx_logic = abs_pos // pool.block_size
+        block_offset = abs_pos % pool.block_size
+
         padded_active_indices = torch.zeros(
             (bsz, max_num_needed_blocks),
             dtype=torch.long,
             device=target_device,
         )
 
+        physical_block_idx_per_token = torch.zeros(
+            (bsz, q_len),
+            dtype=torch.long,
+            device=target_device,
+        )
+
         for row in range(bsz):
-            start_pos = start_pos_list[row]
-            total_seq_len = total_seq_len_list[row]
-            num_needed_blocks = num_needed_blocks_list[row]
+            start_pos = int(start_pos_tensor[row].item())
+            total_seq_len = int(total_seq_len_tensor[row].item())
+            num_needed_blocks = int(num_needed_blocks_tensor[row].item())
 
             block_table_tensor = block_table_tensors[row]
 
@@ -676,29 +689,14 @@ class PagedLlamaAttention(nn.Module):
                 print(f"[POS] start_pos={start_pos}")
                 print(f"[POS] total_seq_len={total_seq_len}")
 
-            abs_pos = torch.arange(
-                start_pos,
-                start_pos + q_len,
-                device=target_device,
-                dtype=torch.long,
-            )
-            block_idx_logic = abs_pos // pool.block_size
-            block_offset = abs_pos % pool.block_size
+            row_block_idx_logic = block_idx_logic[row]
 
-            if torch.any(block_idx_logic >= block_table_tensor.size(1)):
-                bad_block_idx = int(block_idx_logic.max().item())
+            if torch.any(row_block_idx_logic >= block_table_tensor.size(1)):
+                bad_block_idx = int(row_block_idx_logic.max().item())
                 raise IndexError(
                     f"Layer {self.layer_idx} | row {row} | block_idx_logic {bad_block_idx} "
                     f"out of range (size {block_table_tensor.size(1)})"
                 )
-
-            physical_block_idx = block_table_tensor[0, block_idx_logic]
-
-            k_src = key_states[row].permute(1, 0, 2).contiguous()
-            v_src = value_states[row].permute(1, 0, 2).contiguous()
-
-            pool.k_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
-            pool.v_cache[self.layer_idx, physical_block_idx, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
 
             if num_needed_blocks > block_table_tensor.size(1):
                 raise RuntimeError(
@@ -711,14 +709,26 @@ class PagedLlamaAttention(nn.Module):
             if num_needed_blocks < max_num_needed_blocks:
                 padded_active_indices[row, num_needed_blocks:] = active_indices[-1]
 
-        # 8. READ를 batch gather로 처리
+            physical_block_idx_per_token[row] = block_table_tensor[0, row_block_idx_logic]
+
+        # 8. WRITE를 batch scatter로 처리
+        batch_idx = torch.arange(bsz, device=target_device, dtype=torch.long)[:, None]
+        token_idx = torch.arange(q_len, device=target_device, dtype=torch.long)[None, :]
+
+        k_src = key_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
+        v_src = value_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
+
+        pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
+        pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
+
+        # 9. READ를 batch gather로 처리
         layer_k_cache = pool.k_cache[self.layer_idx]
         layer_v_cache = pool.v_cache[self.layer_idx]
 
         k_blocks = layer_k_cache[padded_active_indices]  # [bsz, blocks, kv_heads, block_size, head_dim]
         v_blocks = layer_v_cache[padded_active_indices]  # [bsz, blocks, kv_heads, block_size, head_dim]
 
-        # 9. flatten
+        # 10. flatten
         k_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(
             bsz, self.num_key_value_heads, max_num_needed_blocks * pool.block_size, self.head_dim
         )
@@ -739,7 +749,7 @@ class PagedLlamaAttention(nn.Module):
         full_key_states = k_flat[:, :, :max_total_seq_len, :].contiguous()
         full_value_states = v_flat[:, :, :max_total_seq_len, :].contiguous()
 
-        # 10. GQA 복제 없이 grouped attention 계산 준비
+        # 11. GQA 복제 없이 grouped attention 계산 준비
         q_grouped = query_states.view(
             bsz,
             self.num_key_value_heads,
@@ -755,7 +765,7 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("q_grouped", q_grouped, self.layer_idx)
             _tensor_debug("full_key_states", full_key_states, self.layer_idx)
 
-        # 11. attention
+        # 12. attention
         attn_weights = torch.einsum(
             "b g r q d, b g k d -> b g r q k",
             q_grouped,
@@ -769,18 +779,6 @@ class PagedLlamaAttention(nn.Module):
         if self.debug_stop_on_nonfinite:
             _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
             _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
-
-        start_pos_tensor = torch.tensor(
-            start_pos_list,
-            device=target_device,
-            dtype=torch.long,
-        )
-
-        total_seq_len_tensor = torch.tensor(
-            total_seq_len_list,
-            device=target_device,
-            dtype=torch.long,
-        )
 
         q_abs = start_pos_tensor[:, None] + torch.arange(
             q_len,
@@ -839,7 +837,7 @@ class PagedLlamaAttention(nn.Module):
             self.head_dim,
         ).to(query_states.dtype)
 
-        # 12. output
+        # 13. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
