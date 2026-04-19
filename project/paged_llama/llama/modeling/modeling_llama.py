@@ -544,6 +544,7 @@ class PagedLlamaAttention(nn.Module):
 
         return [single for _ in range(bsz)]
 
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -651,12 +652,12 @@ class PagedLlamaAttention(nn.Module):
 
         max_total_seq_len = max(total_seq_len_list) if total_seq_len_list else q_len
 
-        full_key_states_before_repeat = torch.zeros(
+        full_key_states = torch.zeros(
             (bsz, self.num_key_value_heads, max_total_seq_len, self.head_dim),
             dtype=key_states.dtype,
             device=target_device,
         )
-        full_value_states_before_repeat = torch.zeros(
+        full_value_states = torch.zeros(
             (bsz, self.num_key_value_heads, max_total_seq_len, self.head_dim),
             dtype=value_states.dtype,
             device=target_device,
@@ -730,31 +731,31 @@ class PagedLlamaAttention(nn.Module):
                 _assert_no_nan("v_flat", v_flat, self.layer_idx)
                 _assert_no_posinf("v_flat", v_flat, self.layer_idx)
 
-            # repeat 전 상태 보관
-            full_key_states_before_repeat[row, :, :total_seq_len, :] = k_flat[:, :total_seq_len, :]
-            full_value_states_before_repeat[row, :, :total_seq_len, :] = v_flat[:, :total_seq_len, :]
+            # 현재 row의 KV 상태를 배치 텐서에 채운다.
+            full_key_states[row, :, :total_seq_len, :] = k_flat[:, :total_seq_len, :]
+            full_value_states[row, :, :total_seq_len, :] = v_flat[:, :total_seq_len, :]
 
-        # 11. GQA 확장
-        full_key_states = repeat_kv(full_key_states_before_repeat, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states_before_repeat, self.num_key_value_groups)
-
-        full_key_states = full_key_states.to(dtype=query_states.dtype)
-        full_value_states = full_value_states.to(dtype=query_states.dtype)
-
-        # 12. attention
-        q_for_scores = query_states
-        k_for_scores = full_key_states
-        v_for_attn = full_value_states
+        # 11. GQA 복제 없이 grouped attention 계산 준비
+        q_grouped = query_states.view(
+            bsz,
+            self.num_key_value_heads,
+            self.num_key_value_groups,
+            q_len,
+            self.head_dim,
+        )
 
         if self.debug and self.layer_idx == 0:
             print(f"[ATTN][Layer {self.layer_idx}] q_len={q_len} max_total_seq_len={max_total_seq_len}")
 
         if self.debug_verbose:
-            _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
-            _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
+            _tensor_debug("q_grouped", q_grouped, self.layer_idx)
+            _tensor_debug("full_key_states", full_key_states, self.layer_idx)
 
-        attn_weights = torch.matmul(
-            q_for_scores, k_for_scores.transpose(2, 3)
+        # 12. attention
+        attn_weights = torch.einsum(
+            "b g r q d, b g k d -> b g r q k",
+            q_grouped,
+            full_key_states,
         )
         attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
@@ -770,7 +771,7 @@ class PagedLlamaAttention(nn.Module):
             total_seq_len = total_seq_len_list[row]
 
             if total_seq_len < max_total_seq_len:
-                attn_weights[row, :, :, total_seq_len:] = float("-inf")
+                attn_weights[row, :, :, :, total_seq_len:] = float("-inf")
 
             future_mask = torch.triu(
                 torch.full(
@@ -781,8 +782,9 @@ class PagedLlamaAttention(nn.Module):
                 ),
                 diagonal=start_pos + 1,
             )
-            attn_weights[row, :, :, :total_seq_len] = (
-                attn_weights[row, :, :, :total_seq_len] + future_mask.unsqueeze(0)
+
+            attn_weights[row, :, :, :, :total_seq_len] = (
+                attn_weights[row, :, :, :, :total_seq_len] + future_mask.unsqueeze(0).unsqueeze(0)
             )
 
         if self.debug_verbose:
@@ -792,7 +794,7 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
             _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
 
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_for_scores.dtype)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_grouped.dtype)
 
         if self.debug_verbose:
             _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
@@ -801,7 +803,11 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
             _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
-        attn_output = torch.matmul(attn_weights, v_for_attn)
+        attn_output = torch.einsum(
+            "b g r q k, b g k d -> b g r q d",
+            attn_weights,
+            full_value_states,
+        )
 
         if self.debug_verbose:
             _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
@@ -810,14 +816,19 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
             _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
 
-        attn_output = attn_output.to(query_states.dtype)
+        attn_output = attn_output.reshape(
+            bsz,
+            self.num_heads,
+            q_len,
+            self.head_dim,
+        ).to(query_states.dtype)
 
         # 13. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
-    
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
