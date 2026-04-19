@@ -8,13 +8,28 @@
 [LOAD] missing keys: 0
 [LOAD] unexpected keys: 0
 >>> 로컬 paged 모델 GPU 이동 중...
-Traceback (most recent call last):
-  File "/LimYeonGyeong/project/multi_run.py", line 482, in <module>
-    multi_only_main()
-  File "/LimYeonGyeong/project/multi_run.py", line 464, in multi_only_main
-    stats_paged_multi = measure_paged_multi(
-  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 116, in decorate_context
-    return func(*args, **kwargs)
-  File "/LimYeonGyeong/project/multi_run.py", line 230, in measure_paged_multi
-    process = psutil.Process(os.getpid())
-NameError: name 'psutil' is not defined
+[OUTPUT] Multi Request Generation Results (first 5 only)
+--- Request 1 ---
+### Instruction:Explain LLM in one short sentence.### Response:Lexical Linguistic Markup (LLM) is a machine learning technique that uses natural
+--- Request 2 ---
+### Instruction:Explain transformer attention in one short sentence.### Response:Transformer attention is a mechanism used in neural machine translation (NMT) to model the dependencies between
+--- Request 3 ---
+### Instruction:Explain KV cache in one short sentence.### Response:A key-value (KV) cache is a data structure that stores key-value pairs in
+--- Request 4 ---
+### Instruction:Explain paged attention in one short sentence.### Response:Paged attention is a technique used in machine learning that involves dividing a large dataset into smaller,
+--- Request 5 ---
+### Instruction:Explain multi-head attention in one short sentence.### Response:Multi-head attention is a mechanism used in neural networks to improve the performance of neural networks by allowing
+
+=== Multi Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 3.2609          | 37.4037         |
+Throughput (tok/s)        | 122.67          | 10.69           |
+RAM Increase (MB)         | 161.6           | 10.1            |
+Peak VRAM (MB)            | 2206.6          | 2148.0          |
+Alloc VRAM (MB)           | 2106.3          | 2138.7          |
+Reserved VRAM (MB)        | 2230.0          | 2170.0          |
+Max Reserved VRAM (MB)    | 2230.0          | 2170.0          |
+VRAM/token (KB)           | 5649.01         | 5498.84         |
+Context Switch            | 12              | 224             |
+Used Blocks               | -               | 90              |
+Block Utilization         | -               | 95.74%          |

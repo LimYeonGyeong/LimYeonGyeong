@@ -3,7 +3,10 @@ import gc
 import sys
 import torch
 import builtins
+import psutil
+import time
 from contextlib import contextmanager
+
 
 sys.path.append("/LimYeonGyeong/project")
 
@@ -54,6 +57,16 @@ DEBUG_PREFIXES_TO_SUPPRESS = (
     "[DBG]",
 )
 
+def build_decode_positions(model):
+    request_state = getattr(model.model, "active_request_state", None)
+    if request_state is None:
+        raise RuntimeError("[POSITION ERROR] active_request_state is None")
+
+    current_pos = int(request_state["seq_len"])
+    cache_position = torch.tensor([current_pos], device=model.device, dtype=torch.long)
+    position_ids = cache_position.unsqueeze(0)
+
+    return cache_position, position_ids
 
 @contextmanager
 def suppress_debug_prints(enabled: bool = True):
