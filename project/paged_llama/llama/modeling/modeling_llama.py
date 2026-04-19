@@ -628,28 +628,23 @@ class PagedLlamaAttention(nn.Module):
             if cache_position.dim() == 2:
                 start_pos_list = [int(cache_position[row, 0].item()) for row in range(bsz)]
             else:
-                cp_flat = cache_position.reshape(-1)
-                if cp_flat.numel() == bsz:
-                    start_pos_list = [int(cp_flat[row].item()) for row in range(bsz)]
-                else:
-                    start_pos_list = [int(cp_flat[0].item()) for _ in range(bsz)]
+                start_pos_list = [int(cache_position.reshape(-1)[0].item()) for _ in range(bsz)]
         elif position_ids is not None:
             if position_ids.dim() == 2:
                 start_pos_list = [int(position_ids[row, 0].item()) for row in range(bsz)]
             else:
-                pid_flat = position_ids.reshape(-1)
-                if pid_flat.numel() == bsz:
-                    start_pos_list = [int(pid_flat[row].item()) for row in range(bsz)]
-                else:
-                    start_pos_list = [int(pid_flat[0].item()) for _ in range(bsz)]
+                start_pos_list = [int(position_ids.reshape(-1)[0].item()) for _ in range(bsz)]
         else:
             start_pos_list = [0 for _ in range(bsz)]
 
-        row_attn_outputs = []
+        full_key_states_before_repeat_list = []
+        full_value_states_before_repeat_list = []
+        total_seq_len_list = []
 
         for row in range(bsz):
             start_pos = start_pos_list[row]
             total_seq_len = start_pos + q_len
+            total_seq_len_list.append(total_seq_len)
             num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
 
             block_table_tensor = block_table_tensors[row]
@@ -705,7 +700,7 @@ class PagedLlamaAttention(nn.Module):
             k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
             v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
 
-            # repeat 전 상태 보관 (검증용)
+            # repeat 전 상태 보관
             full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
             full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
 
@@ -719,86 +714,109 @@ class PagedLlamaAttention(nn.Module):
                 _assert_no_nan("v_flat", v_flat, self.layer_idx)
                 _assert_no_posinf("v_flat", v_flat, self.layer_idx)
 
-            # 11. repeat 후 현재 row에 대해서만 attention 계산
-            full_key_states = repeat_kv(full_key_states_before_repeat, self.num_key_value_groups)
-            full_value_states = repeat_kv(full_value_states_before_repeat, self.num_key_value_groups)
+            full_key_states_before_repeat_list.append(full_key_states_before_repeat)
+            full_value_states_before_repeat_list.append(full_value_states_before_repeat)
 
-            full_key_states = full_key_states.to(dtype=query_states.dtype)
-            full_value_states = full_value_states.to(dtype=query_states.dtype)
+        max_total_seq_len = max(total_seq_len_list) if total_seq_len_list else q_len
+        padded_key_list = []
+        padded_value_list = []
 
-            # 12. attention
-            q_row = query_states[row : row + 1]
-            q_for_scores = q_row.float()
-            k_for_scores = full_key_states.float()
+        for row in range(bsz):
+            k_row = full_key_states_before_repeat_list[row]
+            v_row = full_value_states_before_repeat_list[row]
+            total_seq_len = total_seq_len_list[row]
+            if total_seq_len < max_total_seq_len:
+                pad_len = max_total_seq_len - total_seq_len
+                k_row = torch.nn.functional.pad(k_row, (0, 0, 0, pad_len))
+                v_row = torch.nn.functional.pad(v_row, (0, 0, 0, pad_len))
+            padded_key_list.append(k_row)
+            padded_value_list.append(v_row)
 
-            if self.debug and self.layer_idx == 0:
-                print(f"[ATTN][Layer {self.layer_idx}] row={row} q_len={q_len} total_seq_len={total_seq_len}")
+        full_key_states = torch.cat(padded_key_list, dim=0).to(dtype=query_states.dtype)
+        full_value_states = torch.cat(padded_value_list, dim=0).to(dtype=query_states.dtype)
 
-            if self.debug_verbose:
-                _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
-                _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
+        # 11. GQA 확장
+        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
+        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
 
-            attn_weights = torch.matmul(
-                q_for_scores, k_for_scores.transpose(2, 3)
-            )
-            attn_weights *= (1.0 / math.sqrt(self.head_dim))
+        full_key_states = full_key_states.to(dtype=query_states.dtype)
+        full_value_states = full_value_states.to(dtype=query_states.dtype)
 
-            if self.debug_verbose:
-                _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
+        # 12. attention
+        q_for_scores = query_states
+        k_for_scores = full_key_states
+        v_for_attn = full_value_states
 
-            if self.debug_stop_on_nonfinite:
-                _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
-                _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
+        if self.debug and self.layer_idx == 0:
+            print(f"[ATTN][Layer {self.layer_idx}] q_len={q_len} max_total_seq_len={max_total_seq_len}")
 
+        if self.debug_verbose:
+            _tensor_debug("q_for_scores", q_for_scores, self.layer_idx)
+            _tensor_debug("k_for_scores", k_for_scores, self.layer_idx)
+
+        attn_weights = torch.matmul(
+            q_for_scores, k_for_scores.transpose(2, 3)
+        )
+        attn_weights *= (1.0 / math.sqrt(self.head_dim))
+
+        if self.debug_verbose:
+            _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
+
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
+
+        batch_masks = []
+        for row in range(bsz):
+            start_pos = start_pos_list[row]
+            total_seq_len = total_seq_len_list[row]
             row_pos = start_pos + torch.arange(q_len, device=target_device).unsqueeze(1)
             col_pos = torch.arange(total_seq_len, device=target_device).unsqueeze(0)
-            causal_mask = torch.where(
+            row_mask = torch.where(
                 col_pos <= row_pos,
                 torch.tensor(0.0, device=target_device, dtype=attn_weights.dtype),
                 torch.tensor(float("-inf"), device=target_device, dtype=attn_weights.dtype),
             ).unsqueeze(0).unsqueeze(0)
+            if total_seq_len < max_total_seq_len:
+                pad_len = max_total_seq_len - total_seq_len
+                row_mask = torch.nn.functional.pad(row_mask, (0, pad_len), value=float("-inf"))
+            batch_masks.append(row_mask)
 
-            attn_weights = attn_weights + causal_mask
+        causal_mask = torch.cat(batch_masks, dim=0)
+        attn_weights = attn_weights + causal_mask
 
-            if self.debug_verbose:
-                _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
+        if self.debug_verbose:
+            _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
 
-            if self.debug_stop_on_nonfinite:
-                _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
-                _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
 
-            attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_for_scores.dtype)
 
-            if self.debug_verbose:
-                _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
+        if self.debug_verbose:
+            _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
-            if self.debug_stop_on_nonfinite:
-                _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
-                _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
+            _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
 
-            attn_output_row = torch.matmul(
-                attn_weights.to(full_value_states.dtype),
-                full_value_states,
-            )
+        attn_output = torch.matmul(attn_weights, v_for_attn)
 
-            if self.debug_verbose:
-                _tensor_debug("attn_output(before cast)", attn_output_row, self.layer_idx)
+        if self.debug_verbose:
+            _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
 
-            if self.debug_stop_on_nonfinite:
-                _assert_no_nan("attn_output(before cast)", attn_output_row, self.layer_idx)
-                _assert_no_posinf("attn_output(before cast)", attn_output_row, self.layer_idx)
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
+            _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
 
-            attn_output_row = attn_output_row.to(query_states.dtype)
-            row_attn_outputs.append(attn_output_row)
+        attn_output = attn_output.to(query_states.dtype)
 
-        attn_output = torch.cat(row_attn_outputs, dim=0)
-
-        # 14. output
+        # 13. output
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
-
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
