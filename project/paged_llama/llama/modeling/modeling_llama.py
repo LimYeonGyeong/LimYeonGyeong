@@ -617,8 +617,7 @@ class PagedLlamaAttention(nn.Module):
         start_pos_vec = self._resolve_start_positions(cache_position, position_ids, bsz, target_device)
 
         if self.debug and self.layer_idx == 0:
-            print(f"
-[POS][Layer {self.layer_idx}] ====================")
+            print(f"[POS][Layer {self.layer_idx}] ====================")
             print(f"[POS] q_len={q_len}")
             print(f"[POS] start_pos={start_pos_vec.detach().cpu().tolist()}")
 
