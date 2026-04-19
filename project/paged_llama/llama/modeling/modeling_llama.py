@@ -766,26 +766,38 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
             _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
 
-        for row in range(bsz):
-            start_pos = start_pos_list[row]
-            total_seq_len = total_seq_len_list[row]
+        start_pos_tensor = torch.tensor(
+            start_pos_list,
+            device=target_device,
+            dtype=torch.long,
+        )  # [bsz]
 
-            if total_seq_len < max_total_seq_len:
-                attn_weights[row, :, :, :, total_seq_len:] = float("-inf")
+        total_seq_len_tensor = torch.tensor(
+            total_seq_len_list,
+            device=target_device,
+            dtype=torch.long,
+        )  # [bsz]
 
-            future_mask = torch.triu(
-                torch.full(
-                    (q_len, total_seq_len),
-                    float("-inf"),
-                    dtype=attn_weights.dtype,
-                    device=target_device,
-                ),
-                diagonal=start_pos + 1,
-            )
+        q_abs = start_pos_tensor[:, None] + torch.arange(
+            q_len,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]  # [bsz, q_len]
 
-            attn_weights[row, :, :, :, :total_seq_len] = (
-                attn_weights[row, :, :, :, :total_seq_len] + future_mask.unsqueeze(0).unsqueeze(0)
-            )
+        k_pos = torch.arange(
+            max_total_seq_len,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]  # [1, max_total_seq_len]
+
+        valid_k_mask = k_pos < total_seq_len_tensor[:, None]  # [bsz, max_total_seq_len]
+        causal_keep_mask = k_pos[:, None, :] <= q_abs[:, :, None]  # [bsz, q_len, max_total_seq_len]
+        final_keep_mask = causal_keep_mask & valid_k_mask[:, None, :]  # [bsz, q_len, max_total_seq_len]
+
+        attn_weights = attn_weights.masked_fill(
+            ~final_keep_mask[:, None, None, :, :],
+            float("-inf"),
+        )
 
         if self.debug_verbose:
             _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
