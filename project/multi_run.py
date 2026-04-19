@@ -70,7 +70,7 @@ def suppress_debug_prints(enabled: bool = True):
             return original_print(*args, **kwargs)
 
         text = " ".join(str(a) for a in args)
-        if text.startswith(DEBUG_PREFIXES_TO_SUPPRESS):
+        if text.startswith(DEBUG_PREFIXES_TO_SUPPRESS) or any(pref in text for pref in DEBUG_PREFIXES_TO_SUPPRESS):
             return
         return original_print(*args, **kwargs)
 
@@ -392,6 +392,7 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         "max_reserved_vram": max_reserved_vram,
         "vram_per_token_kb": vram_per_token_kb,
         "context_switch": context_switch,
+        "ctx_switches": context_switch,
         "used_blocks": used_blocks,
         "block_utilization": block_util,
         # 확장/가독성용 별칭 키
