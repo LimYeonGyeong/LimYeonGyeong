@@ -485,7 +485,9 @@ def multi_only_main():
         needed_blocks = (needed_tokens + block_size - 1) // block_size
         all_needed_blocks += needed_blocks
 
-    num_blocks = int(all_needed_blocks * 2.5) + 32
+    # 필요한 블록 수에 작은 여유만 둔다.
+    safety_margin = 4
+    num_blocks = all_needed_blocks + safety_margin
 
     pool = PagePool(
         num_blocks=num_blocks,
@@ -512,30 +514,35 @@ def multi_only_main():
         debug_verbose=False,
     )
 
-    # dummy는 바로 해제
+    # dummy는 바로 반환
     scheduler.release_request("dummy_req")
 
-    pool.k_cache.zero_()
-    pool.v_cache.zero_()
-
-    # measure_paged_multi 내부의 step-by-step print는 성능 측정에 큰 방해가 되므로 막는다.
-    with suppress_debug_prints(enabled=True):
-        stats_paged_multi = measure_paged_multi(
-            model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
-        )
+    stats_paged_multi = measure_paged_multi(
+        model=model_paged,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        scheduler=scheduler,
+        pool=pool,
+        max_new_tokens=max_new_tokens,
+    )
 
     print("[OUTPUT] Multi Request Generation Results (first 5 only)")
     for i, text in enumerate(stats_paged_multi["texts"][:5]):
-        print(f"--- Request {i+1} ---")
-        print(text[:500])
+        print(f"--- Request {i + 1} ---")
+        print(text)
 
-    print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
+    print_stats_table(
+        "Multi Request Result",
+        stats_base_multi,
+        stats_paged_multi,
+    )
 
     del model_paged
+    del pool
+    del scheduler
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
-
-
 if __name__ == "__main__":
+    
     multi_only_main()
