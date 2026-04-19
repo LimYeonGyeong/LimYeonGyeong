@@ -2,10 +2,12 @@ import os
 import gc
 import sys
 import time
-import psutil
+import contextlib
+import io
+from typing import Dict, List
+
 import torch
-import builtins
-from contextlib import contextmanager
+import psutil
 
 sys.path.append("/LimYeonGyeong/project")
 
@@ -32,53 +34,72 @@ MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# 실행 중 너무 많이 찍히는 디버그 출력만 걸러낸다.
-# - measure_paged_multi() 내부의 step-by-step 로그
-# - modeling_llama.py 내부의 잔여 디버그 로그
-# 최종 결과, 로딩 메시지, 성능 표는 그대로 둔다.
-DEBUG_PREFIXES_TO_SUPPRESS = (
-    "[MAIN-PREFILL]",
-    "[MAIN-DECODE STEP",
-    "[CACHE-ID]",
-    "[CACHE-TYPE]",
-    "[CACHE-SEQ]",
-    "[CACHE-POS]",
-    "[CACHE-UPDATE]",
-    "[REQ-STATE]",
-    "[REQ-STATE-ID]",
-    "[POSITION-IDS]",
-    "[CHECK]",
-    "[MODEL-ENTRY]",
-    "[MODEL-EXIT]",
-    "[LM-HEAD-ENTRY]",
-    "[LM-HEAD-EXIT]",
-    "[PagedCacheShim",
-    "[DBG]",
-)
+class _StdoutFilter(io.TextIOBase):
+    """과한 디버그 출력만 걸러내고, 나머지 정상 출력은 유지합니다."""
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self._buffer = ""
+        self._drop_prefixes = (
+            "[MAIN-PREFILL]",
+            "[MAIN-DECODE STEP",
+            "[CACHE-ID]",
+            "[CACHE-TYPE]",
+            "[CACHE-SEQ]",
+            "[REQ-STATE]",
+            "[REQ-STATE-ID]",
+            "[CACHE-POS]",
+            "[POSITION-IDS]",
+            "[CHECK]",
+            "[MODEL-ENTRY]",
+            "[MODEL-EXIT]",
+            "[LM-HEAD-ENTRY]",
+            "[LM-HEAD-EXIT]",
+            "[CACHE-UPDATE]",
+            "[PagedCacheShim",
+            "[VERIFY-WRITE]",
+            "[WRITE][Layer",
+            "[WRITE] k_diff=",
+            "[READ][Layer",
+            "[READ] check_pos=",
+            "[READ] logic_block=",
+            "[READ] physical_block=",
+            "[READ] offset=",
+            "[READ] k_diff=",
+            "[READ] v_diff=",
+            "[POS][Layer",
+            "[POS] ",
+            "[ATTN][Layer",
+            "[DBG]",
+            "[DBG][Layer",
+        )
+
+    def write(self, s):
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if not line.startswith(self._drop_prefixes):
+                self.wrapped.write(line + "\n")
+        return len(s)
+
+    def flush(self):
+        if self._buffer and not self._buffer.startswith(self._drop_prefixes):
+            self.wrapped.write(self._buffer)
+        self._buffer = ""
+        self.wrapped.flush()
 
 
-@contextmanager
-def suppress_debug_prints(enabled: bool = True):
-    if not enabled:
-        yield
-        return
+@contextlib.contextmanager
 
-    original_print = builtins.print
-
-    def filtered_print(*args, **kwargs):
-        if not args:
-            return original_print(*args, **kwargs)
-
-        text = " ".join(str(a) for a in args)
-        if text.startswith(DEBUG_PREFIXES_TO_SUPPRESS) or any(pref in text for pref in DEBUG_PREFIXES_TO_SUPPRESS):
-            return
-        return original_print(*args, **kwargs)
-
-    builtins.print = filtered_print
+def filtered_stdout():
+    old_stdout = sys.stdout
+    filt = _StdoutFilter(old_stdout)
+    sys.stdout = filt
     try:
         yield
     finally:
-        builtins.print = original_print
+        filt.flush()
+        sys.stdout = old_stdout
 
 
 def build_local_config_from_hf(hf_config):
@@ -217,153 +238,93 @@ def build_mixed_prompts(n_requests: int = 20):
     return prompts
 
 
-def _get_ram_mb() -> float:
-    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+def _ctx_switch_count() -> int:
+    ctx = psutil.Process().num_ctx_switches()
+    return int(ctx.voluntary + ctx.involuntary)
 
 
-def _get_ctx_switches() -> int:
-    cs = psutil.Process(os.getpid()).num_ctx_switches()
-    return int(cs.voluntary + cs.involuntary)
+def _set_request_runtime_state(model_paged, block_table, request_state):
+    # model 레벨
+    model_paged.model.block_table = block_table
+    model_paged.model.active_request_state = request_state
+
+    # layer attention 레벨
+    for layer in model_paged.model.layers:
+        layer.self_attn.block_table = block_table
+        layer.self_attn.page_pool = model_paged.model.page_pool
+        layer.self_attn.debug = False
+        layer.self_attn.debug_verbose = False
+        layer.self_attn.debug_stop_on_nonfinite = True
 
 
-def _build_request_entries(tokenizer, prompts, scheduler, max_new_tokens):
-    entries = []
-    for i, prompt in enumerate(prompts):
-        req_id = f"req_{i}"
-        enc = tokenizer(prompt, return_tensors="pt")
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        attention_mask = attention_mask.to(device)
+def measure_paged_multi(
+    model_paged,
+    tokenizer,
+    prompts: List[str],
+    scheduler: SimpleScheduler,
+    pool: PagePool,
+    max_new_tokens: int = 20,
+) -> Dict[str, object]:
+    """
+    correctness 우선 버전:
+    - 요청별 순차 generate 유지
+    - 각 요청마다 scheduler state만 정확히 바꿔가며 실행
+    - main.print_stats_table과 호환되는 키를 모두 반환
+    """
+    model_paged.eval()
+    model_paged.model.page_pool = pool
 
-        prompt_len = input_ids.shape[1]
-        total_tokens = prompt_len + max_new_tokens
-        block_table = scheduler.allocate_for_request(req_id, total_tokens)
-        request_state = scheduler.get_request_state(req_id)
-
-        entries.append(
-            {
-                "req_id": req_id,
-                "prompt": prompt,
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "prompt_len": prompt_len,
-                "block_table": block_table,
-                "request_state": request_state,
-                "past_key_values": None,
-                "generated_token_ids": [],
-                "generated_tokens": 0,
-                "finished": False,
-            }
-        )
-    return entries
-
-
-# -------------------------
-# Step 1 구조 수정:
-# - 기존: request-major loop
-# - 변경: prefill-all -> decode step-major loop
-# 아직 attention 내부는 bsz=1 전제라 진짜 병렬 GPU batch는 아님
-# 하지만 실행 구조를 다음 단계(batch-aware attention)로 옮기기 쉽게 만든다.
-# -------------------------
-@torch.no_grad()
-def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_tokens=20):
-    model.eval()
+    texts: List[str] = []
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
+    gc.collect()
 
-    ram_before = _get_ram_mb()
-    ctx_before = _get_ctx_switches()
-    start_time = time.perf_counter()
+    ram_before = psutil.Process().memory_info().rss / (1024 * 1024)
+    ctx_before = _ctx_switch_count()
+    t0 = time.perf_counter()
 
-    entries = _build_request_entries(
-        tokenizer=tokenizer,
-        prompts=prompts,
-        scheduler=scheduler,
-        max_new_tokens=max_new_tokens,
-    )
+    with torch.inference_mode(), filtered_stdout():
+        for req_idx, prompt in enumerate(prompts):
+            request_id = f"req_{req_idx}"
+            enc = tokenizer(prompt, return_tensors="pt")
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
 
-    # -------------------------
-    # Prefill-all
-    # -------------------------
-    for entry in entries:
-        model.active_request_state = entry["request_state"]
-        model.active_block_table = entry["block_table"]
+            prompt_len = input_ids.shape[1]
+            total_tokens = prompt_len + max_new_tokens
 
-        outputs = model(
-            input_ids=entry["input_ids"],
-            attention_mask=entry["attention_mask"],
-            use_cache=True,
-            past_key_values=None,
-            return_dict=True,
-        )
-        entry["past_key_values"] = outputs.past_key_values
+            block_table = scheduler.allocate_for_request(request_id, total_tokens)
+            request_state = scheduler.get_request_state(request_id)
+            request_state["seq_len"] = 0
 
-    # -------------------------
-    # Decode step-major
-    # -------------------------
-    active_entries = [e for e in entries if not e["finished"]]
+            _set_request_runtime_state(model_paged, block_table, request_state)
 
-    for _step in range(max_new_tokens):
-        if not active_entries:
-            break
-
-        next_active = []
-        for entry in active_entries:
-            model.active_request_state = entry["request_state"]
-            model.active_block_table = entry["block_table"]
-
-            if entry["generated_tokens"] == 0:
-                step_input_ids = entry["input_ids"][:, -1:]
-            else:
-                step_input_ids = torch.tensor(
-                    [[entry["generated_token_ids"][-1]]],
-                    device=device,
-                    dtype=entry["input_ids"].dtype,
+            try:
+                outputs = model_paged.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
                 )
 
-            outputs = model(
-                input_ids=step_input_ids,
-                use_cache=True,
-                past_key_values=entry["past_key_values"],
-                return_dict=True,
-            )
-            entry["past_key_values"] = outputs.past_key_values
+                text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                texts.append(text)
+            finally:
+                scheduler.release_request(request_id)
 
-            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-            next_token = int(next_token_id.item())
-            entry["generated_token_ids"].append(next_token)
-            entry["generated_tokens"] += 1
+    latency = time.perf_counter() - t0
+    ctx_after = _ctx_switch_count()
+    ram_after = psutil.Process().memory_info().rss / (1024 * 1024)
 
-            if next_token == tokenizer.eos_token_id:
-                entry["finished"] = True
-            else:
-                next_active.append(entry)
-
-        active_entries = next_active
-
-    elapsed = time.perf_counter() - start_time
-    ram_after = _get_ram_mb()
-    ctx_after = _get_ctx_switches()
-
-    texts = []
-    total_generated_tokens = 0
-    for entry in entries:
-        total_generated_tokens += len(entry["generated_token_ids"])
-        full_ids = torch.cat(
-            [
-                entry["input_ids"][0].detach().cpu(),
-                torch.tensor(entry["generated_token_ids"], dtype=entry["input_ids"].dtype),
-            ],
-            dim=0,
-        )
-        texts.append(tokenizer.decode(full_ids, skip_special_tokens=True))
-
-    used_blocks = pool.num_blocks - len(pool.free_blocks)
-    block_util = (used_blocks / pool.num_blocks * 100.0) if pool.num_blocks > 0 else 0.0
+    total_generated_tokens = len(prompts) * max_new_tokens
+    throughput = total_generated_tokens / max(latency, 1e-9)
 
     if device == "cuda":
         peak_vram = torch.cuda.max_memory_allocated() / (1024 * 1024)
@@ -373,35 +334,36 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     else:
         peak_vram = alloc_vram = reserved_vram = max_reserved_vram = 0.0
 
-    vram_per_token_kb = 0.0
-    if total_generated_tokens > 0:
-        vram_per_token_kb = (peak_vram * 1024.0) / total_generated_tokens
+    used_blocks = int(pool.num_blocks - len(pool.free_blocks))
+    block_utilization = (used_blocks / max(pool.num_blocks, 1)) * 100.0
+    vram_per_token_kb = (peak_vram * 1024.0) / max(total_generated_tokens, 1)
 
-    ram_increase_mb = max(0.0, ram_after - ram_before)
-    context_switch = max(0, ctx_after - ctx_before)
-
-    return {
+    stats = {
+        # main.print_stats_table 호환 키
+        "latency": float(latency),
+        "throughput": float(throughput),
+        "ram_mb": float(ram_after - ram_before),
+        "peak_vram": float(peak_vram),
+        "alloc_vram": float(alloc_vram),
+        "reserved_vram": float(reserved_vram),
+        "max_reserved_vram": float(max_reserved_vram),
+        "vram_per_token_kb": float(vram_per_token_kb),
+        "ctx_switches": int(ctx_after - ctx_before),
+        "used_blocks": int(used_blocks),
+        "block_utilization": float(block_utilization),
+        # 추가 정보
         "texts": texts,
-        "latency": elapsed,
-        "throughput": (total_generated_tokens / elapsed) if elapsed > 0 else 0.0,
-        # 기존 main.print_stats_table() 호환 키
-        "ram_mb": ram_increase_mb,
-        "peak_vram": peak_vram,
-        "alloc_vram": alloc_vram,
-        "reserved_vram": reserved_vram,
-        "max_reserved_vram": max_reserved_vram,
-        "vram_per_token_kb": vram_per_token_kb,
-        "context_switch": context_switch,
-        "ctx_switches": context_switch,
-        "used_blocks": used_blocks,
-        "block_utilization": block_util,
-        # 확장/가독성용 별칭 키
-        "ram_increase_mb": ram_increase_mb,
-        "peak_vram_mb": peak_vram,
-        "alloc_vram_mb": alloc_vram,
-        "reserved_vram_mb": reserved_vram,
-        "max_reserved_vram_mb": max_reserved_vram,
+        "total_generated_tokens": int(total_generated_tokens),
+        "num_requests": int(len(prompts)),
+        # 보조 호환 키
+        "context_switch": int(ctx_after - ctx_before),
+        "ram_increase_mb": float(ram_after - ram_before),
+        "peak_vram_mb": float(peak_vram),
+        "alloc_vram_mb": float(alloc_vram),
+        "reserved_vram_mb": float(reserved_vram),
+        "max_reserved_vram_mb": float(max_reserved_vram),
     }
+    return stats
 
 
 def multi_only_main():
@@ -491,10 +453,9 @@ def multi_only_main():
     pool.k_cache.zero_()
     pool.v_cache.zero_()
 
-    with suppress_debug_prints(enabled=True):
-        stats_paged_multi = measure_paged_multi(
-            model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
-        )
+    stats_paged_multi = measure_paged_multi(
+        model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
+    )
 
     print("\n[OUTPUT] Multi Request Generation Results (first 5 only)")
     for i, text in enumerate(stats_paged_multi["texts"][:5]):
