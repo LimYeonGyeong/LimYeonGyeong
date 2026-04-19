@@ -154,35 +154,32 @@ def load_paged_model():
 def make_prompt(topic: str, detail_level: str) -> str:
     if detail_level == "short":
         return (
-            "### Instruction:"
-            f"Explain {topic} in one short sentence."
-            "### Response:"
+            "### Instruction:\n"
+            f"Explain {topic} in one short sentence.\n"
+            "### Response:\n"
         )
 
     if detail_level == "medium":
         return (
-            "### Instruction:"
-            f"Explain {topic} clearly for a beginner."
-            "Use 3 to 4 simple sentences and include one example."
-            "### Response:"
+            "### Instruction:\n"
+            f"Explain {topic} clearly for a beginner.\n"
+            "Use 3 to 4 simple sentences and include one example.\n"
+            "### Response:\n"
         )
 
     if detail_level == "long":
         return (
-            "### Instruction:"
-            f"Explain {topic} in detail for a student who is learning LLM systems."
-            "Your answer should include:"
-            "1. a simple definition,"
-            "2. why it matters,"
-            "3. one technical detail,"
-            "4. one practical example,"
-            "5. one limitation."
-            "Write around 8 to 10 sentences."
-            "### Response:"
+            "### Instruction:\n"
+            f"Explain {topic} in detail for a student who is learning LLM systems.\n"
+            "Your answer should include:\n"
+            "1. a simple definition,\n"
+            "2. why it matters,\n"
+            "3. one technical detail,\n"
+            "4. one practical example,\n"
+            "5. one limitation.\n"
+            "Write around 8 to 10 sentences.\n"
+            "### Response:\n"
         )
-
-    raise ValueError(f"Unknown detail_level: {detail_level}")
-
 
 def build_mixed_prompts(n_requests: int = 20):
     topics = [
@@ -319,6 +316,9 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
 
+        # prefill 직후 seq_len 동기화
+        rt["request_state"]["seq_len"] = rt["generated"].shape[1]
+
         if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
             rt["finished"] = True
 
@@ -335,7 +335,9 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             [rt["generated"][:, -1:] for rt in active_rts],
             dim=0,
         )  # [batch, 1]
-
+        for rt in active_rts:
+            rt["request_state"]["seq_len"] = rt["generated"].shape[1] - 1
+        
         batch_cache_position = torch.tensor(
             [int(rt["request_state"]["seq_len"]) for rt in active_rts],
             device=model.device,
