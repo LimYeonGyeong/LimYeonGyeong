@@ -1,0 +1,60 @@
+🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
+🔥 LlamaModel.forward 위치 = /LimYeonGyeong/project/paged_llama/llama/utils/utils.py
+>>> Multi Request 비교 실행
+>>> Baseline multi 로딩 중...
+>>> Paged multi 로딩 중...
+>>> HF config / state_dict 로딩 중...
+>>> 로컬 paged 모델 생성 중...
+[LOAD] missing keys: 0
+[LOAD] unexpected keys: 0
+>>> 로컬 paged 모델 GPU 이동 중...
+
+[OUTPUT] Multi Request Generation Results (first 5 only)
+
+--- Request 1 ---
+### Instruction:
+Explain LLM in one short sentence.
+### Response:
+yaringyaringyaringyyyyyyyAyAyAyA
+
+--- Request 2 ---
+### Instruction:
+Explain transformer attention in one short sentence.
+### Response:
+Aaring
+AyaringyaringyyyyyAyAyAyA
+
+--- Request 3 ---
+### Instruction:
+Explain KV cache in one short sentence.
+### Response:
+Aaring
+AyaringyaringyyyyyAyAyAyA
+
+--- Request 4 ---
+### Instruction:
+Explain paged attention in one short sentence.
+### Response:
+Aaring
+AyaringyaringyyyyyAyAyAyA
+
+--- Request 5 ---
+### Instruction:
+Explain multi-head attention in one short sentence.
+### Response:
+Ay
+AyaringyaringyyyAyAyAyAyA
+
+=== Multi Request Result ===
+Metric                    | nomal           | Paged           |
+Latency (sec)             | 3.2794          | 49.7860         |
+Throughput (tok/s)        | 121.97          | 8.03            |
+RAM Increase (MB)         | 62.0            | 10.9            |
+Peak VRAM (MB)            | 2220.6          | 2152.2          |
+Alloc VRAM (MB)           | 2106.3          | 2141.5          |
+Reserved VRAM (MB)        | 2258.0          | 2172.0          |
+Max Reserved VRAM (MB)    | 2258.0          | 2172.0          |
+VRAM/token (KB)           | 5684.72         | 5509.60         |
+Context Switch            | 15              | 297             |
+Used Blocks               | -               | 102             |
+Block Utilization         | -               | 10000.00%       |
