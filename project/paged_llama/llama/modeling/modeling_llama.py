@@ -593,6 +593,35 @@ class PagedLlamaAttention(nn.Module):
             if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
                 print(f"[POS] past_seq_len={past_key_values.get_seq_length()}")
 
+        # 6-1. 필요한 경우 block table 자동 확장
+        current_num_blocks = block_table_tensor.size(1)
+        if num_needed_blocks > current_num_blocks:
+            grow_by = num_needed_blocks - current_num_blocks
+
+            if not hasattr(target_block_table, "add_block"):
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} | Block table cannot grow dynamically: {type(target_block_table)}"
+                )
+
+            for _ in range(grow_by):
+                new_physical_block = pool.allocate()
+                target_block_table.add_block(new_physical_block)
+
+            block_table_tensor = target_block_table.to_tensor(device=target_device)
+
+            if self.debug and self.layer_idx == 0:
+                print(
+                    f"[BLOCK-GROW] Layer {self.layer_idx} | grew block table "
+                    f"from {current_num_blocks} to {block_table_tensor.size(1)}"
+                )
+
+            if getattr(self, "request_state", None) is not None:
+                self.request_state["block_table"] = target_block_table
+                self.request_state["total_tokens"] = max(
+                    int(self.request_state.get("total_tokens", 0)),
+                    total_seq_len,
+                )
+
         # 7. WRITE
         abs_pos = torch.arange(
             start_pos,
@@ -607,7 +636,7 @@ class PagedLlamaAttention(nn.Module):
             bad_block_idx = int(block_idx_logic.max().item())
             raise IndexError(
                 f"Layer {self.layer_idx} | block_idx_logic {bad_block_idx} "
-                f"out of range (size {block_table_tensor.size(1)})"
+                f"out of range (size {block_table_tensor.size(1)}) after auto-grow"
             )
 
         physical_block_idx = block_table_tensor[0, block_idx_logic]
@@ -648,7 +677,7 @@ class PagedLlamaAttention(nn.Module):
         # 8. block table 크기 확인
         if num_needed_blocks > block_table_tensor.size(1):
             raise RuntimeError(
-                f"Layer {self.layer_idx} | Block table size too small! "
+                f"Layer {self.layer_idx} | Block table size too small even after auto-grow! "
                 f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
             )
 
