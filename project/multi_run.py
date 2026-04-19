@@ -2,6 +2,8 @@ import os
 import gc
 import sys
 import torch
+import builtins
+from contextlib import contextmanager
 
 sys.path.append("/LimYeonGyeong/project")
 
@@ -27,6 +29,55 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# 실행 중 너무 많이 찍히는 디버그 출력만 걸러낸다.
+# - measure_paged_multi() 내부의 step-by-step 로그
+# - modeling_llama.py 내부의 잔여 디버그 로그
+# 최종 결과, 로딩 메시지, 성능 표는 그대로 둔다.
+DEBUG_PREFIXES_TO_SUPPRESS = (
+    "[MAIN-PREFILL]",
+    "[MAIN-DECODE STEP",
+    "[CACHE-ID]",
+    "[CACHE-TYPE]",
+    "[CACHE-SEQ]",
+    "[CACHE-POS]",
+    "[CACHE-UPDATE]",
+    "[REQ-STATE]",
+    "[REQ-STATE-ID]",
+    "[POSITION-IDS]",
+    "[CHECK]",
+    "[MODEL-ENTRY]",
+    "[MODEL-EXIT]",
+    "[LM-HEAD-ENTRY]",
+    "[LM-HEAD-EXIT]",
+    "[PagedCacheShim",
+    "[DBG]",
+)
+
+
+@contextmanager
+def suppress_debug_prints(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+
+    original_print = builtins.print
+
+    def filtered_print(*args, **kwargs):
+        if not args:
+            return original_print(*args, **kwargs)
+
+        text = " ".join(str(a) for a in args)
+        if text.startswith(DEBUG_PREFIXES_TO_SUPPRESS):
+            return
+        return original_print(*args, **kwargs)
+
+    builtins.print = filtered_print
+    try:
+        yield
+    finally:
+        builtins.print = original_print
 
 
 def build_local_config_from_hf(hf_config):
@@ -91,31 +142,48 @@ def load_paged_model():
 def make_prompt(topic: str, detail_level: str) -> str:
     if detail_level == "short":
         return (
-            "### Instruction:\n"
-            f"Explain {topic} in one short sentence.\n"
-            "### Response:\n"
+            "### Instruction:
+"
+            f"Explain {topic} in one short sentence.
+"
+            "### Response:
+"
         )
 
     if detail_level == "medium":
         return (
-            "### Instruction:\n"
-            f"Explain {topic} clearly for a beginner.\n"
-            "Use 3 to 4 simple sentences and include one example.\n"
-            "### Response:\n"
+            "### Instruction:
+"
+            f"Explain {topic} clearly for a beginner.
+"
+            "Use 3 to 4 simple sentences and include one example.
+"
+            "### Response:
+"
         )
 
     if detail_level == "long":
         return (
-            "### Instruction:\n"
-            f"Explain {topic} in detail for a student who is learning LLM systems.\n"
-            "Your answer should include:\n"
-            "1. a simple definition,\n"
-            "2. why it matters,\n"
-            "3. one technical detail,\n"
-            "4. one practical example,\n"
-            "5. one limitation.\n"
-            "Write around 8 to 10 sentences.\n"
-            "### Response:\n"
+            "### Instruction:
+"
+            f"Explain {topic} in detail for a student who is learning LLM systems.
+"
+            "Your answer should include:
+"
+            "1. a simple definition,
+"
+            "2. why it matters,
+"
+            "3. one technical detail,
+"
+            "4. one practical example,
+"
+            "5. one limitation.
+"
+            "Write around 8 to 10 sentences.
+"
+            "### Response:
+"
         )
 
     raise ValueError(f"Unknown detail_level: {detail_level}")
@@ -252,13 +320,15 @@ def multi_only_main():
     pool.k_cache.zero_()
     pool.v_cache.zero_()
 
-    stats_paged_multi = measure_paged_multi(
-        model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
-    )
+    # measure_paged_multi 내부의 step-by-step print는 성능 측정에 큰 방해가 되므로 막는다.
+    with suppress_debug_prints(enabled=True):
+        stats_paged_multi = measure_paged_multi(
+            model_paged, tokenizer, prompts, scheduler, pool, max_new_tokens=max_new_tokens
+        )
 
-    print("\n[OUTPUT] Multi Request Generation Results (first 5 only)")
+    print("[OUTPUT] Multi Request Generation Results (first 5 only)")
     for i, text in enumerate(stats_paged_multi["texts"][:5]):
-        print(f"\n--- Request {i+1} ---")
+        print(f"--- Request {i+1} ---")
         print(text[:500])
 
     print_stats_table("Multi Request Result", stats_base_multi, stats_paged_multi, include_blocks=True)
