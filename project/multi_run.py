@@ -246,15 +246,29 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     block_tables = []
     runtimes = []
 
-    # 토크나이징을 루프 밖에서 1회만 수행
-    for i, prompt in enumerate(prompts):
+    # ---------------------------------------------
+    # 0) 토크나이징 먼저 하고, batch 내 최대 prompt 길이 계산
+    # ---------------------------------------------
+    encoded_inputs = []
+    max_prompt_len = 0
+
+    for prompt in prompts:
         enc = tokenizer(prompt, return_tensors="pt")
         input_ids = enc["input_ids"].to(model.device)
         prompt_len = input_ids.shape[1]
+        encoded_inputs.append((input_ids, prompt_len))
+        max_prompt_len = max(max_prompt_len, prompt_len)
 
+    # batch decode에서는 모든 요청이 step을 함께 가므로
+    # block table도 batch 내 최대 길이에 맞춰 동일하게 잡아준다.
+    shared_total_tokens = max_prompt_len + max_new_tokens
+
+    # ---------------------------------------------
+    # 1) request runtime/state 준비
+    # ---------------------------------------------
+    for i, (input_ids, prompt_len) in enumerate(encoded_inputs):
         rid = f"multi_req_{i}"
-        total_tokens = prompt_len + max_new_tokens
-        bt = scheduler.allocate_for_request(rid, total_tokens)
+        bt = scheduler.allocate_for_request(rid, shared_total_tokens)
         scheduler.set_seq_len(rid, 0)
         request_state = scheduler.get_request_state(rid)
 
@@ -279,15 +293,10 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     t0 = time.perf_counter()
 
     # -------------------------------------------------
-    # 1) PREFILL
-    # -------------------------------------------------
-    # prefill은 correctness를 위해 요청별로 그대로 진행
-    # (길이가 제각각인 prompt를 한 번에 pad batch로 넣으면
-    #  현재 paged write 경로에서 pad 토큰까지 cache에 반영될 수 있으므로
-    #  여기서는 안정적으로 요청별 prefill 유지)
+    # 2) PREFILL
+    # correctness를 위해 요청별로 그대로 진행
     # -------------------------------------------------
     for rt in runtimes:
-        # 단일 요청 상태 바인딩
         for layer in model.model.layers:
             layer.self_attn.block_table = rt["block_table"]
             layer.self_attn.page_pool = pool
@@ -296,7 +305,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         model.model.page_pool = pool
         model.model.active_request_state = rt["request_state"]
 
-        # batch-aware 단계에서 추가된 속성이 있으면 정리
         if hasattr(model.model, "active_request_states"):
             model.model.active_request_states = None
 
@@ -315,18 +323,14 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
             rt["finished"] = True
 
     # -------------------------------------------------
-    # 2) DECODE
-    # -------------------------------------------------
-    # 여기부터가 핵심:
-    # - 예전: for step -> for req -> model(...)
-    # - 지금: for step -> active req들을 batch로 묶어서 model(...) 1번
+    # 3) DECODE
+    # step마다 active requests를 batch로 묶어 한 번에 forward
     # -------------------------------------------------
     for step in range(1, max_new_tokens):
         active_rts = [rt for rt in runtimes if not rt["finished"]]
         if not active_rts:
             break
 
-        # batch 입력 구성
         batch_last_tokens = torch.cat(
             [rt["generated"][:, -1:] for rt in active_rts],
             dim=0,
@@ -343,7 +347,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         batch_block_tables = [rt["block_table"] for rt in active_rts]
         batch_request_states = [rt["request_state"] for rt in active_rts]
 
-        # batch 요청 상태 바인딩
         for layer in model.model.layers:
             layer.self_attn.block_table = batch_block_tables
             layer.self_attn.page_pool = pool
@@ -353,8 +356,6 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
         model.model.active_request_state = None
         model.model.active_request_states = batch_request_states
 
-        # 실제 KV는 page_pool에 있으므로
-        # past_key_values는 shim만 새로 만들어도 동작 가능
         outputs = model(
             input_ids=batch_last_tokens,
             use_cache=True,
@@ -365,9 +366,8 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
 
         next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)  # [batch, 1]
 
-        # batch 결과를 다시 각 요청에 분배
         for i, rt in enumerate(active_rts):
-            next_token = next_tokens[i:i+1]   # [1, 1]
+            next_token = next_tokens[i:i+1]  # [1, 1]
             rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
 
             if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
