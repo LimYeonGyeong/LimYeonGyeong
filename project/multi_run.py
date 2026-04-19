@@ -483,7 +483,7 @@ def multi_only_main():
         needed_blocks = (needed_tokens + block_size - 1) // block_size
         all_needed_blocks += needed_blocks
 
-    num_blocks = all_needed_blocks + 4
+    num_blocks = int(all_needed_blocks * 2.5) + 32
 
     pool = PagePool(
         num_blocks=num_blocks,
