@@ -240,7 +240,9 @@ def _bind_request_runtime(model, block_table, request_state, pool):
 
 @torch.no_grad()
 def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_tokens=20):
+    model.eval()
     process = psutil.Process(os.getpid())
+    layer_attns = [layer.self_attn for layer in model.model.layers]
 
     request_ids = []
     block_tables = []
@@ -277,61 +279,76 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     ram_start = process.memory_info().rss / 1024 / 1024
     ctx_start = process.num_ctx_switches()
 
-    t0 = time.time()
+    t0 = time.perf_counter()
 
-    # 1) 모든 요청 prefill 먼저 수행
-    for rt in runtimes:
-        _bind_request_runtime(model, rt["block_table"], rt["request_state"], pool)
-        scheduler.set_seq_len(rt["request_id"], 0)
+    def bind_request_runtime(rt):
+        bt = rt["block_table"]
+        rs = rt["request_state"]
+        for attn in layer_attns:
+            attn.block_table = bt
+            attn.page_pool = pool
+        model.model.block_table = bt
+        model.model.page_pool = pool
+        model.model.active_request_state = rs
 
-        outputs = model(
-            input_ids=rt["generated"],
-            use_cache=True,
-            past_key_values=None,
-        )
-
-        rt["past_key_values"] = outputs.past_key_values
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-        rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
-
-        if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
-            rt["finished"] = True
-
-    # 2) decode는 step 기준으로 active request 전체를 한 바퀴씩 처리
-    for step in range(1, max_new_tokens):
-        any_active = False
-
-        for rt in runtimes:
-            if rt["finished"]:
-                continue
-
-            any_active = True
-            _bind_request_runtime(model, rt["block_table"], rt["request_state"], pool)
-
-            last_token = rt["generated"][:, -1:]
-            cache_position, position_ids = build_decode_positions(model)
+    with torch.inference_mode():
+        # 1) 모든 요청 prefill 먼저 수행
+        active_indices = []
+        for idx, rt in enumerate(runtimes):
+            bind_request_runtime(rt)
+            scheduler.set_seq_len(rt["request_id"], 0)
 
             outputs = model(
-                input_ids=last_token,
+                input_ids=rt["generated"],
                 use_cache=True,
-                past_key_values=rt["past_key_values"],
-                cache_position=cache_position,
-                position_ids=position_ids,
+                past_key_values=None,
             )
 
             rt["past_key_values"] = outputs.past_key_values
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
 
             if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
                 rt["finished"] = True
+            else:
+                active_indices.append(idx)
 
-        if not any_active:
-            break
+        # 2) decode는 step 기준으로 active request 전체를 한 바퀴씩 처리
+        for step in range(1, max_new_tokens):
+            if not active_indices:
+                break
+
+            next_active_indices = []
+
+            for idx in active_indices:
+                rt = runtimes[idx]
+                bind_request_runtime(rt)
+
+                last_token = rt["generated"][:, -1:]
+                cache_position, position_ids = build_decode_positions(model)
+
+                outputs = model(
+                    input_ids=last_token,
+                    use_cache=True,
+                    past_key_values=rt["past_key_values"],
+                    cache_position=cache_position,
+                    position_ids=position_ids,
+                )
+
+                rt["past_key_values"] = outputs.past_key_values
+                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
+
+                if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
+                    rt["finished"] = True
+                else:
+                    next_active_indices.append(idx)
+
+            active_indices = next_active_indices
 
     if device == "cuda":
         torch.cuda.synchronize()
-    t1 = time.time()
+    t1 = time.perf_counter()
 
     ram_end = process.memory_info().rss / 1024 / 1024
     ctx_end = process.num_ctx_switches()
