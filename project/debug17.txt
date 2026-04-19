@@ -1,0 +1,20 @@
+🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
+🔥 LlamaModel.forward 위치 = /LimYeonGyeong/project/paged_llama/llama/utils/utils.py
+>>> Multi Request 비교 실행
+>>> Baseline multi 로딩 중...
+>>> Paged multi 로딩 중...
+>>> HF config / state_dict 로딩 중...
+>>> 로컬 paged 모델 생성 중...
+[LOAD] missing keys: 0
+[LOAD] unexpected keys: 0
+>>> 로컬 paged 모델 GPU 이동 중...
+Traceback (most recent call last):
+  File "/LimYeonGyeong/project/multi_run.py", line 482, in <module>
+    multi_only_main()
+  File "/LimYeonGyeong/project/multi_run.py", line 464, in multi_only_main
+    stats_paged_multi = measure_paged_multi(
+  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/LimYeonGyeong/project/multi_run.py", line 230, in measure_paged_multi
+    process = psutil.Process(os.getpid())
+NameError: name 'psutil' is not defined
