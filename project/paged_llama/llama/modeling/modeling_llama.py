@@ -628,23 +628,43 @@ class PagedLlamaAttention(nn.Module):
             if cache_position.dim() == 2:
                 start_pos_list = [int(cache_position[row, 0].item()) for row in range(bsz)]
             else:
-                start_pos_list = [int(cache_position.reshape(-1)[0].item()) for _ in range(bsz)]
+                cp_flat = cache_position.reshape(-1)
+                if cp_flat.numel() == bsz:
+                    start_pos_list = [int(cp_flat[row].item()) for row in range(bsz)]
+                else:
+                    start_pos_list = [int(cp_flat[0].item()) for _ in range(bsz)]
         elif position_ids is not None:
             if position_ids.dim() == 2:
                 start_pos_list = [int(position_ids[row, 0].item()) for row in range(bsz)]
             else:
-                start_pos_list = [int(position_ids.reshape(-1)[0].item()) for _ in range(bsz)]
+                pid_flat = position_ids.reshape(-1)
+                if pid_flat.numel() == bsz:
+                    start_pos_list = [int(pid_flat[row].item()) for row in range(bsz)]
+                else:
+                    start_pos_list = [int(pid_flat[0].item()) for _ in range(bsz)]
         else:
             start_pos_list = [0 for _ in range(bsz)]
 
-        full_key_states_before_repeat_list = []
-        full_value_states_before_repeat_list = []
         total_seq_len_list = []
+        for row in range(bsz):
+            total_seq_len_list.append(start_pos_list[row] + q_len)
+
+        max_total_seq_len = max(total_seq_len_list) if total_seq_len_list else q_len
+
+        full_key_states_before_repeat = torch.zeros(
+            (bsz, self.num_key_value_heads, max_total_seq_len, self.head_dim),
+            dtype=key_states.dtype,
+            device=target_device,
+        )
+        full_value_states_before_repeat = torch.zeros(
+            (bsz, self.num_key_value_heads, max_total_seq_len, self.head_dim),
+            dtype=value_states.dtype,
+            device=target_device,
+        )
 
         for row in range(bsz):
             start_pos = start_pos_list[row]
-            total_seq_len = start_pos + q_len
-            total_seq_len_list.append(total_seq_len)
+            total_seq_len = total_seq_len_list[row]
             num_needed_blocks = (total_seq_len + pool.block_size - 1) // pool.block_size
 
             block_table_tensor = block_table_tensors[row]
@@ -700,10 +720,6 @@ class PagedLlamaAttention(nn.Module):
             k_flat = k_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
             v_flat = v_blocks.transpose(0, 1).reshape(self.num_key_value_heads, -1, self.head_dim)
 
-            # repeat 전 상태 보관
-            full_key_states_before_repeat = k_flat[:, :total_seq_len, :].unsqueeze(0)
-            full_value_states_before_repeat = v_flat[:, :total_seq_len, :].unsqueeze(0)
-
             if self.debug_verbose:
                 _tensor_debug("k_flat", k_flat, self.layer_idx)
                 _tensor_debug("v_flat", v_flat, self.layer_idx)
@@ -714,30 +730,13 @@ class PagedLlamaAttention(nn.Module):
                 _assert_no_nan("v_flat", v_flat, self.layer_idx)
                 _assert_no_posinf("v_flat", v_flat, self.layer_idx)
 
-            full_key_states_before_repeat_list.append(full_key_states_before_repeat)
-            full_value_states_before_repeat_list.append(full_value_states_before_repeat)
-
-        max_total_seq_len = max(total_seq_len_list) if total_seq_len_list else q_len
-        padded_key_list = []
-        padded_value_list = []
-
-        for row in range(bsz):
-            k_row = full_key_states_before_repeat_list[row]
-            v_row = full_value_states_before_repeat_list[row]
-            total_seq_len = total_seq_len_list[row]
-            if total_seq_len < max_total_seq_len:
-                pad_len = max_total_seq_len - total_seq_len
-                k_row = torch.nn.functional.pad(k_row, (0, 0, 0, pad_len))
-                v_row = torch.nn.functional.pad(v_row, (0, 0, 0, pad_len))
-            padded_key_list.append(k_row)
-            padded_value_list.append(v_row)
-
-        full_key_states = torch.cat(padded_key_list, dim=0).to(dtype=query_states.dtype)
-        full_value_states = torch.cat(padded_value_list, dim=0).to(dtype=query_states.dtype)
+            # repeat 전 상태 보관
+            full_key_states_before_repeat[row, :, :total_seq_len, :] = k_flat[:, :total_seq_len, :]
+            full_value_states_before_repeat[row, :, :total_seq_len, :] = v_flat[:, :total_seq_len, :]
 
         # 11. GQA 확장
-        full_key_states = repeat_kv(full_key_states, self.num_key_value_groups)
-        full_value_states = repeat_kv(full_value_states, self.num_key_value_groups)
+        full_key_states = repeat_kv(full_key_states_before_repeat, self.num_key_value_groups)
+        full_value_states = repeat_kv(full_value_states_before_repeat, self.num_key_value_groups)
 
         full_key_states = full_key_states.to(dtype=query_states.dtype)
         full_value_states = full_value_states.to(dtype=query_states.dtype)
@@ -766,24 +765,25 @@ class PagedLlamaAttention(nn.Module):
             _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
             _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
 
-        batch_masks = []
         for row in range(bsz):
             start_pos = start_pos_list[row]
             total_seq_len = total_seq_len_list[row]
-            row_pos = start_pos + torch.arange(q_len, device=target_device).unsqueeze(1)
-            col_pos = torch.arange(total_seq_len, device=target_device).unsqueeze(0)
-            row_mask = torch.where(
-                col_pos <= row_pos,
-                torch.tensor(0.0, device=target_device, dtype=attn_weights.dtype),
-                torch.tensor(float("-inf"), device=target_device, dtype=attn_weights.dtype),
-            ).unsqueeze(0).unsqueeze(0)
-            if total_seq_len < max_total_seq_len:
-                pad_len = max_total_seq_len - total_seq_len
-                row_mask = torch.nn.functional.pad(row_mask, (0, pad_len), value=float("-inf"))
-            batch_masks.append(row_mask)
 
-        causal_mask = torch.cat(batch_masks, dim=0)
-        attn_weights = attn_weights + causal_mask
+            if total_seq_len < max_total_seq_len:
+                attn_weights[row, :, :, total_seq_len:] = float("-inf")
+
+            future_mask = torch.triu(
+                torch.full(
+                    (q_len, total_seq_len),
+                    float("-inf"),
+                    dtype=attn_weights.dtype,
+                    device=target_device,
+                ),
+                diagonal=start_pos + 1,
+            )
+            attn_weights[row, :, :, :total_seq_len] = (
+                attn_weights[row, :, :, :total_seq_len] + future_mask.unsqueeze(0)
+            )
 
         if self.debug_verbose:
             _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
@@ -817,6 +817,7 @@ class PagedLlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
+    
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
