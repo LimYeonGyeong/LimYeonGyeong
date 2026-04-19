@@ -377,19 +377,29 @@ def measure_paged_multi(model, tokenizer, prompts, scheduler, pool, max_new_toke
     if total_generated_tokens > 0:
         vram_per_token_kb = (peak_vram * 1024.0) / total_generated_tokens
 
+    ram_increase_mb = max(0.0, ram_after - ram_before)
+    context_switch = max(0, ctx_after - ctx_before)
+
     return {
         "texts": texts,
         "latency": elapsed,
         "throughput": (total_generated_tokens / elapsed) if elapsed > 0 else 0.0,
-        "ram_increase_mb": max(0.0, ram_after - ram_before),
+        # 기존 main.print_stats_table() 호환 키
+        "ram_mb": ram_increase_mb,
+        "peak_vram": peak_vram,
+        "alloc_vram": alloc_vram,
+        "reserved_vram": reserved_vram,
+        "max_reserved_vram": max_reserved_vram,
+        "vram_per_token_kb": vram_per_token_kb,
+        "context_switch": context_switch,
+        "used_blocks": used_blocks,
+        "block_utilization": block_util,
+        # 확장/가독성용 별칭 키
+        "ram_increase_mb": ram_increase_mb,
         "peak_vram_mb": peak_vram,
         "alloc_vram_mb": alloc_vram,
         "reserved_vram_mb": reserved_vram,
         "max_reserved_vram_mb": max_reserved_vram,
-        "vram_per_token_kb": vram_per_token_kb,
-        "context_switch": max(0, ctx_after - ctx_before),
-        "used_blocks": used_blocks,
-        "block_utilization": block_util,
     }
 
 
