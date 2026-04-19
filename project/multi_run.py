@@ -137,6 +137,16 @@ def load_paged_model():
     print(">>> 로컬 paged 모델 생성 중...")
 
     local_config = build_local_config_from_hf(hf_config)
+    # transformers.generate() 호환용 필드 보강
+    if not hasattr(local_config, "is_encoder_decoder"):
+        local_config.is_encoder_decoder = False
+    if not hasattr(local_config, "is_decoder"):
+        local_config.is_decoder = True
+    if not hasattr(local_config, "use_cache"):
+        local_config.use_cache = True
+    if not hasattr(local_config, "return_dict_in_generate"):
+        local_config.return_dict_in_generate = False
+
     model = PagedLlamaForCausalLM(local_config)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -155,6 +165,12 @@ def load_paged_model():
     model = model.to(device)
 
     model.config.use_cache = True
+    if not hasattr(model.config, "is_encoder_decoder"):
+        model.config.is_encoder_decoder = False
+    if not hasattr(model.config, "is_decoder"):
+        model.config.is_decoder = True
+    if not hasattr(model.config, "return_dict_in_generate"):
+        model.config.return_dict_in_generate = False
 
     # transformers.generate() 호환을 위해 generation_config를 명시적으로 보장
     try:
@@ -163,6 +179,8 @@ def load_paged_model():
         model.generation_config = GenerationConfig.from_model_config(hf_config)
 
     model.generation_config.use_cache = True
+    if not hasattr(model.generation_config, "_from_model_config"):
+        model.generation_config._from_model_config = True
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = local_config.pad_token_id
     if model.generation_config.eos_token_id is None:
