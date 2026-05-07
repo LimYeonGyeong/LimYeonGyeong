@@ -742,10 +742,8 @@ class PagedLlamaAttention(nn.Module):
             _tensor_debug("v_blocks", v_blocks, self.layer_idx)
 
         # =========================================================
-        # 10. block 단위 attention score 계산
-        # 아직 correctness 유지 단계이므로:
-        # - softmax는 전체 기준 유지
-        # - score만 block별 계산 후 concat
+        # 10. vectorized block attention
+        # Python loop 제거
         # =========================================================
 
         q_grouped = query_states.view(
@@ -756,49 +754,67 @@ class PagedLlamaAttention(nn.Module):
             self.head_dim,
         )
 
-        score_blocks = []
+        # ---------------------------------------------------------
+        # k_blocks:
+        # [bsz, blocks, kv_heads, block_size, head_dim]
+        #
+        # →
+        #
+        # [bsz, kv_heads, blocks, block_size, head_dim]
+        # ---------------------------------------------------------
 
-        for blk_idx in range(max_num_needed_blocks):
+        k_blocks_for_attn = k_blocks.permute(
+            0,
+            2,
+            1,
+            3,
+            4,
+        ).contiguous()
 
-            # -----------------------------------------------------
-            # 현재 block 가져오기
-            # [bsz, kv_heads, block_size, head_dim]
-            # -----------------------------------------------------
-            k_block = k_blocks[:, blk_idx]
-
-            if self.debug_verbose and self.layer_idx == 0:
-                _tensor_debug(
-                    f"k_block[{blk_idx}]",
-                    k_block,
-                    self.layer_idx,
-                )
-
-            # -----------------------------------------------------
-            # attention score 계산
-            # q: [b, g, r, q, d]
-            # k: [b, g, k, d]
-            # output:
-            # [b, g, r, q, block_size]
-            # -----------------------------------------------------
-            block_scores = torch.einsum(
-                "b g r q d, b g k d -> b g r q k",
-                q_grouped,
-                k_block,
+        if self.debug_verbose:
+            _tensor_debug(
+                "k_blocks_for_attn",
+                k_blocks_for_attn,
+                self.layer_idx,
             )
 
-            block_scores *= (1.0 / math.sqrt(self.head_dim))
+        # =========================================================
+        # attention score 계산
+        #
+        # q:
+        # [b, g, r, q, d]
+        #
+        # k:
+        # [b, g, blk, k, d]
+        #
+        # output:
+        # [b, g, r, q, blk, k]
+        # =========================================================
 
-            score_blocks.append(block_scores)
+        attn_weights = torch.einsum(
+            "b g r q d, b g n k d -> b g r q n k",
+            q_grouped,
+            k_blocks_for_attn,
+        )
+
+        attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
         # =========================================================
-        # 11. 모든 block score concat
-        # dense reconstruction 없이
-        # attention score만 연결
+        # block dimension + token dimension flatten
+        #
+        # [b,g,r,q,blk,k]
+        # →
+        # [b,g,r,q,total_seq]
         # =========================================================
 
-        attn_weights = torch.cat(score_blocks, dim=-1)
+        attn_weights = attn_weights.reshape(
+            bsz,
+            self.num_key_value_heads,
+            self.num_key_value_groups,
+            q_len,
+            max_num_needed_blocks * pool.block_size,
+        )
 
-        # 실제 sequence 길이만 사용
         attn_weights = attn_weights[..., :max_total_seq_len]
 
         if self.debug_verbose:
@@ -875,62 +891,71 @@ class PagedLlamaAttention(nn.Module):
         # dense reconstruction 제거
         # =========================================================
 
-        attn_output_blocks = []
-
-        start_idx = 0
-
-        for blk_idx in range(max_num_needed_blocks):
-
-            # -----------------------------------------------------
-            # 현재 block value
-            # [bsz, kv_heads, block_size, head_dim]
-            # -----------------------------------------------------
-            v_block = v_blocks[:, blk_idx]
-
-            if self.debug_verbose and self.layer_idx == 0:
-                _tensor_debug(
-                    f"v_block[{blk_idx}]",
-                    v_block,
-                    self.layer_idx,
-                )
-
-            # -----------------------------------------------------
-            # 현재 block에 해당하는 attention score slice
-            # -----------------------------------------------------
-            end_idx = min(
-                start_idx + pool.block_size,
-                max_total_seq_len,
-            )
-
-            block_attn = attn_weights[..., start_idx:end_idx]
-
-            current_block_size = end_idx - start_idx
-
-            # 마지막 block padding 대응
-            v_block = v_block[:, :, :current_block_size, :]
-
-            # -----------------------------------------------------
-            # block output 계산
-            # [b, g, r, q, d]
-            # -----------------------------------------------------
-            block_output = torch.einsum(
-                "b g r q k, b g k d -> b g r q d",
-                block_attn,
-                v_block,
-            )
-
-            attn_output_blocks.append(block_output)
-
-            start_idx += pool.block_size
-
-        # =========================================================
-        # 모든 block output accumulation
+               # =========================================================
+        # 14. vectorized value accumulation
+        # Python loop 제거
         # =========================================================
 
-        attn_output = torch.stack(
-            attn_output_blocks,
-            dim=0,
-        ).sum(dim=0)
+        v_blocks_for_attn = v_blocks.permute(
+            0,
+            2,
+            1,
+            3,
+            4,
+        ).contiguous()
+
+        if self.debug_verbose:
+            _tensor_debug(
+                "v_blocks_for_attn",
+                v_blocks_for_attn,
+                self.layer_idx,
+            )
+
+        # =========================================================
+        # [b,g,blk,k,d]
+        # →
+        # [b,g,total_seq,d]
+        # =========================================================
+
+        v_blocks_for_attn = v_blocks_for_attn.reshape(
+            bsz,
+            self.num_key_value_heads,
+            max_num_needed_blocks * pool.block_size,
+            self.head_dim,
+        )
+
+        v_blocks_for_attn = v_blocks_for_attn[
+            :,
+            :,
+            :max_total_seq_len,
+            :
+        ]
+
+        if self.debug_verbose:
+            _tensor_debug(
+                "v_blocks_for_attn(flattened)",
+                v_blocks_for_attn,
+                self.layer_idx,
+            )
+
+        # =========================================================
+        # attention output
+        #
+        # attn:
+        # [b,g,r,q,total_seq]
+        #
+        # value:
+        # [b,g,total_seq,d]
+        #
+        # output:
+        # [b,g,r,q,d]
+        # =========================================================
+
+        attn_output = torch.einsum(
+            "b g r q k, b g k d -> b g r q d",
+            attn_weights,
+            v_blocks_for_attn,
+        )
 
         if self.debug_verbose:
             _tensor_debug(
