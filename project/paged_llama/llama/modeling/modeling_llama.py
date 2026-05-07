@@ -871,31 +871,66 @@ class PagedLlamaAttention(nn.Module):
             )
 
         # =========================================================
-        # 14. value 계산
-        # correctness 유지 위해
-        # 현재는 value만 flatten 유지
+        # 14. block 단위 value accumulation
+        # dense reconstruction 제거
         # =========================================================
 
-        v_flat = v_blocks.permute(
-            0,
-            2,
-            1,
-            3,
-            4,
-        ).reshape(
-            bsz,
-            self.num_key_value_heads,
-            max_num_needed_blocks * pool.block_size,
-            self.head_dim,
-        )
+        attn_output_blocks = []
 
-        full_value_states = v_flat[:, :, :max_total_seq_len, :].contiguous()
+        start_idx = 0
 
-        attn_output = torch.einsum(
-            "b g r q k, b g k d -> b g r q d",
-            attn_weights,
-            full_value_states,
-        )
+        for blk_idx in range(max_num_needed_blocks):
+
+            # -----------------------------------------------------
+            # 현재 block value
+            # [bsz, kv_heads, block_size, head_dim]
+            # -----------------------------------------------------
+            v_block = v_blocks[:, blk_idx]
+
+            if self.debug_verbose and self.layer_idx == 0:
+                _tensor_debug(
+                    f"v_block[{blk_idx}]",
+                    v_block,
+                    self.layer_idx,
+                )
+
+            # -----------------------------------------------------
+            # 현재 block에 해당하는 attention score slice
+            # -----------------------------------------------------
+            end_idx = min(
+                start_idx + pool.block_size,
+                max_total_seq_len,
+            )
+
+            block_attn = attn_weights[..., start_idx:end_idx]
+
+            current_block_size = end_idx - start_idx
+
+            # 마지막 block padding 대응
+            v_block = v_block[:, :, :current_block_size, :]
+
+            # -----------------------------------------------------
+            # block output 계산
+            # [b, g, r, q, d]
+            # -----------------------------------------------------
+            block_output = torch.einsum(
+                "b g r q k, b g k d -> b g r q d",
+                block_attn,
+                v_block,
+            )
+
+            attn_output_blocks.append(block_output)
+
+            start_idx += pool.block_size
+
+        # =========================================================
+        # 모든 block output accumulation
+        # =========================================================
+
+        attn_output = torch.stack(
+            attn_output_blocks,
+            dim=0,
+        ).sum(dim=0)
 
         if self.debug_verbose:
             _tensor_debug(
