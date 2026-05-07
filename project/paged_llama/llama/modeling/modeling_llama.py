@@ -725,31 +725,29 @@ class PagedLlamaAttention(nn.Module):
         layer_k_cache = pool.k_cache[self.layer_idx]
         layer_v_cache = pool.v_cache[self.layer_idx]
 
-        k_blocks = layer_k_cache[padded_active_indices]  # [bsz, blocks, kv_heads, block_size, head_dim]
-        v_blocks = layer_v_cache[padded_active_indices]  # [bsz, blocks, kv_heads, block_size, head_dim]
+        k_blocks = layer_k_cache[padded_active_indices]
+        v_blocks = layer_v_cache[padded_active_indices]
 
-        # 10. flatten
-        k_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(
-            bsz, self.num_key_value_heads, max_num_needed_blocks * pool.block_size, self.head_dim
-        )
-        v_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(
-            bsz, self.num_key_value_heads, max_num_needed_blocks * pool.block_size, self.head_dim
-        )
+        # =========================================================
+        # DEBUG
+        # block shape 확인
+        # =========================================================
+        if self.debug and self.layer_idx == 0:
+            print(f"[BLOCK DEBUG]")
+            print(f"k_blocks.shape = {k_blocks.shape}")
+            print(f"v_blocks.shape = {v_blocks.shape}")
 
         if self.debug_verbose:
-            _tensor_debug("k_flat", k_flat, self.layer_idx)
-            _tensor_debug("v_flat", v_flat, self.layer_idx)
+            _tensor_debug("k_blocks", k_blocks, self.layer_idx)
+            _tensor_debug("v_blocks", v_blocks, self.layer_idx)
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("k_flat", k_flat, self.layer_idx)
-            _assert_no_posinf("k_flat", k_flat, self.layer_idx)
-            _assert_no_nan("v_flat", v_flat, self.layer_idx)
-            _assert_no_posinf("v_flat", v_flat, self.layer_idx)
+        # =========================================================
+        # 10. block 단위 attention score 계산
+        # 아직 correctness 유지 단계이므로:
+        # - softmax는 전체 기준 유지
+        # - score만 block별 계산 후 concat
+        # =========================================================
 
-        full_key_states = k_flat[:, :, :max_total_seq_len, :].contiguous()
-        full_value_states = v_flat[:, :, :max_total_seq_len, :].contiguous()
-
-        # 11. GQA 복제 없이 grouped attention 계산 준비
         q_grouped = query_states.view(
             bsz,
             self.num_key_value_heads,
@@ -758,27 +756,73 @@ class PagedLlamaAttention(nn.Module):
             self.head_dim,
         )
 
-        if self.debug and self.layer_idx == 0:
-            print(f"[ATTN][Layer {self.layer_idx}] q_len={q_len} max_total_seq_len={max_total_seq_len}")
+        score_blocks = []
+
+        for blk_idx in range(max_num_needed_blocks):
+
+            # -----------------------------------------------------
+            # 현재 block 가져오기
+            # [bsz, kv_heads, block_size, head_dim]
+            # -----------------------------------------------------
+            k_block = k_blocks[:, blk_idx]
+
+            if self.debug_verbose and self.layer_idx == 0:
+                _tensor_debug(
+                    f"k_block[{blk_idx}]",
+                    k_block,
+                    self.layer_idx,
+                )
+
+            # -----------------------------------------------------
+            # attention score 계산
+            # q: [b, g, r, q, d]
+            # k: [b, g, k, d]
+            # output:
+            # [b, g, r, q, block_size]
+            # -----------------------------------------------------
+            block_scores = torch.einsum(
+                "b g r q d, b g k d -> b g r q k",
+                q_grouped,
+                k_block,
+            )
+
+            block_scores *= (1.0 / math.sqrt(self.head_dim))
+
+            score_blocks.append(block_scores)
+
+        # =========================================================
+        # 11. 모든 block score concat
+        # dense reconstruction 없이
+        # attention score만 연결
+        # =========================================================
+
+        attn_weights = torch.cat(score_blocks, dim=-1)
+
+        # 실제 sequence 길이만 사용
+        attn_weights = attn_weights[..., :max_total_seq_len]
 
         if self.debug_verbose:
-            _tensor_debug("q_grouped", q_grouped, self.layer_idx)
-            _tensor_debug("full_key_states", full_key_states, self.layer_idx)
-
-        # 12. attention
-        attn_weights = torch.einsum(
-            "b g r q d, b g k d -> b g r q k",
-            q_grouped,
-            full_key_states,
-        )
-        attn_weights *= (1.0 / math.sqrt(self.head_dim))
-
-        if self.debug_verbose:
-            _tensor_debug("attn_weights(before mask)", attn_weights, self.layer_idx)
+            _tensor_debug(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
 
         if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(before mask)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(before mask)", attn_weights, self.layer_idx)
+            _assert_no_nan(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
+
+        # =========================================================
+        # 12. causal mask
+        # =========================================================
 
         q_abs = start_pos_tensor[:, None] + torch.arange(
             q_len,
@@ -794,6 +838,7 @@ class PagedLlamaAttention(nn.Module):
 
         valid_k_mask = k_pos < total_seq_len_tensor[:, None]
         causal_keep_mask = k_pos[:, None, :] <= q_abs[:, :, None]
+
         final_keep_mask = causal_keep_mask & valid_k_mask[:, None, :]
 
         attn_weights = attn_weights.masked_fill(
@@ -802,20 +847,49 @@ class PagedLlamaAttention(nn.Module):
         )
 
         if self.debug_verbose:
-            _tensor_debug("attn_weights(after mask)", attn_weights, self.layer_idx)
+            _tensor_debug(
+                "attn_weights(after mask)",
+                attn_weights,
+                self.layer_idx,
+            )
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after mask)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(after mask)", attn_weights, self.layer_idx)
+        # =========================================================
+        # 13. softmax
+        # =========================================================
 
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_grouped.dtype)
+        attn_weights = torch.softmax(
+            attn_weights,
+            dim=-1,
+            dtype=torch.float32,
+        ).to(q_grouped.dtype)
 
         if self.debug_verbose:
-            _tensor_debug("attn_weights(after softmax)", attn_weights, self.layer_idx)
+            _tensor_debug(
+                "attn_weights(after softmax)",
+                attn_weights,
+                self.layer_idx,
+            )
 
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_weights(after softmax)", attn_weights, self.layer_idx)
-            _assert_no_posinf("attn_weights(after softmax)", attn_weights, self.layer_idx)
+        # =========================================================
+        # 14. value 계산
+        # correctness 유지 위해
+        # 현재는 value만 flatten 유지
+        # =========================================================
+
+        v_flat = v_blocks.permute(
+            0,
+            2,
+            1,
+            3,
+            4,
+        ).reshape(
+            bsz,
+            self.num_key_value_heads,
+            max_num_needed_blocks * pool.block_size,
+            self.head_dim,
+        )
+
+        full_value_states = v_flat[:, :, :max_total_seq_len, :].contiguous()
 
         attn_output = torch.einsum(
             "b g r q k, b g k d -> b g r q d",
@@ -824,11 +898,11 @@ class PagedLlamaAttention(nn.Module):
         )
 
         if self.debug_verbose:
-            _tensor_debug("attn_output(before cast)", attn_output, self.layer_idx)
-
-        if self.debug_stop_on_nonfinite:
-            _assert_no_nan("attn_output(before cast)", attn_output, self.layer_idx)
-            _assert_no_posinf("attn_output(before cast)", attn_output, self.layer_idx)
+            _tensor_debug(
+                "attn_output(before cast)",
+                attn_output,
+                self.layer_idx,
+            )
 
         attn_output = attn_output.reshape(
             bsz,
@@ -837,8 +911,19 @@ class PagedLlamaAttention(nn.Module):
             self.head_dim,
         ).to(query_states.dtype)
 
-        # 13. output
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        # =========================================================
+        # 15. output
+        # =========================================================
+
+        attn_output = attn_output.transpose(
+            1,
+            2,
+        ).reshape(
+            bsz,
+            q_len,
+            self.hidden_size,
+        )
+
         attn_output = self.o_proj(attn_output).to(original_dtype)
 
         return attn_output, None
