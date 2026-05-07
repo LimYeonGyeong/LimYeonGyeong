@@ -37,7 +37,7 @@ Multi-head attention is a technique used in neural machine translation (NMT) to 
 
 === Multi Request Result ===
 Metric                    | nomal           | Paged           |
-Latency (sec)             | 3.2337          | 13.4113         |
+Latency (sec)             | 3.2337          | 20.4113         |
 Throughput (tok/s)        | 123.70          | 28.71           |
 RAM Increase (MB)         | 62.9            | 9.7             |
 Peak VRAM (MB)            | 2220.6          | 2222.3          |
