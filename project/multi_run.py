@@ -119,7 +119,7 @@ def load_paged_model():
     hf_config = AutoConfig.from_pretrained(MODEL_ID)
     hf_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     )
     hf_model = hf_model.to("cpu")
     state_dict = hf_model.state_dict()
@@ -475,7 +475,7 @@ def multi_only_main():
     print(">>> Baseline multi 로딩 중...")
     model_base_multi = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
 
     stats_base_multi = measure_baseline_multi(
