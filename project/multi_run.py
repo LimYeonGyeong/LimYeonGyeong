@@ -814,7 +814,7 @@ def multi_only_main():
         n_requests=num_requests
     )
 
-    max_new_tokens = 3
+    max_new_tokens = 20
 
     block_size = 16
 
