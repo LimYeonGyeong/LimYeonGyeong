@@ -211,9 +211,11 @@ class PagedCacheShim:
             self.seen_tokens = max(values) if len(values) > 0 else self.seen_tokens
         else:
             self.seen_tokens = int(new_len)
+
+            # multi-request에서는 scalar overwrite 금지
             if self.request_states:
-                for rs in self.request_states:
-                    rs["seq_len"] = int(new_len)
+                pass
+
             elif self.request_state is not None:
                 self.request_state["seq_len"] = int(new_len)
 
@@ -817,7 +819,7 @@ class PagedLlamaAttention(nn.Module):
                 f"[KV READ] "
                 f"k[:8]={read_k.tolist()}"
             )
-            
+
         # =========================================================
         # DEBUG
         # block shape 확인
