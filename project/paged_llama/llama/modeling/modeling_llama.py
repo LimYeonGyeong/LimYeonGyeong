@@ -710,7 +710,28 @@ class PagedLlamaAttention(nn.Module):
                 padded_active_indices[row, num_needed_blocks:] = active_indices[-1]
 
             physical_block_idx_per_token[row] = block_table_tensor[0, row_block_idx_logic]
+            print(f"\n[BLOCK MAP][Layer {self.layer_idx}]")
 
+            print(
+                f"row={row} "
+                f"start_pos={start_pos} "
+                f"total_seq_len={total_seq_len}"
+            )
+
+            print(
+                f"logical_block_idx="
+                f"{row_block_idx_logic.tolist()}"
+            )
+
+            print(
+                f"physical_block_idx="
+                f"{physical_block_idx_per_token[row].tolist()}"
+            )
+
+            print(
+                f"block_offset="
+                f"{block_offset[row].tolist()}"
+            )
         # 8. WRITE를 batch scatter로 처리
         batch_idx = torch.arange(bsz, device=target_device, dtype=torch.long)[:, None]
         token_idx = torch.arange(q_len, device=target_device, dtype=torch.long)[None, :]
@@ -720,6 +741,47 @@ class PagedLlamaAttention(nn.Module):
 
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
+        # =========================================================
+        # DEBUG : KV WRITE 확인
+        # =========================================================
+
+        if self.layer_idx == 0:
+
+            sample_row = 0
+            sample_tok = 0
+
+            pb = int(
+                physical_block_idx_per_token[
+                    sample_row,
+                    sample_tok
+                ].item()
+            )
+
+            off = int(
+                block_offset[
+                    sample_row,
+                    sample_tok
+                ].item()
+            )
+
+            written_k = pool.k_cache[
+                self.layer_idx,
+                pb,
+                0,
+                off,
+                :8
+            ].detach().float().cpu()
+
+            print(
+                f"\n[KV WRITE] "
+                f"block={pb} "
+                f"offset={off}"
+            )
+
+            print(
+                f"[KV WRITE] "
+                f"k[:8]={written_k.tolist()}"
+            )
 
         # 9. READ를 batch gather로 처리
         layer_k_cache = pool.k_cache[self.layer_idx]
@@ -727,7 +789,35 @@ class PagedLlamaAttention(nn.Module):
 
         k_blocks = layer_k_cache[padded_active_indices]
         v_blocks = layer_v_cache[padded_active_indices]
+        # =========================================================
+        # DEBUG : KV READ 확인
+        # =========================================================
 
+        if self.layer_idx == 0:
+
+            sample_row = 0
+            sample_block = 0
+            sample_offset = 0
+
+            read_k = k_blocks[
+                sample_row,
+                sample_block,
+                0,
+                sample_offset,
+                :8
+            ].detach().float().cpu()
+
+            print(
+                f"\n[KV READ] "
+                f"block={sample_block} "
+                f"offset={sample_offset}"
+            )
+
+            print(
+                f"[KV READ] "
+                f"k[:8]={read_k.tolist()}"
+            )
+            
         # =========================================================
         # DEBUG
         # block shape 확인
