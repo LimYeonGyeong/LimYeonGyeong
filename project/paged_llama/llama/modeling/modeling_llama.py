@@ -845,7 +845,58 @@ class PagedLlamaAttention(nn.Module):
             q_len,
             self.head_dim,
         )
+        # =========================================================
+        # QUERY TRACE DEBUG
+        # =========================================================
 
+        print("\n================ QUERY TRACE ================")
+
+        for row in range(bsz):
+
+            real_seq_len = int(
+                total_seq_len_tensor[row].item()
+            )
+
+            num_needed_blocks = int(
+                num_needed_blocks_tensor[row].item()
+            )
+
+            print(
+                f"[QUERY] row={row}"
+            )
+
+            print(
+                f"[QUERY] real_seq_len="
+                f"{real_seq_len}"
+            )
+
+            print(
+                f"[QUERY] num_needed_blocks="
+                f"{num_needed_blocks}"
+            )
+
+            print(
+                f"[QUERY] physical_blocks="
+                f"{padded_active_indices[row, :num_needed_blocks].tolist()}"
+            )
+
+        print(
+            f"\n[QUERY] "
+            f"block_size={pool.block_size}"
+        )
+
+        print(
+            f"[QUERY] "
+            f"max_num_needed_blocks={max_num_needed_blocks}"
+        )
+
+        print(
+            f"[QUERY] "
+            f"attention_compute_tokens="
+            f"{max_num_needed_blocks * pool.block_size}"
+        )
+
+        print("============================================\n")
         # ---------------------------------------------------------
         # k_blocks:
         # [bsz, blocks, kv_heads, block_size, head_dim]
@@ -906,7 +957,41 @@ class PagedLlamaAttention(nn.Module):
             q_len,
             max_num_needed_blocks * pool.block_size,
         )
+        # =========================================================
+        # ATTENTION COMPUTE DEBUG
+        # =========================================================
 
+        print("\n[ATTENTION COMPUTE DEBUG]")
+
+        print(
+            f"attn_weights.shape="
+            f"{attn_weights.shape}"
+        )
+
+        for row in range(bsz):
+
+            real_seq_len = int(
+                total_seq_len_tensor[row].item()
+            )
+
+            compute_tokens = (
+                max_num_needed_blocks
+                * pool.block_size
+            )
+
+            wasted_tokens = (
+                compute_tokens
+                - real_seq_len
+            )
+
+            print(
+                f"row={row} "
+                f"real_seq_len={real_seq_len} "
+                f"compute_tokens={compute_tokens} "
+                f"wasted_tokens={wasted_tokens}"
+            )
+
+        print()
         attn_weights = attn_weights[..., :max_total_seq_len]
 
         if self.debug_verbose:
@@ -970,7 +1055,49 @@ class PagedLlamaAttention(nn.Module):
             dim=-1,
             dtype=torch.float32,
         ).to(q_grouped.dtype)
+        # =========================================================
+        # INVALID ATTENTION CHECK
+        # =========================================================
 
+        print("\n[INVALID ATTENTION CHECK]")
+
+        for row in range(bsz):
+
+            valid_len = int(
+                total_seq_len_tensor[row].item()
+            )
+
+            valid_sum = (
+                attn_weights[
+                    row,
+                    0,
+                    0,
+                    0,
+                    :valid_len
+                ]
+                .sum()
+                .item()
+            )
+
+            invalid_sum = (
+                attn_weights[
+                    row,
+                    0,
+                    0,
+                    0,
+                    valid_len:
+                ]
+                .sum()
+                .item()
+            )
+
+            print(
+                f"row={row} "
+                f"valid_sum={valid_sum:.6f} "
+                f"invalid_sum={invalid_sum:.6f}"
+            )
+
+        print()
         if self.debug_verbose:
             _tensor_debug(
                 "attn_weights(after softmax)",
