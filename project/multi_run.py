@@ -470,47 +470,8 @@ def measure_paged_multi(
                 rt["generated"].shape[1]
             )
 
-            print("\n================ PREFILL ================")
 
-            print(
-                f"[PREFILL] "
-                f"req={rt['request_id']}"
-            )
 
-            print(
-                f"[PREFILL] "
-                f"generated_len="
-                f"{rt['generated'].shape[1]}"
-            )
-
-            print(
-                f"[PREFILL] "
-                f"seq_len="
-                f"{rt['request_state']['seq_len']}"
-            )
-
-            print(
-                tokenizer.decode(
-                    rt["generated"][0],
-                    skip_special_tokens=False,
-                )
-            )
-
-            if (
-                tokenizer.eos_token_id is not None
-                and int(next_token.item())
-                == tokenizer.eos_token_id
-            ):
-
-                rt["finished"] = True
-        print("\n[REQUEST STATE OBJECT CHECK]")
-
-        for rt in runtimes:
-            print(
-                f"req={rt['request_id']} "
-                f"request_state_id={id(rt['request_state'])} "
-                f"seq_len={rt['request_state']['seq_len']}"
-            )
     # -------------------------------------------------
     # 3) DECODE
     # -------------------------------------------------
@@ -525,20 +486,6 @@ def measure_paged_multi(
         if not active_rts:
             break
 
-        print(
-            f"\n================ DECODE STEP {step} ================"
-        )
-
-        for i, rt in enumerate(active_rts):
-
-            print(
-                f"[STEP {step}] "
-                f"req={rt['request_id']} "
-                f"generated_len="
-                f"{rt['generated'].shape[1]} "
-                f"seq_len(before)="
-                f"{rt['request_state']['seq_len']}"
-            )
 
         batch_last_tokens = torch.cat(
             [
@@ -548,29 +495,7 @@ def measure_paged_multi(
             dim=0,
         )
 
-        print(
-            f"\n[STEP {step}] "
-            f"batch_last_tokens.shape="
-            f"{batch_last_tokens.shape}"
-        )
 
-        print(
-            f"\n[STEP {step}] input last tokens"
-        )
-
-        for row in range(batch_last_tokens.shape[0]):
-
-            token_id = int(
-                batch_last_tokens[row, 0].item()
-            )
-
-            decoded = tokenizer.decode([token_id])
-
-            print(
-                f"row={row} "
-                f"token_id={token_id} "
-                f"decoded={repr(decoded)}"
-            )
 
         # -------------------------------------------------
         # decode 기준 seq_len 동기화
@@ -581,17 +506,6 @@ def measure_paged_multi(
                 rt["generated"].shape[1]
         )
 
-        print(
-            f"\n[STEP {step}] seq_len after sync"
-        )
-
-        for i, rt in enumerate(active_rts):
-
-            print(
-                f"req={rt['request_id']} "
-                f"seq_len(after)="
-                f"{rt['request_state']['seq_len']}"
-            )
 
         # -------------------------------------------------
         # cache_position 생성
@@ -609,17 +523,7 @@ def measure_paged_multi(
             batch_cache_position.unsqueeze(1)
         )
 
-        print(
-            f"\n[STEP {step}] batch_cache_position"
-        )
 
-        print(batch_cache_position.tolist())
-
-        print(
-            f"\n[STEP {step}] batch_position_ids"
-        )
-
-        print(batch_position_ids.tolist())
 
         # -------------------------------------------------
         # block table
@@ -634,19 +538,8 @@ def measure_paged_multi(
             for rt in active_rts
         ]
 
-        print(
-            f"\n[STEP {step}] block table status"
-        )
 
-        for row, bt in enumerate(batch_block_tables):
 
-            if hasattr(bt, "physical_blocks"):
-
-                print(
-                    f"row={row} "
-                    f"physical_blocks="
-                    f"{bt.physical_blocks}"
-                )
 
         # -------------------------------------------------
         # runtime 연결
@@ -672,9 +565,6 @@ def measure_paged_multi(
         # -------------------------------------------------
         # forward
         # -------------------------------------------------
-        print(
-            f"\n[STEP {step}] forward start"
-        )
 
         outputs = model(
             input_ids=batch_last_tokens,
@@ -684,18 +574,8 @@ def measure_paged_multi(
             position_ids=batch_position_ids,
         )
 
-        print("\n[AFTER FORWARD]")
 
-        for rt in runtimes:
 
-            print(
-                f"req={rt['request_id']} "
-                f"seq_len={rt['request_state']['seq_len']}"
-            )
-
-        print(
-            f"\n[STEP {step}] forward complete"
-        )
 
         # -------------------------------------------------
         # next token
@@ -739,23 +619,6 @@ def measure_paged_multi(
                 dim=1,
             )
 
-            print(
-                f"[STEP {step}] "
-                f"req={rt['request_id']} "
-                f"generated_len(after append)="
-                f"{rt['generated'].shape[1]}"
-            )
-
-            print(
-                f"[STEP {step}] decoded_so_far="
-            )
-
-            print(
-                tokenizer.decode(
-                    rt["generated"][0],
-                    skip_special_tokens=False,
-                )
-            )
 
             if (
                 tokenizer.eos_token_id is not None
@@ -765,15 +628,6 @@ def measure_paged_multi(
 
                 rt["finished"] = True
 
-                print(
-                    f"[STEP {step}] "
-                    f"req={rt['request_id']} "
-                    f"EOS detected"
-                )
-
-        print(
-            f"\n================ END STEP {step} ================\n"
-        )
 
     if device == "cuda":
 
@@ -815,6 +669,7 @@ def multi_only_main():
     )
 
     max_new_tokens = 20
+
 
     block_size = 16
 
