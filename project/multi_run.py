@@ -297,7 +297,7 @@ def measure_paged_multi(
     prompts,
     scheduler,
     pool,
-    max_new_tokens=3,
+    max_new_tokens=20,
 ):
 
     process = psutil.Process(os.getpid())
@@ -692,7 +692,7 @@ def measure_paged_multi(
                 f"req={rt['request_id']} "
                 f"seq_len={rt['request_state']['seq_len']}"
             )
-            
+
         print(
             f"\n[STEP {step}] forward complete"
         )
