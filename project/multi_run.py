@@ -503,7 +503,14 @@ def measure_paged_multi(
             ):
 
                 rt["finished"] = True
+        print("\n[REQUEST STATE OBJECT CHECK]")
 
+        for rt in runtimes:
+            print(
+                f"req={rt['request_id']} "
+                f"request_state_id={id(rt['request_state'])} "
+                f"seq_len={rt['request_state']['seq_len']}"
+            )
     # -------------------------------------------------
     # 3) DECODE
     # -------------------------------------------------
@@ -571,8 +578,8 @@ def measure_paged_multi(
         for rt in active_rts:
 
             rt["request_state"]["seq_len"] = (
-                rt["generated"].shape[1] - 1
-            )
+                rt["generated"].shape[1]
+        )
 
         print(
             f"\n[STEP {step}] seq_len after sync"
@@ -591,7 +598,7 @@ def measure_paged_multi(
         # -------------------------------------------------
         batch_cache_position = torch.tensor(
             [
-                int(rt["request_state"]["seq_len"])
+                int(rt["request_state"]["seq_len"]) -1
                 for rt in active_rts
             ],
             device=model.device,
