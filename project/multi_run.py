@@ -684,6 +684,15 @@ def measure_paged_multi(
             position_ids=batch_position_ids,
         )
 
+        print("\n[AFTER FORWARD]")
+
+        for rt in runtimes:
+
+            print(
+                f"req={rt['request_id']} "
+                f"seq_len={rt['request_state']['seq_len']}"
+            )
+            
         print(
             f"\n[STEP {step}] forward complete"
         )
