@@ -899,11 +899,32 @@ class PagedLlamaAttention(nn.Module):
         # [b, g, r, q, blk, k]
         # =========================================================
 
-        attn_weights = torch.einsum(
-            "b g r q d, b g n k d -> b g r q n k",
-            q_grouped,
-            k_blocks_for_attn,
-        )
+        # =========================================================
+        # block-wise attention accumulation
+        # =========================================================
+
+        attn_chunks = []
+
+        for blk_idx in range(max_num_needed_blocks):
+
+            # [b, g, n, block_size, d]
+            k_chunk = k_blocks_for_attn[:, :, :, blk_idx]
+
+            # [b, g, r, q, d]
+            q_chunk = q_grouped
+
+            # score:
+            # [b, g, r, q, block_size]
+            score_chunk = torch.einsum(
+                "b g r q d, b g n k d -> b g r q k",
+                q_chunk,
+                k_chunk,
+            )
+
+            attn_chunks.append(score_chunk)
+
+        # concat only needed blocks
+        attn_weights = torch.cat(attn_chunks, dim=-1)
 
         attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
