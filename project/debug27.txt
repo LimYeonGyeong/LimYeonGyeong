@@ -1,0 +1,71 @@
+/usr/local/lib/python3.10/dist-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
+🔥 LlamaModel.forward 위치 = /LimYeonGyeong/project/paged_llama/llama/utils/utils.py
+>>> Multi Request 비교 실행
+>>> Paged multi 로딩 중...
+>>> HF config / state_dict 로딩 중...
+>>> 로컬 paged 모델 생성 중...
+[LOAD] missing keys: 0
+[LOAD] unexpected keys: 0
+>>> 로컬 paged 모델 GPU 이동 중...
+
+[POS][Layer 0] ====================
+[POS] row=0 q_len=21
+[POS] start_pos=0
+[POS] total_seq_len=21
+[BLOCK DEBUG]
+k_blocks.shape = torch.Size([1, 2, 4, 16, 64])
+v_blocks.shape = torch.Size([1, 2, 4, 16, 64])
+
+================ QUERY TRACE ================
+[QUERY] row=0
+[QUERY] real_seq_len=21
+[QUERY] num_needed_blocks=2
+[QUERY] physical_blocks=[3, 4]
+
+[QUERY] block_size=16
+[QUERY] max_num_needed_blocks=2
+[QUERY] attention_compute_tokens=32
+============================================
+
+Traceback (most recent call last):
+  File "/LimYeonGyeong/project/multi_run.py", line 787, in <module>
+    multi_only_main()
+  File "/LimYeonGyeong/project/multi_run.py", line 763, in multi_only_main
+    stats_paged_multi = measure_paged_multi(
+  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/LimYeonGyeong/project/multi_run.py", line 444, in measure_paged_multi
+    outputs = model(
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1445, in forward
+    outputs: BaseModelOutputWithPast = self.model(
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/LimYeonGyeong/project/paged_llama/llama/utils/utils.py", line 38, in wrapper
+    return func(*args, **kwargs)
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1366, in forward
+    hidden_states = decoder_layer(
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_layers.py", line 38, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1224, in forward
+    hidden_states, _ = self.self_attn(
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 918, in forward
+    score_chunk = torch.einsum(
+  File "/usr/local/lib/python3.10/dist-packages/torch/functional.py", line 377, in einsum
+    return _VF.einsum(equation, operands)  # type: ignore[attr-defined]
+RuntimeError: einsum(): the number of subscripts in the equation (5) does not match the number of dimensions (4) for operand 1 and no ellipsis was given
