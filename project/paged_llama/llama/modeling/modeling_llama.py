@@ -1173,37 +1173,68 @@ class PagedLlamaAttention(nn.Module):
         # [b,g,total_seq,d]
         # =========================================================
 
-        v_blocks_for_attn = v_blocks_for_attn.reshape(
-            bsz,
-            self.num_key_value_heads,
-            max_num_needed_blocks * pool.block_size,
-            self.head_dim,
-        )
+        # =========================================================
+        # request별 block-wise value accumulation
+        # =========================================================
 
-        if self.debug_verbose:
-            _tensor_debug(
-                "v_blocks_for_attn(flattened)",
-                v_blocks_for_attn,
-                self.layer_idx,
+        attn_outputs = []
+
+        for row in range(bsz):
+
+            row_num_blocks = int(
+                num_needed_blocks_tensor[row].item()
             )
 
-        # =========================================================
-        # attention output
-        #
-        # attn:
-        # [b,g,r,q,total_seq]
-        #
-        # value:
-        # [b,g,total_seq,d]
-        #
-        # output:
-        # [b,g,r,q,d]
-        # =========================================================
+            row_attn = attn_weights[
+                row : row + 1
+            ]
 
-        attn_output = torch.einsum(
-            "b g r q k, b g k d -> b g r q d",
-            attn_weights,
-            v_blocks_for_attn,
+            row_output = None
+
+            start_idx = 0
+
+            for blk_idx in range(row_num_blocks):
+
+                end_idx = (
+                    start_idx
+                    + pool.block_size
+                )
+
+                # attention slice
+                attn_chunk = row_attn[
+                    :,
+                    :,
+                    :,
+                    :,
+                    start_idx:end_idx
+                ]
+
+                # value block
+                v_chunk = v_blocks_for_attn[
+                    row : row + 1,
+                    :,
+                    blk_idx,
+                ]
+
+                # [1,g,r,q,d]
+                output_chunk = torch.einsum(
+                    "b g r q k, b g k d -> b g r q d",
+                    attn_chunk,
+                    v_chunk,
+                )
+
+                if row_output is None:
+                    row_output = output_chunk
+                else:
+                    row_output = row_output + output_chunk
+
+                start_idx = end_idx
+
+            attn_outputs.append(row_output)
+
+        attn_output = torch.cat(
+            attn_outputs,
+            dim=0,
         )
 
         if self.debug_verbose:
