@@ -915,12 +915,36 @@ class PagedLlamaAttention(nn.Module):
         # [b,g,r,q,total_seq]
         # =========================================================
 
+        # =========================================================
+        # flatten block dimension
+        # =========================================================
+
         attn_weights = attn_weights.reshape(
             bsz,
             self.num_key_value_heads,
             self.num_key_value_groups,
             q_len,
             max_num_needed_blocks * pool.block_size,
+        )
+
+        # =========================================================
+        # row별 real seq len masking
+        # unnecessary compute 제거
+        # =========================================================
+
+        token_positions = torch.arange(
+            max_num_needed_blocks * pool.block_size,
+            device=attn_weights.device,
+        ).view(1, 1, 1, 1, -1)
+
+        real_seq_mask = (
+            token_positions
+            < total_seq_len_tensor.view(bsz, 1, 1, 1, 1)
+        )
+
+        attn_weights = attn_weights.masked_fill(
+            ~real_seq_mask,
+            float("-inf"),
         )
         # =========================================================
         # ATTENTION COMPUTE DEBUG
@@ -956,8 +980,6 @@ class PagedLlamaAttention(nn.Module):
                 f"wasted_tokens={wasted_tokens}"
             )
 
-        print()
-        attn_weights = attn_weights[..., :max_total_seq_len]
 
         if self.debug_verbose:
             _tensor_debug(
