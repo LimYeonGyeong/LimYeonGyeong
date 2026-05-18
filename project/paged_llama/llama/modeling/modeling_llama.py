@@ -1119,13 +1119,6 @@ class PagedLlamaAttention(nn.Module):
             self.head_dim,
         )
 
-        v_blocks_for_attn = v_blocks_for_attn[
-            :,
-            :,
-            :max_total_seq_len,
-            :
-        ]
-
         if self.debug_verbose:
             _tensor_debug(
                 "v_blocks_for_attn(flattened)",
