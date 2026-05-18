@@ -1,3 +1,50 @@
+Traceback (most recent call last):
+  File "/LimYeonGyeong/project/multi_run.py", line 13, in <module>
+    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+  File "/usr/local/lib/python3.10/dist-packages/transformers/__init__.py", line 26, in <module>
+    from . import dependency_versions_check
+  File "/usr/local/lib/python3.10/dist-packages/transformers/dependency_versions_check.py", line 16, in <module>
+    from .utils.versions import require_version, require_version_core
+  File "/usr/local/lib/python3.10/dist-packages/transformers/utils/__init__.py", line 18, in <module>
+    from huggingface_hub import get_full_repo_name  # for backward compatibility
+  File "<frozen importlib._bootstrap>", line 1075, in _handle_fromlist
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/__init__.py", line 1044, in __getattr__
+    submod = importlib.import_module(submod_path)
+  File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/hf_api.py", line 56, in <module>
+    from ._commit_api import (
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/_commit_api.py", line 20, in <module>
+    from .file_download import hf_hub_url
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/file_download.py", line 22, in <module>
+    from ._local_folder import get_local_download_paths, read_download_metadata, write_download_metadata
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/_local_folder.py", line 61, in <module>
+    from .utils import WeakFileLock
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/utils/__init__.py", line 37, in <module>
+    from ._auth import get_stored_tokens, get_token
+  File "/usr/local/lib/python3.10/dist-packages/huggingface_hub/utils/_auth.py", line 16, in <module>
+    import configparser
+  File "/usr/lib/python3.10/configparser.py", line 561, in <module>
+    class RawConfigParser(MutableMapping):
+  File "/usr/lib/python3.10/configparser.py", line 595, in RawConfigParser
+    OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
+  File "/usr/lib/python3.10/re.py", line 251, in compile
+    return _compile(pattern, flags)
+  File "/usr/lib/python3.10/re.py", line 303, in _compile
+    p = sre_compile.compile(pattern, flags)
+  File "/usr/lib/python3.10/sre_compile.py", line 788, in compile
+    p = sre_parse.parse(p, flags)
+  File "/usr/lib/python3.10/sre_parse.py", line 955, in parse
+    p = _parse_sub(source, state, flags & SRE_FLAG_VERBOSE, 0)
+  File "/usr/lib/python3.10/sre_parse.py", line 444, in _parse_sub
+    itemsappend(_parse(source, state, verbose, nested + 1,
+  File "/usr/lib/python3.10/sre_parse.py", line 846, in _parse
+    state.closegroup(group, p)
+  File "/usr/lib/python3.10/sre_parse.py", line 98, in closegroup
+    self.groupwidths[gid] = p.getwidth()
+  File "/usr/lib/python3.10/sre_parse.py", line 199, in getwidth
+    i, j = av[2].getwidth()
+KeyboardInterrupt
 /usr/local/lib/python3.10/dist-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
   warnings.warn(
 🔥 실제 사용 파일 = /LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py
@@ -33,6 +80,10 @@ v_blocks.shape = torch.Size([1, 2, 4, 16, 64])
 [ATTENTION COMPUTE DEBUG]
 attn_weights.shape=torch.Size([1, 4, 8, 21, 32])
 row=0 real_seq_len=21 compute_tokens=32 wasted_tokens=11
+
+[INVALID ATTENTION CHECK]
+row=0 valid_sum=1.000000 invalid_sum=0.000000
+
 Traceback (most recent call last):
   File "/LimYeonGyeong/project/multi_run.py", line 787, in <module>
     multi_only_main()
@@ -46,7 +97,7 @@ Traceback (most recent call last):
     return self._call_impl(*args, **kwargs)
   File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
     return forward_call(*args, **kwargs)
-  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1439, in forward
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1432, in forward
     outputs: BaseModelOutputWithPast = self.model(
   File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
     return self._call_impl(*args, **kwargs)
@@ -54,7 +105,7 @@ Traceback (most recent call last):
     return forward_call(*args, **kwargs)
   File "/LimYeonGyeong/project/paged_llama/llama/utils/utils.py", line 38, in wrapper
     return func(*args, **kwargs)
-  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1360, in forward
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1353, in forward
     hidden_states = decoder_layer(
   File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_layers.py", line 38, in __call__
     return super().__call__(*args, **kwargs)
@@ -62,12 +113,14 @@ Traceback (most recent call last):
     return self._call_impl(*args, **kwargs)
   File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
     return forward_call(*args, **kwargs)
-  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1218, in forward
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1211, in forward
     hidden_states, _ = self.self_attn(
   File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
     return self._call_impl(*args, **kwargs)
   File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 1527, in _call_impl
     return forward_call(*args, **kwargs)
-  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1024, in forward
-    attn_weights = attn_weights.masked_fill(
-RuntimeError: The size of tensor a (21) must match the size of tensor b (32) at non-singleton dimension 4
+  File "/LimYeonGyeong/project/paged_llama/llama/modeling/modeling_llama.py", line 1149, in forward
+    attn_output = torch.einsum(
+  File "/usr/local/lib/python3.10/dist-packages/torch/functional.py", line 377, in einsum
+    return _VF.einsum(equation, operands)  # type: ignore[attr-defined]
+RuntimeError: einsum(): subscript k has size 21 for operand 1 which does not broadcast with previously seen size 32
