@@ -908,15 +908,14 @@ class PagedLlamaAttention(nn.Module):
         for blk_idx in range(max_num_needed_blocks):
 
             # [b, g, n, block_size, d]
-            k_chunk = k_blocks_for_attn[:, :, :, blk_idx]
-
+            k_chunk = k_blocks_for_attn[:, :, blk_idx]
             # [b, g, r, q, d]
             q_chunk = q_grouped
 
             # score:
             # [b, g, r, q, block_size]
             score_chunk = torch.einsum(
-                "b g r q d, b g n k d -> b g r q k",
+                "b g r q d, b g k d -> b g r q k",
                 q_chunk,
                 k_chunk,
             )
