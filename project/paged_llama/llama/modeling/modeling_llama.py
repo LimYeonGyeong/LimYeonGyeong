@@ -900,31 +900,73 @@ class PagedLlamaAttention(nn.Module):
         # =========================================================
 
         # =========================================================
-        # block-wise attention accumulation
+        # real block-wise attention
+        # request별 실제 block까지만 계산
         # =========================================================
 
-        attn_chunks = []
+        attn_chunks_per_row = []
 
-        for blk_idx in range(max_num_needed_blocks):
+        for row in range(bsz):
 
-            # [b, g, n, block_size, d]
-            k_chunk = k_blocks_for_attn[:, :, blk_idx]
-            # [b, g, r, q, d]
-            q_chunk = q_grouped
+            row_chunks = []
 
-            # score:
-            # [b, g, r, q, block_size]
-            score_chunk = torch.einsum(
-                "b g r q d, b g k d -> b g r q k",
-                q_chunk,
-                k_chunk,
+            row_num_blocks = int(
+                num_needed_blocks_tensor[row].item()
             )
 
-            attn_chunks.append(score_chunk)
+            q_row = q_grouped[row : row + 1]
 
-        # concat only needed blocks
-        attn_weights = torch.cat(attn_chunks, dim=-1)
+            for blk_idx in range(row_num_blocks):
 
+                k_chunk = k_blocks_for_attn[
+                    row : row + 1,
+                    :,
+                    blk_idx,
+                ]
+
+                score_chunk = torch.einsum(
+                    "b g r q d, b g k d -> b g r q k",
+                    q_row,
+                    k_chunk,
+                )
+
+                row_chunks.append(score_chunk)
+
+            row_attn = torch.cat(row_chunks, dim=-1)
+
+            attn_chunks_per_row.append(row_attn)
+
+        # =========================================================
+        # batch padding
+        # =========================================================
+
+        max_tokens = (
+            max_num_needed_blocks
+            * pool.block_size
+        )
+
+        padded_attn = []
+
+        for row_attn in attn_chunks_per_row:
+
+            cur_tokens = row_attn.shape[-1]
+
+            if cur_tokens < max_tokens:
+
+                pad_size = max_tokens - cur_tokens
+
+                row_attn = torch.nn.functional.pad(
+                    row_attn,
+                    (0, pad_size),
+                    value=float("-inf"),
+                )
+
+            padded_attn.append(row_attn)
+
+        attn_weights = torch.cat(
+            padded_attn,
+            dim=0,
+        )
 
         # =========================================================
         # block dimension + token dimension flatten
