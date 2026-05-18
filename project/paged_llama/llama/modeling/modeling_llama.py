@@ -926,7 +926,6 @@ class PagedLlamaAttention(nn.Module):
         # concat only needed blocks
         attn_weights = torch.cat(attn_chunks, dim=-1)
 
-        attn_weights *= (1.0 / math.sqrt(self.head_dim))
 
         # =========================================================
         # block dimension + token dimension flatten
