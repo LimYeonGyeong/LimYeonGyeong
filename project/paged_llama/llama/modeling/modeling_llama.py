@@ -465,7 +465,14 @@ class LlamaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
+        
+        print(
+            f"[ATTN SHAPE][Layer {self.layer_idx}] "
+            f"hidden={hidden_states.shape} "
+            f"query={query_states.shape} "
+            f"key={key_states.shape}"
+        )
+        
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -712,28 +719,7 @@ class PagedLlamaAttention(nn.Module):
                 padded_active_indices[row, num_needed_blocks:] = active_indices[-1]
 
             physical_block_idx_per_token[row] = block_table_tensor[0, row_block_idx_logic]
-            print(f"\n[BLOCK MAP][Layer {self.layer_idx}]")
-
-            print(
-                f"row={row} "
-                f"start_pos={start_pos} "
-                f"total_seq_len={total_seq_len}"
-            )
-
-            print(
-                f"logical_block_idx="
-                f"{row_block_idx_logic.tolist()}"
-            )
-
-            print(
-                f"physical_block_idx="
-                f"{physical_block_idx_per_token[row].tolist()}"
-            )
-
-            print(
-                f"block_offset="
-                f"{block_offset[row].tolist()}"
-            )
+            
         # 8. WRITE를 batch scatter로 처리
         batch_idx = torch.arange(bsz, device=target_device, dtype=torch.long)[:, None]
         token_idx = torch.arange(q_len, device=target_device, dtype=torch.long)[None, :]
@@ -774,16 +760,6 @@ class PagedLlamaAttention(nn.Module):
                 :8
             ].detach().float().cpu()
 
-            print(
-                f"\n[KV WRITE] "
-                f"block={pb} "
-                f"offset={off}"
-            )
-
-            print(
-                f"[KV WRITE] "
-                f"k[:8]={written_k.tolist()}"
-            )
 
         # 9. READ를 batch gather로 처리
         layer_k_cache = pool.k_cache[self.layer_idx]
@@ -808,17 +784,6 @@ class PagedLlamaAttention(nn.Module):
                 sample_offset,
                 :8
             ].detach().float().cpu()
-
-            print(
-                f"\n[KV READ] "
-                f"block={sample_block} "
-                f"offset={sample_offset}"
-            )
-
-            print(
-                f"[KV READ] "
-                f"k[:8]={read_k.tolist()}"
-            )
 
         # =========================================================
         # DEBUG
@@ -1105,12 +1070,8 @@ class PagedLlamaAttention(nn.Module):
                 self.layer_idx,
             )
 
-        # =========================================================
-        # 14. block 단위 value accumulation
-        # dense reconstruction 제거
-        # =========================================================
 
-               # =========================================================
+        # =========================================================
         # 14. vectorized value accumulation
         # Python loop 제거
         # =========================================================
