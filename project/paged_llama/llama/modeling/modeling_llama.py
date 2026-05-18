@@ -1011,27 +1011,20 @@ class PagedLlamaAttention(nn.Module):
         )[None, :]
 
         k_pos = torch.arange(
-            max_total_seq_len,
+            max_num_needed_blocks * pool.block_size,
             device=target_device,
             dtype=torch.long,
         )[None, :]
 
-        valid_k_mask = k_pos < total_seq_len_tensor[:, None]
-        causal_keep_mask = k_pos[:, None, :] <= q_abs[:, :, None]
-
-        final_keep_mask = causal_keep_mask & valid_k_mask[:, None, :]
-
-        attn_weights = attn_weights.masked_fill(
-            ~final_keep_mask[:, None, None, :, :],
-            float("-inf"),
+        causal_keep_mask = (
+            k_pos[:, None, :]
+            <= q_abs[:, :, None]
         )
 
-        if self.debug_verbose:
-            _tensor_debug(
-                "attn_weights(after mask)",
-                attn_weights,
-                self.layer_idx,
-            )
+        attn_weights = attn_weights.masked_fill(
+            ~causal_keep_mask[:, None, None, :, :],
+            float("-inf"),
+        )
 
         # =========================================================
         # 13. softmax
