@@ -624,10 +624,16 @@ class PagedLlamaAttention(nn.Module):
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # 6. Value Accumulation
+        # 7. Value Accumulation 및 결과 반환
         attn_output = torch.matmul(attn_weights, v_blocks_flat)
         
-        # [수정] 차원 재구성 시 num_heads와 head_dim을 명시적으로 사용
-        # attn_output: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads * head_dim]
+        # --- 디버그 코드 추가 ---
+        print(f"\n[DEBUG] attn_output.shape before reshape: {attn_output.shape}")
+        print(f"[DEBUG] bsz={bsz}, q_len={q_len}, num_heads={self.num_heads}, head_dim={self.head_dim}")
+        print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
+        # ----------------------
+
+        # 기존 reshape 코드
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.num_heads * self.head_dim)
         
         return self.o_proj(attn_output), None
