@@ -652,7 +652,9 @@ class PagedLlamaAttention(nn.Module):
         print(f"[DEBUG] bsz={bsz}, q_len={q_len}, num_heads={self.num_heads}, head_dim={self.head_dim}")
         print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
         # ----------------------
-        
+        print("attn_weights =", attn_weights.shape)
+        print("value_states =", value_states.shape)
+        print("attn_output =", attn_output.shape)
         attn_output = attn_output.transpose(1, 2).contiguous()
         
         # 2. bsz와 q_len을 유지하면서, 나머지 차원(num_heads * head_dim)을 하나로 합침
@@ -685,7 +687,10 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
+        print("\n===== DECODER LAYER =====")
+        print("layer hidden_states =", hidden_states.shape)
+        print("attention_mask =", None if attention_mask is None else attention_mask.shape)
+        print("position_ids =", None if position_ids is None else position_ids.shape)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -697,6 +702,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             block_table=getattr(self.self_attn, "block_table", None),
             **kwargs,
         )
+        print("after self_attn =", hidden_states.shape)
 
         hidden_states = residual + hidden_states
 
