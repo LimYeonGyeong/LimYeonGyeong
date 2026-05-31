@@ -568,6 +568,10 @@ class PagedLlamaAttention(nn.Module):
         else:
             bt_tensor = block_table.to_tensor(device=target_device) if hasattr(block_table, "to_tensor") else block_table.to(target_device)
 
+        print("block_table type =", type(block_table))
+        print("bt_tensor.shape =", bt_tensor.shape)
+        print("bt_tensor =", bt_tensor)
+        
         # 3. WRITE 로직
         print("\n========== DEBUG ==========")
         print("cache_position.shape =", cache_position.shape)
@@ -590,14 +594,20 @@ class PagedLlamaAttention(nn.Module):
         # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
         # bt_tensor shape: [bsz, max_blocks]
         # k_blocks 인덱싱 후 shape: [bsz, max_blocks, num_heads, block_size, head_dim]
+        print("bt_tensor.shape =", bt_tensor.shape)
+
         k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
-        
+
+        print("k_blocks.shape =", k_blocks.shape)
+        print("v_blocks.shape =", v_blocks.shape)
         # [핵심] 배치 차원이 0번에 오도록 확실히 고정합니다.
         # k_blocks: [bsz, max_blocks, num_heads, block_size, head_dim]
         # bsz를 0번으로 유지하고, num_heads를 1번으로 가져오기 위해 permute
-        k_blocks = k_blocks.permute(0, 2, 1, 3, 4) # [bsz, num_heads, max_blocks, block_size, head_dim]
+        k_blocks = k_blocks.permute(0, 2, 1, 3, 4)
         v_blocks = v_blocks.permute(0, 2, 1, 3, 4)
+
+        print("k_blocks after permute =", k_blocks.shape)
 
         # 이제 bsz가 0번에 있으므로 reshape이 안전합니다.
         # -1은 자동으로 max_blocks * block_size를 계산합니다.
