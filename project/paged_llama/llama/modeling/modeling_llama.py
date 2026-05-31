@@ -1,25 +1,3 @@
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# paged_llama/llama/modeling_llama.py
-
-# paged_llama/llama/modeling/modeling_llama.py
-
 import torch
 from torch import nn
 import math
@@ -591,7 +569,15 @@ class PagedLlamaAttention(nn.Module):
             bt_tensor = block_table.to_tensor(device=target_device) if hasattr(block_table, "to_tensor") else block_table.to(target_device)
 
         # 3. WRITE 로직
+        print("\n========== DEBUG ==========")
+        print("cache_position.shape =", cache_position.shape)
+        print("cache_position =", cache_position)
+        print("q_len =", q_len)
+
         abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
+
+        print("abs_pos.shape =", abs_pos.shape)
+        print("===========================\n")
         block_idx_logic = abs_pos // pool.block_size
         block_offset = abs_pos % pool.block_size
         batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
