@@ -545,10 +545,13 @@ class PagedLlamaAttention(nn.Module):
         use_cache: bool | None = False,
         **kwargs,
     ):
+        print("ATTN INPUT")
+        print("hidden_states.shape =", hidden_states.shape)
         target_device = self.q_proj.weight.device
         bsz, q_len, _ = hidden_states.size()
         pool = self.page_pool
-
+        print("bsz =", bsz)
+        print("q_len =", q_len)
         # 1. Projection
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -557,7 +560,16 @@ class PagedLlamaAttention(nn.Module):
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
+        print("hidden_states.shape =", hidden_states.shape)
 
+        print("query_states.shape =", query_states.shape)
+
+        print("key_states.shape =", key_states.shape)
+
+        print("value_states.shape =", value_states.shape)
+
+        print("bsz =", bsz)
+        print("q_len =", q_len)
         # 2. block_table 텐서 변환
         if isinstance(block_table, list):
             processed_tables = []
@@ -571,7 +583,7 @@ class PagedLlamaAttention(nn.Module):
         print("block_table type =", type(block_table))
         print("bt_tensor.shape =", bt_tensor.shape)
         print("bt_tensor =", bt_tensor)
-        
+
         # 3. WRITE 로직
         print("\n========== DEBUG ==========")
         print("cache_position.shape =", cache_position.shape)
