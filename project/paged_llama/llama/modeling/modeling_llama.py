@@ -513,7 +513,9 @@ class PagedLlamaAttention(nn.Module):
         self.head_dim = config.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
+        
+        self.scaling = self.head_dim**-0.5
+        
         self.page_pool = page_pool
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -569,7 +571,7 @@ class PagedLlamaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         pool = self.page_pool
 
-        # 1. 프로젝션
+        # 1. Projection
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -578,62 +580,54 @@ class PagedLlamaAttention(nn.Module):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-        # 2. block_table 텐서 변환 (리스트 및 타입 에러 방지)
+        # 2. block_table 텐서 변환
         if isinstance(block_table, list):
             processed_tables = []
             for bt in block_table:
-                if hasattr(bt, "to_tensor"):
-                    processed_tables.append(bt.to_tensor(device=target_device))
-                else:
-                    processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
-            bt_tensor = torch.stack(processed_tables).squeeze(1) 
-        elif hasattr(block_table, "to_tensor"):
-            bt_tensor = block_table.to_tensor(device=target_device)
+                if hasattr(bt, "to_tensor"): processed_tables.append(bt.to_tensor(device=target_device))
+                else: processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
+            bt_tensor = torch.stack(processed_tables).squeeze(1)
         else:
-            bt_tensor = block_table.to(target_device)
+            bt_tensor = block_table.to_tensor(device=target_device) if hasattr(block_table, "to_tensor") else block_table.to(target_device)
 
-        # 3. WRITE 로직 (캐시 저장)
+        # 3. WRITE 로직
         abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
         block_idx_logic = abs_pos // pool.block_size
         block_offset = abs_pos % pool.block_size
-        
-        # 직접 인덱싱 사용 (gather 차원 오류 방지)
         batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
         physical_block_idx_per_token = bt_tensor[batch_indices, block_idx_logic]
 
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-        # 5. KV Cache READ (벡터화된 Gather)
+        # 4. READ 및 Attention 연산
         k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-        # 차원 정리: [bsz, max_blocks, num_kv_heads, block_size, head_dim]
-        # -> [bsz, num_kv_heads, max_blocks * block_size, head_dim]
         k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
         v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
-
-        # [핵심] 쿼리 헤드 수에 맞게 KV 헤드 확장 (Broadcast)
-        # num_key_value_groups = num_heads / num_kv_heads
+        
+        # 헤드 확장
         k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
         v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
 
-        # 이제 query_states와 k_blocks_flat의 헤드 차원이 [bsz, num_heads, ...]로 일치합니다.
         attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
         
-        # 6. 마스킹 및 Softmax (이하 동일)
-        total_len = cache_position.max() + q_len
-        # mask shape을 [bsz, 1, 1, total_kv_len]으로 유지
-        mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
+        # 5. 요청별 동적 마스킹
+        # [bsz, 1, 1, total_kv_len]
+        total_kv_len = k_blocks_flat.size(2)
+        token_idx = torch.arange(total_kv_len, device=target_device).view(1, 1, 1, -1)
+        # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
+        mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+        
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # 7. Value Accumulation
+        # 6. Value Accumulation
         attn_output = torch.matmul(attn_weights, v_blocks_flat)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         
         return self.o_proj(attn_output), None
-    
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
