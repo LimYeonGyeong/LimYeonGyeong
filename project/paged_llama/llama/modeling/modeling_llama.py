@@ -571,7 +571,7 @@ class PagedLlamaAttention(nn.Module):
             bsz, q_len, _ = hidden_states.size()
             pool = self.page_pool
 
-            # 2. Q, K, V Projection
+            # 2. Projection
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -581,39 +581,42 @@ class PagedLlamaAttention(nn.Module):
                 cos, sin = position_embeddings
                 query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-            # 4. KV Cache Write (배치 단위 Scatter)
-            # abs_pos 계산 및 physical_block_idx 할당은 유지 (캐시 저장을 위해 필수)
-            # ... [기존 WRITE 로직 유지: physical_block_idx_per_token, block_offset 계산] ...
+            # 4. KV Cache WRITE 로직 (루프 유지 또는 벡터화) - 반드시 포함!
+            # block_table_tensors가 각 요청의 물리 블록을 담고 있다고 가정
+            abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
+            block_idx_logic = abs_pos // pool.block_size
+            block_offset = abs_pos % pool.block_size
+            
+            # block_table(Tensor)에서 인덱싱
+            physical_block_idx_per_token = torch.gather(block_table, 1, block_idx_logic)
+
+            # 실제 메모리 기록 (이게 있어야 KV 데이터가 저장됨)
             pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
             pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-            # 5. KV Cache Read (배치 단위 Gather) - 여기서 루프 제거
-            # block_table: [bsz, max_blocks]
-            current_block_table = block_table.to(target_device) 
-            
-            # [bsz, max_blocks, num_kv_heads, block_size, head_dim]
-            k_blocks = pool.k_cache[self.layer_idx, current_block_table]
-            v_blocks = pool.v_cache[self.layer_idx, current_block_table]
+            # 5. KV Cache READ (벡터화된 Gather)
+            # block_table을 이용해 모든 블록 한 번에 읽기
+            k_blocks = pool.k_cache[self.layer_idx, block_table]
+            v_blocks = pool.v_cache[self.layer_idx, block_table]
 
             # 6. Attention 연산 (Vectorized)
-            # k_blocks를 [bsz, num_kv_heads, max_blocks * block_size, head_dim]으로 변환
             k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
             v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
 
-            # Q @ K^T 연산
             attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
             
-            # 7. 마스킹 및 Softmax (요청별 유효 토큰 기준)
-            # [bsz, num_heads, q_len, total_compute_tokens]
-            attn_weights = self.apply_masking(attn_weights, total_seq_len_tensor, max_num_needed_blocks * pool.block_size)
+            # 7. 마스킹 및 Softmax
+            # total_seq_len_tensor 등은 루프 제거 전 코드에서 계산하던 방식 활용 가능
+            mask = (torch.arange(attn_weights.size(-1), device=target_device) < (cache_position.unsqueeze(1) + q_len)).view(bsz, 1, 1, -1)
+            attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-            # 8. Value Accumulation
+            # 8. Value Accumulation 및 결과 반환
             attn_output = torch.matmul(attn_weights, v_blocks_flat)
-            
-            # 9. Output Projection
             attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+            
             return self.o_proj(attn_output), None
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
