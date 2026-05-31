@@ -600,33 +600,31 @@ class PagedLlamaAttention(nn.Module):
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-# 4. KV Cache READ 및 차원 정렬
-        # k_blocks: [bsz, max_blocks, kv_heads, block_size, head_dim]
-        # k_blocks를 강제로 [bsz, kv_heads, max_blocks * block_size, head_dim]으로 만듭니다.
-        
-        # 1. bsz 차원이 항상 첫 번째에 오도록 확보
-        # 인덱싱 후 k_blocks가 [bsz, max_blocks, kv_heads, block_size, head_dim] 인지 반드시 확인하세요.
-        # 만약 k_blocks가 [21, ...]로 나온다면, 이는 bt_tensor의 bsz가 1인데 
-        # 어디선가 bsz를 21로 착각하고 있는 것입니다.
-        
-        # [수정] READ 후 차원 정렬을 명확하게 합니다.
-        k_blocks = pool.k_cache[self.layer_idx, bt_tensor] # [bsz, max_blocks, kv_heads, block_size, head_dim]
+        # 4. READ 및 차원 정렬
+        # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
+        # bt_tensor shape: [bsz, max_blocks]
+        # k_blocks 인덱싱 후 shape: [bsz, max_blocks, num_heads, block_size, head_dim]
+        k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
         
-        # permute(0, 2, 1, 3, 4) -> [bsz, kv_heads, max_blocks, block_size, head_dim]
-        k_blocks = k_blocks.permute(0, 2, 1, 3, 4) 
+        # [핵심] 배치 차원이 0번에 오도록 확실히 고정합니다.
+        # k_blocks: [bsz, max_blocks, num_heads, block_size, head_dim]
+        # bsz를 0번으로 유지하고, num_heads를 1번으로 가져오기 위해 permute
+        k_blocks = k_blocks.permute(0, 2, 1, 3, 4) # [bsz, num_heads, max_blocks, block_size, head_dim]
         v_blocks = v_blocks.permute(0, 2, 1, 3, 4)
-        
-        # 이제 reshape 시 bsz를 명시
+
+        # 이제 bsz가 0번에 있으므로 reshape이 안전합니다.
+        # -1은 자동으로 max_blocks * block_size를 계산합니다.
         k_blocks_flat = k_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
         v_blocks_flat = v_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
-        
+
         # 5. 헤드 확장 (repeat_kv)
         k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
         v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
-        
-        # 이후 로직은 기존대로 유지
+
+        # 6. Attention 연산
         attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
+        
         # 5. 요청별 동적 마스킹
         # [bsz, 1, 1, total_kv_len]
         total_kv_len = k_blocks_flat.size(2)
