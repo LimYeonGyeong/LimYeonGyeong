@@ -633,8 +633,10 @@ class PagedLlamaAttention(nn.Module):
         print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
         # ----------------------
 
-        # 기존 reshape 코드
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        
+        # 이제 attn_output은 [bsz, q_len, num_heads, head_dim]
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
         
         return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
