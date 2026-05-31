@@ -566,57 +566,61 @@ class PagedLlamaAttention(nn.Module):
             use_cache: bool | None = False,
             **kwargs,
         ):
-            # 1. 설정 및 준비
             target_device = self.q_proj.weight.device
             bsz, q_len, _ = hidden_states.size()
             pool = self.page_pool
 
-            # 2. Projection
+            # 1. 프로젝션
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            # 3. RoPE 적용
             if position_embeddings is not None:
                 cos, sin = position_embeddings
                 query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-            # 4. KV Cache WRITE 로직 (루프 유지 또는 벡터화) - 반드시 포함!
-            # block_table_tensors가 각 요청의 물리 블록을 담고 있다고 가정
+            # 2. block_table 텐서 변환 (타입 오류 방지)
+            if hasattr(block_table, "to_tensor"):
+                bt_tensor = block_table.to_tensor(device=target_device)
+            else:
+                bt_tensor = block_table.to(target_device)
+
+            # 3. WRITE 로직 (캐시 저장 - 반드시 유지)
             abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # block_table(Tensor)에서 인덱싱
-            physical_block_idx_per_token = torch.gather(block_table, 1, block_idx_logic)
+            # bt_tensor가 [bsz, max_blocks]라고 가정
+            physical_block_idx_per_token = torch.gather(bt_tensor, 1, block_idx_logic)
 
-            # 실제 메모리 기록 (이게 있어야 KV 데이터가 저장됨)
             pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
             pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-            # 5. KV Cache READ (벡터화된 Gather)
-            # block_table을 이용해 모든 블록 한 번에 읽기
-            k_blocks = pool.k_cache[self.layer_idx, block_table]
-            v_blocks = pool.v_cache[self.layer_idx, block_table]
+            # 4. READ 로직 (벡터화된 Gather)
+            # bt_tensor를 사용하여 일괄적으로 블록 캐시 읽기
+            k_blocks = pool.k_cache[self.layer_idx, bt_tensor] # [bsz, max_blocks, num_kv_heads, block_size, head_dim]
+            v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-            # 6. Attention 연산 (Vectorized)
+            # 5. Attention 연산 (Vectorized)
+            # 차원 정리: [bsz, num_heads, total_kv_len, head_dim]으로 변환
             k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
             v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
 
+            # Q @ K^T
             attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
             
-            # 7. 마스킹 및 Softmax
-            # total_seq_len_tensor 등은 루프 제거 전 코드에서 계산하던 방식 활용 가능
-            mask = (torch.arange(attn_weights.size(-1), device=target_device) < (cache_position.unsqueeze(1) + q_len)).view(bsz, 1, 1, -1)
+            # 6. 마스킹 및 Softmax
+            # total_len: 현재까지의 모든 토큰 길이
+            total_len = cache_position.max() + q_len
+            mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
             attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-            # 8. Value Accumulation 및 결과 반환
+            # 7. Value Accumulation
             attn_output = torch.matmul(attn_weights, v_blocks_flat)
             attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
             
             return self.o_proj(attn_output), None
-
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
