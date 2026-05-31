@@ -604,27 +604,36 @@ class PagedLlamaAttention(nn.Module):
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-        # 4. READ 로직 (벡터화된 Gather)
+        # 5. KV Cache READ (벡터화된 Gather)
         k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-        # 5. Attention 연산 (Vectorized)
+        # 차원 정리: [bsz, max_blocks, num_kv_heads, block_size, head_dim]
+        # -> [bsz, num_kv_heads, max_blocks * block_size, head_dim]
         k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
         v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
 
+        # [핵심] 쿼리 헤드 수에 맞게 KV 헤드 확장 (Broadcast)
+        # num_key_value_groups = num_heads / num_kv_heads
+        k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
+        v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
+
+        # 이제 query_states와 k_blocks_flat의 헤드 차원이 [bsz, num_heads, ...]로 일치합니다.
         attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
         
-        # 6. 마스킹 및 Softmax
+        # 6. 마스킹 및 Softmax (이하 동일)
         total_len = cache_position.max() + q_len
+        # mask shape을 [bsz, 1, 1, total_kv_len]으로 유지
         mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # 7. Value Accumulation 및 결과 반환
+        # 7. Value Accumulation
         attn_output = torch.matmul(attn_weights, v_blocks_flat)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         
         return self.o_proj(attn_output), None
+    
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
