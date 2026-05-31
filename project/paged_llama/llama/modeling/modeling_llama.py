@@ -633,12 +633,12 @@ class PagedLlamaAttention(nn.Module):
         print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
         # ----------------------
         
-        # 1. bsz 차원을 유지하고, num_heads(1번)와 q_len(2번)을 swap
-        attn_output = attn_output.transpose(1, 2).contiguous() 
+        attn_output = attn_output.transpose(1, 2).contiguous()
         
-        # 2. bsz=1인 경우 텐서의 차원을 명확히 reshape
-        # 최종적으로 [bsz, q_len, num_heads * head_dim] 형태여야 합니다.
-        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
+        # 2. bsz와 q_len을 유지하면서, 나머지 차원(num_heads * head_dim)을 하나로 합침
+        # view 대신 flatten을 사용하여 [bsz, q_len, -1]로 만들면, 
+        # 뒤의 2차원(num_heads * head_dim)이 자동으로 2048로 계산됩니다.
+        attn_output = attn_output.flatten(2, 3) 
         
         return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
