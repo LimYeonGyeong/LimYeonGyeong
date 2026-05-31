@@ -554,77 +554,77 @@ class PagedLlamaAttention(nn.Module):
         return [single for _ in range(bsz)]
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-            attention_mask: torch.Tensor | None = None,
-            past_key_values: Cache | None = None,
-            cache_position: torch.LongTensor | None = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            block_table: Optional[torch.Tensor] = None,
-            use_cache: bool | None = False,
-            **kwargs,
-        ):
-            target_device = self.q_proj.weight.device
-            bsz, q_len, _ = hidden_states.size()
-            pool = self.page_pool
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        use_cache: bool | None = False,
+        **kwargs,
+    ):
+        target_device = self.q_proj.weight.device
+        bsz, q_len, _ = hidden_states.size()
+        pool = self.page_pool
 
-            # 1. Projection
-            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # 1. 프로젝션
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            if position_embeddings is not None:
-                cos, sin = position_embeddings
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-            # 2. block_table 변환 로직 (리스트/객체 대응 수정)
-            if isinstance(block_table, list):
-                # BlockTable 객체들이 리스트로 들어온 경우 각 텐서로 변환 후 stack
-                processed_tables = []
-                for bt in block_table:
-                    # BlockTable 객체라면 to_tensor(), 아니면 그대로 사용 시도
-                    if hasattr(bt, "to_tensor"):
-                        processed_tables.append(bt.to_tensor(device=target_device))
-                    else:
-                        processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
-                bt_tensor = torch.stack(processed_tables).squeeze(1) # [bsz, max_blocks]
-            elif hasattr(block_table, "to_tensor"):
-                bt_tensor = block_table.to_tensor(device=target_device)
-            else:
-                bt_tensor = block_table.to(target_device)
+        # 2. block_table 텐서 변환 (리스트 및 타입 에러 방지)
+        if isinstance(block_table, list):
+            processed_tables = []
+            for bt in block_table:
+                if hasattr(bt, "to_tensor"):
+                    processed_tables.append(bt.to_tensor(device=target_device))
+                else:
+                    processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
+            bt_tensor = torch.stack(processed_tables).squeeze(1) 
+        elif hasattr(block_table, "to_tensor"):
+            bt_tensor = block_table.to_tensor(device=target_device)
+        else:
+            bt_tensor = block_table.to(target_device)
 
-            # 3. WRITE 로직 (캐시 저장)
-            abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
-            block_idx_logic = abs_pos // pool.block_size
-            block_offset = abs_pos % pool.block_size
-            
-            physical_block_idx_per_token = torch.gather(bt_tensor, 1, block_idx_logic)
+        # 3. WRITE 로직 (캐시 저장)
+        abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
+        block_idx_logic = abs_pos // pool.block_size
+        block_offset = abs_pos % pool.block_size
+        
+        # 직접 인덱싱 사용 (gather 차원 오류 방지)
+        batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
+        physical_block_idx_per_token = bt_tensor[batch_indices, block_idx_logic]
 
-            pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
-            pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
+        pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
+        pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-            # 4. READ 로직 (벡터화된 Gather)
-            k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
-            v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
+        # 4. READ 로직 (벡터화된 Gather)
+        k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
+        v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-            # 5. Attention 연산
-            k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
-            v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
+        # 5. Attention 연산 (Vectorized)
+        k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
+        v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
 
-            attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
-            
-            # 6. 마스킹 및 Softmax
-            total_len = cache_position.max() + q_len
-            mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
-            attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
-            attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
+        
+        # 6. 마스킹 및 Softmax
+        total_len = cache_position.max() + q_len
+        mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
+        attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-            # 7. Value Accumulation 및 결과 반환
-            attn_output = torch.matmul(attn_weights, v_blocks_flat)
-            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
-            
-            return self.o_proj(attn_output), None
+        # 7. Value Accumulation 및 결과 반환
+        attn_output = torch.matmul(attn_weights, v_blocks_flat)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        
+        return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
