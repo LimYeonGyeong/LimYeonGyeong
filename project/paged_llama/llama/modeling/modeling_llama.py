@@ -553,7 +553,6 @@ class PagedLlamaAttention(nn.Module):
 
         return [single for _ in range(bsz)]
 
-
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -570,7 +569,7 @@ class PagedLlamaAttention(nn.Module):
             bsz, q_len, _ = hidden_states.size()
             pool = self.page_pool
 
-            # 1. 프로젝션
+            # 1. Projection
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -579,44 +578,49 @@ class PagedLlamaAttention(nn.Module):
                 cos, sin = position_embeddings
                 query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
 
-            # 2. block_table 텐서 변환 (타입 오류 방지)
-            if hasattr(block_table, "to_tensor"):
+            # 2. block_table 변환 로직 (리스트/객체 대응 수정)
+            if isinstance(block_table, list):
+                # BlockTable 객체들이 리스트로 들어온 경우 각 텐서로 변환 후 stack
+                processed_tables = []
+                for bt in block_table:
+                    # BlockTable 객체라면 to_tensor(), 아니면 그대로 사용 시도
+                    if hasattr(bt, "to_tensor"):
+                        processed_tables.append(bt.to_tensor(device=target_device))
+                    else:
+                        processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
+                bt_tensor = torch.stack(processed_tables).squeeze(1) # [bsz, max_blocks]
+            elif hasattr(block_table, "to_tensor"):
                 bt_tensor = block_table.to_tensor(device=target_device)
             else:
                 bt_tensor = block_table.to(target_device)
 
-            # 3. WRITE 로직 (캐시 저장 - 반드시 유지)
+            # 3. WRITE 로직 (캐시 저장)
             abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
             block_idx_logic = abs_pos // pool.block_size
             block_offset = abs_pos % pool.block_size
             
-            # bt_tensor가 [bsz, max_blocks]라고 가정
             physical_block_idx_per_token = torch.gather(bt_tensor, 1, block_idx_logic)
 
             pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
             pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
             # 4. READ 로직 (벡터화된 Gather)
-            # bt_tensor를 사용하여 일괄적으로 블록 캐시 읽기
-            k_blocks = pool.k_cache[self.layer_idx, bt_tensor] # [bsz, max_blocks, num_kv_heads, block_size, head_dim]
+            k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
             v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-            # 5. Attention 연산 (Vectorized)
-            # 차원 정리: [bsz, num_heads, total_kv_len, head_dim]으로 변환
+            # 5. Attention 연산
             k_blocks_flat = k_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
             v_blocks_flat = v_blocks.permute(0, 2, 1, 3, 4).reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
 
-            # Q @ K^T
             attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
             
             # 6. 마스킹 및 Softmax
-            # total_len: 현재까지의 모든 토큰 길이
             total_len = cache_position.max() + q_len
             mask = (torch.arange(attn_weights.size(-1), device=target_device) < total_len).view(1, 1, 1, -1)
             attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-            # 7. Value Accumulation
+            # 7. Value Accumulation 및 결과 반환
             attn_output = torch.matmul(attn_weights, v_blocks_flat)
             attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
             
