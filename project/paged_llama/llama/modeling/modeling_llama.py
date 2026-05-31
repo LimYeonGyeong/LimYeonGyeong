@@ -625,7 +625,10 @@ class PagedLlamaAttention(nn.Module):
 
         # 6. Value Accumulation
         attn_output = torch.matmul(attn_weights, v_blocks_flat)
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+        
+        # [수정] 차원 재구성 시 num_heads와 head_dim을 명시적으로 사용
+        # attn_output: [bsz, num_heads, q_len, head_dim] -> [bsz, q_len, num_heads * head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.num_heads * self.head_dim)
         
         return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
