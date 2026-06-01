@@ -452,8 +452,10 @@ def measure_paged_multi(
             dim=-1,
             keepdim=True,
         )
-        print("logits top5 =",
-            torch.topk(logits[0,-1],5))
+        print(
+            "logits top5 =",
+            torch.topk(outputs.logits[0, -1], 5)
+        )
         for i, rt in enumerate(group_rts):
 
             next_token = next_tokens[i:i+1]
