@@ -694,8 +694,7 @@ class PagedLlamaAttention(nn.Module):
         # view 대신 flatten을 사용하여 [bsz, q_len, -1]로 만들면, 
         # 뒤의 2차원(num_heads * head_dim)이 자동으로 2048로 계산됩니다.
         attn_output = attn_output.flatten(2, 3) 
-        print("logits top5 =",
-            torch.topk(logits[0,-1],5))
+        
         return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):

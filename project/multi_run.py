@@ -440,7 +440,7 @@ def measure_paged_multi(
                 rt["request_id"],
                 0,
             )
-
+        
         outputs = model(
             input_ids=batch_input_ids,
             use_cache=True,
@@ -452,7 +452,8 @@ def measure_paged_multi(
             dim=-1,
             keepdim=True,
         )
-
+        print("logits top5 =",
+            torch.topk(logits[0,-1],5))
         for i, rt in enumerate(group_rts):
 
             next_token = next_tokens[i:i+1]
