@@ -639,7 +639,10 @@ class PagedLlamaAttention(nn.Module):
         token_idx = torch.arange(total_kv_len, device=target_device).view(1, 1, 1, -1)
         print("before mask =", attn_weights.shape)
         # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
-        mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
+        #mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
+        current_len = cache_position[:, -1] + 1
+
+        mask = token_idx < current_len.view(bsz,1,1,1) 
         print("mask =", mask.shape)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
         print("after mask =", attn_weights.shape)
