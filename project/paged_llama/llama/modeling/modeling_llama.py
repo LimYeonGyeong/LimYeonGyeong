@@ -594,22 +594,36 @@ class PagedLlamaAttention(nn.Module):
 
         print("abs_pos.shape =", abs_pos.shape)
         print("===========================\n")
+        print("abs_pos =", abs_pos)
+
         block_idx_logic = abs_pos // pool.block_size
+
+        print("block_idx_logic =", block_idx_logic)
+        print("block_idx_logic.max =", block_idx_logic.max().item())
+
         block_offset = abs_pos % pool.block_size
-        batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
-        physical_block_idx_per_token = bt_tensor[batch_indices, block_idx_logic]
+
+        print("before physical index")
+
+        physical_block_idx_per_token = \
+            bt_tensor[batch_indices, block_idx_logic]
+
+        print("physical index success")
+
+        print("physical_block_idx_per_token.shape =",
+            physical_block_idx_per_token.shape)
+
+        print("before k write")
 
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
+
+        print("k write success")
+
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
-        print("cache_position.shape =", cache_position.shape)
-        print("cache_position =", cache_position)
+    
 
-        print("abs_pos.shape =", abs_pos.shape)
-        print("abs_pos max =", abs_pos.max().item())
-
-        print("block_idx_logic.shape =", block_idx_logic.shape)
-        print("block_idx_logic max =", block_idx_logic.max().item())
-        print("bt_tensor.shape =", bt_tensor.shape)
+        print("v write success")
+        
         # 4. READ 및 차원 정렬
         # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
         # bt_tensor shape: [bsz, max_blocks]
