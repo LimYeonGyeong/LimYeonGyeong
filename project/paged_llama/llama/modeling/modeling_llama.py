@@ -590,7 +590,7 @@ class PagedLlamaAttention(nn.Module):
         print("cache_position =", cache_position)
         print("q_len =", q_len)
 
-        abs_pos = cache_position.unsqueeze(1) + torch.arange(q_len, device=target_device).unsqueeze(0)
+        abs_pos = cache_position.unsqueeze(1)
 
         print("abs_pos.shape =", abs_pos.shape)
         print("===========================\n")
