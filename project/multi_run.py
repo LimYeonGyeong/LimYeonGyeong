@@ -508,7 +508,15 @@ def measure_paged_multi(
             rt["request_state"]["seq_len"] = (
                 rt["generated"].shape[1]
         )
+        print("generated_len",
+            [rt["generated"].shape[1]
+            for rt in active_rts])
 
+        print(
+            "seq_len=",
+            [rt["request_state"]["seq_len"]
+            for rt in active_rts]
+        )
 
         # -------------------------------------------------
         # cache_position 생성
