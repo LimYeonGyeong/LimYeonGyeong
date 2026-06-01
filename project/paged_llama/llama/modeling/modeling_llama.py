@@ -667,6 +667,10 @@ class PagedLlamaAttention(nn.Module):
             current_len = cache_position + 1
         else:
             current_len = cache_position[:, -1] + 1
+        print(
+            "active_request_states =",
+            active_request_states
+        )
         print("current_len =", current_len)
         mask = token_idx < current_len.view(bsz,1,1,1) 
         print("mask sum =", mask.sum(dim=-1))
