@@ -604,6 +604,7 @@ class PagedLlamaAttention(nn.Module):
         block_offset = abs_pos % pool.block_size
 
         print("before physical index")
+        batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
 
         physical_block_idx_per_token = \
             bt_tensor[batch_indices, block_idx_logic]
@@ -614,16 +615,13 @@ class PagedLlamaAttention(nn.Module):
             physical_block_idx_per_token.shape)
 
         print("before k write")
-
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
 
         print("k write success")
 
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
-    
 
         print("v write success")
-        
         # 4. READ 및 차원 정렬
         # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
         # bt_tensor shape: [bsz, max_blocks]
