@@ -601,7 +601,15 @@ class PagedLlamaAttention(nn.Module):
 
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
+        print("cache_position.shape =", cache_position.shape)
+        print("cache_position =", cache_position)
 
+        print("abs_pos.shape =", abs_pos.shape)
+        print("abs_pos max =", abs_pos.max().item())
+
+        print("block_idx_logic.shape =", block_idx_logic.shape)
+        print("block_idx_logic max =", block_idx_logic.max().item())
+        print("bt_tensor.shape =", bt_tensor.shape)
         # 4. READ 및 차원 정렬
         # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
         # bt_tensor shape: [bsz, max_blocks]
