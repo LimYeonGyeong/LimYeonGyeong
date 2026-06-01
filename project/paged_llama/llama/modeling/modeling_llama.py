@@ -645,7 +645,13 @@ class PagedLlamaAttention(nn.Module):
         # -1은 자동으로 max_blocks * block_size를 계산합니다.
         k_blocks_flat = k_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
         v_blocks_flat = v_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
+        def debug_kv(name, k, v):
+            print(f"\n[{name}]")
+            print("K shape:", k.shape)
+            print("V shape:", v.shape)
 
+            print("K first 5:", k[0, 0, 0, :5].detach().float().cpu())
+            print("V first 5:", v[0, 0, 0, :5].detach().float().cpu())
         # 5. 헤드 확장 (repeat_kv)
         k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
         v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
@@ -667,10 +673,7 @@ class PagedLlamaAttention(nn.Module):
             current_len = cache_position + 1
         else:
             current_len = cache_position[:, -1] + 1
-        print(
-            "active_request_states =",
-            active_request_states
-        )
+        
         print("current_len =", current_len)
         mask = token_idx < current_len.view(bsz,1,1,1) 
         print("mask sum =", mask.sum(dim=-1))
