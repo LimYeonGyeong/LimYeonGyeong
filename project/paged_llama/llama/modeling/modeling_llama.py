@@ -637,10 +637,12 @@ class PagedLlamaAttention(nn.Module):
         # [bsz, 1, 1, total_kv_len]
         total_kv_len = k_blocks_flat.size(2)
         token_idx = torch.arange(total_kv_len, device=target_device).view(1, 1, 1, -1)
+        print("before mask =", attn_weights.shape)
         # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
         mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
+        print("mask =", mask.shape)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
-        
+        print("after mask =", attn_weights.shape)
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # 6. Value Accumulation
