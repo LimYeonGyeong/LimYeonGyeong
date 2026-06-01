@@ -660,7 +660,6 @@ class PagedLlamaAttention(nn.Module):
         print("before mask =", attn_weights.shape)
 
 
-        print("mask sum =", mask.sum(dim=-1))
         # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
         #mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
         #current_len = cache_position[:, -1] + 1
@@ -670,6 +669,7 @@ class PagedLlamaAttention(nn.Module):
             current_len = cache_position[:, -1] + 1
         print("current_len =", current_len)
         mask = token_idx < current_len.view(bsz,1,1,1) 
+        print("mask sum =", mask.sum(dim=-1))
         print("mask =", mask.shape)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
         print("after mask =", attn_weights.shape)
