@@ -545,13 +545,13 @@ class PagedLlamaAttention(nn.Module):
         use_cache: bool | None = False,
         **kwargs,
     ):
-        print("ATTN INPUT")
-        print("hidden_states.shape =", hidden_states.shape)
+    #    print("ATTN INPUT")
+    #    print("hidden_states.shape =", hidden_states.shape)
         target_device = self.q_proj.weight.device
         bsz, q_len, _ = hidden_states.size()
         pool = self.page_pool
-        print("bsz =", bsz)
-        print("q_len =", q_len)
+    #    print("bsz =", bsz)
+    #    print("q_len =", q_len)
         # 1. Projection
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -560,16 +560,16 @@ class PagedLlamaAttention(nn.Module):
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
-        print("hidden_states.shape =", hidden_states.shape)
+    #    print("hidden_states.shape =", hidden_states.shape)
 
         print("query_states.shape =", query_states.shape)
 
-        print("key_states.shape =", key_states.shape)
+    #    print("key_states.shape =", key_states.shape)
 
-        print("value_states.shape =", value_states.shape)
+    #    print("value_states.shape =", value_states.shape)
 
-        print("bsz =", bsz)
-        print("q_len =", q_len)
+    #    print("bsz =", bsz)
+    #    print("q_len =", q_len)
         # 2. block_table 텐서 변환
         if isinstance(block_table, list):
             processed_tables = []
@@ -580,15 +580,15 @@ class PagedLlamaAttention(nn.Module):
         else:
             bt_tensor = block_table.to_tensor(device=target_device) if hasattr(block_table, "to_tensor") else block_table.to(target_device)
 
-        print("block_table type =", type(block_table))
-        print("bt_tensor.shape =", bt_tensor.shape)
-        print("bt_tensor =", bt_tensor)
+    #    print("block_table type =", type(block_table))
+    #    print("bt_tensor.shape =", bt_tensor.shape)
+    #    print("bt_tensor =", bt_tensor)
 
         # 3. WRITE 로직
         print("\n========== DEBUG ==========")
         print("cache_position.shape =", cache_position.shape)
         print("cache_position =", cache_position)
-        print("q_len =", q_len)
+    #    print("q_len =", q_len)
 
         abs_pos = cache_position.unsqueeze(1)
 
@@ -603,43 +603,43 @@ class PagedLlamaAttention(nn.Module):
 
         block_offset = abs_pos % pool.block_size
 
-        print("before physical index")
+    #    print("before physical index")
         batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
 
         physical_block_idx_per_token = \
             bt_tensor[batch_indices, block_idx_logic]
 
-        print("physical index success")
+    #    print("physical index success")
 
         print("physical_block_idx_per_token.shape =",
             physical_block_idx_per_token.shape)
 
-        print("before k write")
+    #    print("before k write")
         pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
 
-        print("k write success")
+    #    print("k write success")
 
         pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
 
-        print("v write success")
+    #    print("v write success")
         # 4. READ 및 차원 정렬
         # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
         # bt_tensor shape: [bsz, max_blocks]
         # k_blocks 인덱싱 후 shape: [bsz, max_blocks, num_heads, block_size, head_dim]
-        print("bt_tensor.shape =", bt_tensor.shape)
+    #    print("bt_tensor.shape =", bt_tensor.shape)
 
         k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-        print("k_blocks.shape =", k_blocks.shape)
-        print("v_blocks.shape =", v_blocks.shape)
+    #    print("k_blocks.shape =", k_blocks.shape)
+    #    print("v_blocks.shape =", v_blocks.shape)
         # [핵심] 배치 차원이 0번에 오도록 확실히 고정합니다.
         # k_blocks: [bsz, max_blocks, num_heads, block_size, head_dim]
         # bsz를 0번으로 유지하고, num_heads를 1번으로 가져오기 위해 permute
         k_blocks = k_blocks.permute(0, 2, 1, 3, 4)
         v_blocks = v_blocks.permute(0, 2, 1, 3, 4)
 
-        print("k_blocks after permute =", k_blocks.shape)
+    #    print("k_blocks after permute =", k_blocks.shape)
 
         # 이제 bsz가 0번에 있으므로 reshape이 안전합니다.
         # -1은 자동으로 max_blocks * block_size를 계산합니다.
@@ -660,8 +660,11 @@ class PagedLlamaAttention(nn.Module):
         print("before mask =", attn_weights.shape)
         # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
         #mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
-        current_len = cache_position[:, -1] + 1
-
+        #current_len = cache_position[:, -1] + 1
+        if cache_position.dim() == 1:
+            current_len = cache_position + 1
+        else:
+            current_len = cache_position[:, -1] + 1
         mask = token_idx < current_len.view(bsz,1,1,1) 
         print("mask =", mask.shape)
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
@@ -677,9 +680,9 @@ class PagedLlamaAttention(nn.Module):
         print(f"[DEBUG] bsz={bsz}, q_len={q_len}, num_heads={self.num_heads}, head_dim={self.head_dim}")
         print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
         # ----------------------
-        print("attn_weights =", attn_weights.shape)
-        print("value_states =", value_states.shape)
-        print("attn_output =", attn_output.shape)
+    #    print("attn_weights =", attn_weights.shape)
+    #    print("value_states =", value_states.shape)
+    #    print("attn_output =", attn_output.shape)
         attn_output = attn_output.transpose(1, 2).contiguous()
         
         # 2. bsz와 q_len을 유지하면서, 나머지 차원(num_heads * head_dim)을 하나로 합침
