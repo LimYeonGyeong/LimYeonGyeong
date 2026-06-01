@@ -588,7 +588,7 @@ class PagedLlamaAttention(nn.Module):
         print("\n========== DEBUG ==========")
         print("cache_position.shape =", cache_position.shape)
         print("cache_position =", cache_position)
-    #    print("q_len =", q_len)
+        print("q_len =", q_len)
 
         abs_pos = cache_position.unsqueeze(1)
 
@@ -658,6 +658,9 @@ class PagedLlamaAttention(nn.Module):
         total_kv_len = k_blocks_flat.size(2)
         token_idx = torch.arange(total_kv_len, device=target_device).view(1, 1, 1, -1)
         print("before mask =", attn_weights.shape)
+        print("current_len =", current_len)
+
+        print("mask sum =", mask.sum(dim=-1))
         # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
         #mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
         #current_len = cache_position[:, -1] + 1
