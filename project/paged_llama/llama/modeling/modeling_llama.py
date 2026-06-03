@@ -545,163 +545,166 @@ class PagedLlamaAttention(nn.Module):
         use_cache: bool | None = False,
         **kwargs,
     ):
-    #    print("ATTN INPUT")
-    #    print("hidden_states.shape =", hidden_states.shape)
         target_device = self.q_proj.weight.device
-        bsz, q_len, _ = hidden_states.size()
-        pool = self.page_pool
-    #    print("bsz =", bsz)
-    #    print("q_len =", q_len)
-        # 1. Projection
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        bsz, q_len, _ = hidden_states.shape
+        pool = self.page_pool
+
+        # ---------------------------
+        # 1. QKV projection
+        # ---------------------------
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        # ---------------------------
+        # 2. RoPE
+        # ---------------------------
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(target_device), sin.to(target_device))
-    #    print("hidden_states.shape =", hidden_states.shape)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos.to(target_device),
+                sin.to(target_device),
+            )
 
-        print("query_states.shape =", query_states.shape)
-
-    #    print("key_states.shape =", key_states.shape)
-
-    #    print("value_states.shape =", value_states.shape)
-
-    #    print("bsz =", bsz)
-    #    print("q_len =", q_len)
-        # 2. block_table 텐서 변환
+        # ---------------------------
+        # 3. block_table normalize
+        # ---------------------------
         if isinstance(block_table, list):
-            processed_tables = []
-            for bt in block_table:
-                if hasattr(bt, "to_tensor"): processed_tables.append(bt.to_tensor(device=target_device))
-                else: processed_tables.append(bt.to(target_device) if hasattr(bt, 'to') else torch.tensor(bt, device=target_device))
-            bt_tensor = torch.stack(processed_tables).squeeze(1)
+            bt_tensor = torch.stack([
+                bt.to_tensor(device=target_device) if hasattr(bt, "to_tensor")
+                else bt.to(target_device)
+                for bt in block_table
+            ], dim=0)
         else:
-            bt_tensor = block_table.to_tensor(device=target_device) if hasattr(block_table, "to_tensor") else block_table.to(target_device)
+            bt_tensor = (
+                block_table.to_tensor(device=target_device)
+                if hasattr(block_table, "to_tensor")
+                else block_table.to(target_device)
+            )
 
-    #    print("block_table type =", type(block_table))
-    #    print("bt_tensor.shape =", bt_tensor.shape)
-    #    print("bt_tensor =", bt_tensor)
+        # ---------------------------
+        # 4. token-wise index (CRITICAL FIX)
+        # ---------------------------
+        # cache_position: [bsz, q_len]
+        token_pos = cache_position
 
-        # 3. WRITE 로직
-        print("\n========== DEBUG ==========")
-        print("cache_position.shape =", cache_position.shape)
-        print("cache_position =", cache_position)
-        print("q_len =", q_len)
+        block_idx = token_pos // pool.block_size
+        offset_idx = token_pos % pool.block_size
 
-        abs_pos = cache_position.unsqueeze(1)
+        phys_block = torch.gather(bt_tensor, dim=1, index=block_idx)
 
-        print("abs_pos.shape =", abs_pos.shape)
-        print("===========================\n")
-        print("abs_pos =", abs_pos)
+        # flatten
+        flat_size = bsz * q_len
 
-        block_idx_logic = abs_pos // pool.block_size
+        phys_block_f = phys_block.reshape(flat_size)
+        offset_f = offset_idx.reshape(flat_size)
 
-        print("block_idx_logic =", block_idx_logic)
-        print("block_idx_logic.max =", block_idx_logic.max().item())
+        k_flat = key_states.transpose(1, 2).reshape(
+            flat_size,
+            self.num_key_value_heads,
+            self.head_dim
+        )
 
-        block_offset = abs_pos % pool.block_size
+        v_flat = value_states.transpose(1, 2).reshape(
+            flat_size,
+            self.num_key_value_heads,
+            self.head_dim
+        )
 
-    #    print("before physical index")
-        batch_indices = torch.arange(bsz, device=target_device).unsqueeze(1)
+        # ---------------------------
+        # 5. WRITE KV CACHE (FIXED)
+        # ---------------------------
+        pool.k_cache[
+            self.layer_idx,
+            phys_block_f,
+            :,
+            offset_f,
+            :
+        ] = k_flat.to(pool.k_cache.dtype)
 
-        physical_block_idx_per_token = \
-            bt_tensor[batch_indices, block_idx_logic]
+        pool.v_cache[
+            self.layer_idx,
+            phys_block_f,
+            :,
+            offset_f,
+            :
+        ] = v_flat.to(pool.v_cache.dtype)
 
-    #    print("physical index success")
-
-        print("physical_block_idx_per_token.shape =",
-            physical_block_idx_per_token.shape)
-
-    #    print("before k write")
-        pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = key_states.transpose(1, 2).to(pool.k_cache.dtype)
-
-    #    print("k write success")
-
-        pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = value_states.transpose(1, 2).to(pool.v_cache.dtype)
-
-    #    print("v write success")
-        # 4. READ 및 차원 정렬
-        # pool.k_cache shape: [num_layers, max_num_blocks, num_heads, block_size, head_dim]
-        # bt_tensor shape: [bsz, max_blocks]
-        # k_blocks 인덱싱 후 shape: [bsz, max_blocks, num_heads, block_size, head_dim]
-    #    print("bt_tensor.shape =", bt_tensor.shape)
-
+        # ---------------------------
+        # 6. READ KV CACHE
+        # ---------------------------
         k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
         v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
 
-    #    print("k_blocks.shape =", k_blocks.shape)
-    #    print("v_blocks.shape =", v_blocks.shape)
-        # [핵심] 배치 차원이 0번에 오도록 확실히 고정합니다.
-        # k_blocks: [bsz, max_blocks, num_heads, block_size, head_dim]
-        # bsz를 0번으로 유지하고, num_heads를 1번으로 가져오기 위해 permute
+        # [bsz, max_blocks, heads, block, dim]
         k_blocks = k_blocks.permute(0, 2, 1, 3, 4)
         v_blocks = v_blocks.permute(0, 2, 1, 3, 4)
 
-    #    print("k_blocks after permute =", k_blocks.shape)
+        k_blocks_flat = k_blocks.reshape(
+            bsz,
+            self.num_key_value_heads,
+            -1,
+            self.head_dim
+        )
 
-        # 이제 bsz가 0번에 있으므로 reshape이 안전합니다.
-        # -1은 자동으로 max_blocks * block_size를 계산합니다.
-        k_blocks_flat = k_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
-        v_blocks_flat = v_blocks.reshape(bsz, self.num_key_value_heads, -1, self.head_dim)
-        def debug_kv(name, k, v):
-            print(f"\n[{name}]")
-            print("K shape:", k.shape)
-            print("V shape:", v.shape)
+        v_blocks_flat = v_blocks.reshape(
+            bsz,
+            self.num_key_value_heads,
+            -1,
+            self.head_dim
+        )
 
-            print("K first 5:", k[0, 0, 0, :5].detach().float().cpu())
-            print("V first 5:", v[0, 0, 0, :5].detach().float().cpu())
-        # 5. 헤드 확장 (repeat_kv)
+        # repeat kv heads
         k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
         v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
 
-        # 6. Attention 연산
-        attn_weights = torch.matmul(query_states, k_blocks_flat.transpose(-2, -1)) * self.scaling
-        
-        # 5. 요청별 동적 마스킹
-        # [bsz, 1, 1, total_kv_len]
-        total_kv_len = k_blocks_flat.size(2)
-        token_idx = torch.arange(total_kv_len, device=target_device).view(1, 1, 1, -1)
-        print("before mask =", attn_weights.shape)
+        # ---------------------------
+        # 7. ATTENTION SCORE
+        # ---------------------------
+        attn_weights = torch.matmul(
+            query_states,
+            k_blocks_flat.transpose(-2, -1)
+        ) * self.scaling
 
+        # ---------------------------
+        # 8. SAFE MASK (FIXED MULTI REQUEST)
+        # ---------------------------
+        seq_lens = cache_position.max(dim=-1).values + 1  # [bsz]
 
-        # 요청별 seq_len 사용 (cache_position은 요청별 현재 토큰 위치)
-        #mask = token_idx < (cache_position.unsqueeze(1) + q_len).view(-1, 1, 1, 1)
-        #current_len = cache_position[:, -1] + 1
-        if cache_position.dim() == 1:
-            current_len = cache_position + 1
-        else:
-            current_len = cache_position[:, -1] + 1
-        
-        print("current_len =", current_len)
-        mask = token_idx < current_len.view(bsz,1,1,1) 
-        print("mask sum =", mask.sum(dim=-1))
-        print("mask =", mask.shape)
+        kv_len = k_blocks_flat.size(-2)
+
+        token_idx = torch.arange(kv_len, device=hidden_states.device)
+
+        mask = token_idx[None, None, None, :] < seq_lens[:, None, None, None]
+
         attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
-        print("after mask =", attn_weights.shape)
-        print("position_ids =", position_ids)
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # 6. Value Accumulation
-        # 7. Value Accumulation 및 결과 반환
+        # ---------------------------
+        # 9. SOFTMAX + OUTPUT
+        # ---------------------------
+        attn_weights = torch.softmax(
+            attn_weights,
+            dim=-1,
+            dtype=torch.float32
+        ).to(query_states.dtype)
+
         attn_output = torch.matmul(attn_weights, v_blocks_flat)
-        
-        # --- 디버그 코드 추가 ---
-        print(f"\n[DEBUG] attn_output.shape before reshape: {attn_output.shape}")
-        print(f"[DEBUG] bsz={bsz}, q_len={q_len}, num_heads={self.num_heads}, head_dim={self.head_dim}")
-        print(f"[DEBUG] expected total size: {bsz * q_len * self.num_heads * self.head_dim}")
-        # ----------------------
-    #    print("attn_weights =", attn_weights.shape)
-    #    print("value_states =", value_states.shape)
-    #    print("attn_output =", attn_output.shape)
+
         attn_output = attn_output.transpose(1, 2).contiguous()
-        
-        # 2. bsz와 q_len을 유지하면서, 나머지 차원(num_heads * head_dim)을 하나로 합침
-        # view 대신 flatten을 사용하여 [bsz, q_len, -1]로 만들면, 
-        # 뒤의 2차원(num_heads * head_dim)이 자동으로 2048로 계산됩니다.
-        attn_output = attn_output.flatten(2, 3) 
-        
+
+        attn_output = attn_output.flatten(2)
+
         return self.o_proj(attn_output), None
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
