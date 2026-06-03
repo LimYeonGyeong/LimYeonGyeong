@@ -479,6 +479,12 @@ def measure_paged_multi(
     # 3) DECODE
     # -------------------------------------------------
     for step in range(1, max_new_tokens):
+        
+        active_rts = [
+            rt
+            for rt in runtimes
+            if not rt["finished"]
+        ]
         print(
             f"[STEP {step}] generated_len =",
             [rt["generated"].shape[1]
@@ -490,12 +496,6 @@ def measure_paged_multi(
             [rt["request_state"]["seq_len"]
             for rt in active_rts]
         )
-        active_rts = [
-            rt
-            for rt in runtimes
-            if not rt["finished"]
-        ]
-
         if not active_rts:
             break
 
