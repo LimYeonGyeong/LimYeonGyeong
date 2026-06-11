@@ -499,23 +499,56 @@ class LlamaAttention(nn.Module):
 class PagedLlamaAttention(nn.Module):
     def __init__(self, config, layer_idx=0, page_pool=None):
         super().__init__()
+
         self.config = config
         self.layer_idx = layer_idx
+
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // self.num_heads
+
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.num_key_value_groups = (
+            self.num_heads // self.num_key_value_heads
+        )
+
+        # IMPORTANT:
+        # LLaMA attention score는 반드시 QK^T * (1 / sqrt(head_dim)) 이어야 함.
+        # 이 값이 빠지면 softmax가 비정상적으로 날카로워져서 출력 문장이 깨질 수 있음.
+        self.scaling = self.head_dim ** -0.5
 
         self.page_pool = page_pool
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=False,
+        )
 
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+
+        # 기본 실행에서는 불필요한 로그를 끈다.
+        # main.py의 patch_model_with_paged_attention(debug=True)에서 켤 수 있음.
         self.debug = False
         self.debug_verbose = False
+
+        # NaN / +Inf만 잡고, mask에서 쓰는 -Inf는 허용한다.
         self.debug_stop_on_nonfinite = True
 
     def _normalize_block_tables(self, block_table, bsz, target_device):
@@ -559,56 +592,125 @@ class PagedLlamaAttention(nn.Module):
         use_cache: bool | None = False,
         **kwargs,
     ):
-
-        # 1. dtype / device
+        # -------------------------------------------------
+        # 1. dtype / device 정리
+        # -------------------------------------------------
         original_dtype = hidden_states.dtype
         target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
 
-        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
+        hidden_states = hidden_states.to(
+            dtype=target_dtype,
+            device=target_device,
+        )
+
         bsz, q_len, _ = hidden_states.size()
 
-        # 2. page pool
-        pool = self.page_pool if self.page_pool is not None else getattr(self, "pool", None)
+        # -------------------------------------------------
+        # 2. PagePool 확인
+        # -------------------------------------------------
+        pool = (
+            self.page_pool
+            if self.page_pool is not None
+            else getattr(self, "pool", None)
+        )
+
         if pool is None:
-            raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
+            raise ValueError(
+                f"Layer {self.layer_idx} | PagePool is not initialized."
+            )
 
+        # -------------------------------------------------
         # 3. block table 확보
-        block_table_tensors = self._normalize_block_tables(block_table, bsz, target_device)
+        # -------------------------------------------------
+        block_table_tensors = self._normalize_block_tables(
+            block_table,
+            bsz,
+            target_device,
+        )
 
-        # 4. q, k, v projection
+        # -------------------------------------------------
+        # 4. Q, K, V projection
+        # -------------------------------------------------
         query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
         ).transpose(1, 2)
 
         key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
         ).transpose(1, 2)
 
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
         ).transpose(1, 2)
 
         if self.debug_verbose:
-            _tensor_debug("hidden_states", hidden_states, self.layer_idx)
-            _tensor_debug("query_states(after q_proj)", query_states, self.layer_idx)
-            _tensor_debug("key_states(after k_proj)", key_states, self.layer_idx)
-            _tensor_debug("value_states(after v_proj)", value_states, self.layer_idx)
+            _tensor_debug(
+                "query_states(after q_proj)",
+                query_states,
+                self.layer_idx,
+            )
+            _tensor_debug(
+                "key_states(after k_proj)",
+                key_states,
+                self.layer_idx,
+            )
+            _tensor_debug(
+                "value_states(after v_proj)",
+                value_states,
+                self.layer_idx,
+            )
 
         if self.debug_stop_on_nonfinite:
-            _assert_no_nan("query_states(after q_proj)", query_states, self.layer_idx)
-            _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
-            _assert_no_nan("key_states(after k_proj)", key_states, self.layer_idx)
-            _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
-            _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
-            _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
+            _assert_no_nan(
+                "query_states(after q_proj)",
+                query_states,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "query_states(after q_proj)",
+                query_states,
+                self.layer_idx,
+            )
+            _assert_no_nan(
+                "key_states(after k_proj)",
+                key_states,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "key_states(after k_proj)",
+                key_states,
+                self.layer_idx,
+            )
+            _assert_no_nan(
+                "value_states(after v_proj)",
+                value_states,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "value_states(after v_proj)",
+                value_states,
+                self.layer_idx,
+            )
 
-        # 5. RoPE
+        # -------------------------------------------------
+        # 5. RoPE 적용
+        # -------------------------------------------------
         if position_embeddings is None and "position_embeddings" in kwargs:
             position_embeddings = kwargs["position_embeddings"]
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
+
             query_states, key_states = apply_rotary_pos_emb(
                 query_states,
                 key_states,
@@ -616,52 +718,95 @@ class PagedLlamaAttention(nn.Module):
                 sin.to(target_device),
             )
 
-        if self.debug_verbose:
-            _tensor_debug("query_states(after rope)", query_states, self.layer_idx)
-            _tensor_debug("key_states(after rope)", key_states, self.layer_idx)
-
         if self.debug_stop_on_nonfinite:
-            _assert_no_nan("query_states(after rope)", query_states, self.layer_idx)
-            _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
-            _assert_no_nan("key_states(after rope)", key_states, self.layer_idx)
-            _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
+            _assert_no_nan(
+                "query_states(after rope)",
+                query_states,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "query_states(after rope)",
+                query_states,
+                self.layer_idx,
+            )
+            _assert_no_nan(
+                "key_states(after rope)",
+                key_states,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "key_states(after rope)",
+                key_states,
+                self.layer_idx,
+            )
 
-        # 6. 현재 step 위치 정보
+        # -------------------------------------------------
+        # 6. 현재 token의 absolute position 계산
+        # -------------------------------------------------
         if cache_position is not None:
             if cache_position.dim() == 2:
-                start_pos_tensor = cache_position[:, 0].to(device=target_device, dtype=torch.long)
+                start_pos_tensor = cache_position[:, 0].to(
+                    device=target_device,
+                    dtype=torch.long,
+                )
             else:
-                cp_flat = cache_position.reshape(-1).to(device=target_device, dtype=torch.long)
+                cp_flat = cache_position.reshape(-1).to(
+                    device=target_device,
+                    dtype=torch.long,
+                )
+
                 if cp_flat.numel() == bsz:
                     start_pos_tensor = cp_flat
                 else:
                     start_pos_tensor = cp_flat[0].repeat(bsz)
+
         elif position_ids is not None:
             if position_ids.dim() == 2:
-                start_pos_tensor = position_ids[:, 0].to(device=target_device, dtype=torch.long)
+                start_pos_tensor = position_ids[:, 0].to(
+                    device=target_device,
+                    dtype=torch.long,
+                )
             else:
-                pid_flat = position_ids.reshape(-1).to(device=target_device, dtype=torch.long)
+                pid_flat = position_ids.reshape(-1).to(
+                    device=target_device,
+                    dtype=torch.long,
+                )
+
                 if pid_flat.numel() == bsz:
                     start_pos_tensor = pid_flat
                 else:
                     start_pos_tensor = pid_flat[0].repeat(bsz)
+
         else:
-            start_pos_tensor = torch.zeros((bsz,), device=target_device, dtype=torch.long)
+            start_pos_tensor = torch.zeros(
+                (bsz,),
+                device=target_device,
+                dtype=torch.long,
+            )
 
         total_seq_len_tensor = start_pos_tensor + q_len
-        total_seq_len_list = total_seq_len_tensor.tolist()
-        max_total_seq_len = int(total_seq_len_tensor.max().item()) if bsz > 0 else q_len
 
-        num_needed_blocks_tensor = (total_seq_len_tensor + pool.block_size - 1) // pool.block_size
-        num_needed_blocks_list = num_needed_blocks_tensor.tolist()
-        max_num_needed_blocks = int(num_needed_blocks_tensor.max().item()) if bsz > 0 else 1
+        num_needed_blocks_tensor = (
+            total_seq_len_tensor + pool.block_size - 1
+        ) // pool.block_size
 
-        # 7. WRITE 준비
-        abs_pos = start_pos_tensor[:, None] + torch.arange(
-            q_len,
-            device=target_device,
-            dtype=torch.long,
-        )[None, :]  # [bsz, q_len]
+        max_num_needed_blocks = (
+            int(num_needed_blocks_tensor.max().item())
+            if bsz > 0
+            else 1
+        )
+
+        # -------------------------------------------------
+        # 7. KV cache write 위치 계산
+        # -------------------------------------------------
+        abs_pos = (
+            start_pos_tensor[:, None]
+            + torch.arange(
+                q_len,
+                device=target_device,
+                dtype=torch.long,
+            )[None, :]
+        )
 
         block_idx_logic = abs_pos // pool.block_size
         block_offset = abs_pos % pool.block_size
@@ -679,84 +824,149 @@ class PagedLlamaAttention(nn.Module):
         )
 
         for row in range(bsz):
-            start_pos = int(start_pos_tensor[row].item())
-            total_seq_len = int(total_seq_len_tensor[row].item())
-            num_needed_blocks = int(num_needed_blocks_tensor[row].item())
+            num_needed_blocks = int(
+                num_needed_blocks_tensor[row].item()
+            )
 
             block_table_tensor = block_table_tensors[row]
-
-
             row_block_idx_logic = block_idx_logic[row]
 
             if torch.any(row_block_idx_logic >= block_table_tensor.size(1)):
                 bad_block_idx = int(row_block_idx_logic.max().item())
+
                 raise IndexError(
-                    f"Layer {self.layer_idx} | row {row} | block_idx_logic {bad_block_idx} "
-                    f"out of range (size {block_table_tensor.size(1)})"
+                    f"Layer {self.layer_idx} | row {row} | "
+                    f"block_idx_logic {bad_block_idx} out of range "
+                    f"(size {block_table_tensor.size(1)})"
                 )
 
             if num_needed_blocks > block_table_tensor.size(1):
                 raise RuntimeError(
-                    f"Layer {self.layer_idx} | row {row} | Block table size too small! "
-                    f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
+                    f"Layer {self.layer_idx} | row {row} | "
+                    f"Block table size too small! "
+                    f"Need {num_needed_blocks} blocks but only have "
+                    f"{block_table_tensor.size(1)}"
                 )
 
-            active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
+            active_indices = block_table_tensor[
+                0,
+                :num_needed_blocks,
+            ].to(target_device)
+
             padded_active_indices[row, :num_needed_blocks] = active_indices
+
+            # gather shape를 맞추기 위한 padding.
+            # 실제 attention에서는 뒤에서 mask로 제거됨.
             if num_needed_blocks < max_num_needed_blocks:
-                padded_active_indices[row, num_needed_blocks:] = active_indices[-1]
+                padded_active_indices[
+                    row,
+                    num_needed_blocks:,
+                ] = active_indices[-1]
 
-            physical_block_idx_per_token[row] = block_table_tensor[0, row_block_idx_logic]
-            
-        # 8. WRITE를 batch scatter로 처리
-        batch_idx = torch.arange(bsz, device=target_device, dtype=torch.long)[:, None]
-        token_idx = torch.arange(q_len, device=target_device, dtype=torch.long)[None, :]
+            physical_block_idx_per_token[row] = block_table_tensor[
+                0,
+                row_block_idx_logic,
+            ]
 
-        k_src = key_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
-        v_src = value_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
+        # -------------------------------------------------
+        # 8. KV cache write
+        # -------------------------------------------------
+        k_src = key_states.permute(
+            0,
+            2,
+            1,
+            3,
+        ).contiguous()
 
-        pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
-        pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
-        # Minimal cache debug: layer 0 only, first row/token only.
+        v_src = value_states.permute(
+            0,
+            2,
+            1,
+            3,
+        ).contiguous()
+
+        pool.k_cache[
+            self.layer_idx,
+            physical_block_idx_per_token,
+            :,
+            block_offset,
+            :,
+        ] = k_src.to(pool.k_cache.dtype)
+
+        pool.v_cache[
+            self.layer_idx,
+            physical_block_idx_per_token,
+            :,
+            block_offset,
+            :,
+        ] = v_src.to(pool.v_cache.dtype)
+
+        # 최소 디버그만 유지
         if self.debug and self.layer_idx == 0:
             sample_row = 0
             sample_tok = 0
-            pb = int(physical_block_idx_per_token[sample_row, sample_tok].item())
-            off = int(block_offset[sample_row, sample_tok].item())
-            seq_len0 = int(total_seq_len_tensor[sample_row].item())
-            print(f"[CACHE] layer=0 row=0 seq_len={seq_len0} block={pb} offset={off}")
 
+            pb = int(
+                physical_block_idx_per_token[
+                    sample_row,
+                    sample_tok,
+                ].item()
+            )
 
-        # 9. READ를 batch gather로 처리
+            off = int(
+                block_offset[
+                    sample_row,
+                    sample_tok,
+                ].item()
+            )
+
+            seq_len0 = int(
+                total_seq_len_tensor[
+                    sample_row
+                ].item()
+            )
+
+            print(
+                f"[CACHE] layer=0 row=0 "
+                f"seq_len={seq_len0} block={pb} offset={off}"
+            )
+
+        # -------------------------------------------------
+        # 9. KV cache read
+        # -------------------------------------------------
         layer_k_cache = pool.k_cache[self.layer_idx]
         layer_v_cache = pool.v_cache[self.layer_idx]
 
         k_blocks = layer_k_cache[padded_active_indices]
         v_blocks = layer_v_cache[padded_active_indices]
+
         if self.debug_verbose:
-            _tensor_debug("k_blocks", k_blocks, self.layer_idx)
-            _tensor_debug("v_blocks", v_blocks, self.layer_idx)
+            _tensor_debug(
+                "k_blocks",
+                k_blocks,
+                self.layer_idx,
+            )
+            _tensor_debug(
+                "v_blocks",
+                v_blocks,
+                self.layer_idx,
+            )
 
-        # =========================================================
-        # 10. vectorized block attention
-        # Python loop 제거
-        # =========================================================
-
-        q_grouped = query_states.view(
+        # -------------------------------------------------
+        # 10. Q shape 정리
+        # query_states:
+        # [bsz, num_heads, q_len, head_dim]
+        #
+        # q_grouped:
+        # [bsz, kv_heads, kv_groups, q_len, head_dim]
+        # -------------------------------------------------
+        q_grouped = query_states.reshape(
             bsz,
             self.num_key_value_heads,
             self.num_key_value_groups,
             q_len,
             self.head_dim,
         )
-        # ---------------------------------------------------------
-        # k_blocks:
-        # [bsz, blocks, kv_heads, block_size, head_dim]
-        #
-        # →
-        #
-        # [bsz, kv_heads, blocks, block_size, head_dim]
-        # ---------------------------------------------------------
 
         k_blocks_for_attn = k_blocks.permute(
             0,
@@ -766,47 +976,25 @@ class PagedLlamaAttention(nn.Module):
             4,
         ).contiguous()
 
-        if self.debug_verbose:
-            _tensor_debug(
-                "k_blocks_for_attn",
-                k_blocks_for_attn,
-                self.layer_idx,
-            )
-
-        # =========================================================
-        # attention score 계산
-        #
-        # q:
-        # [b, g, r, q, d]
-        #
-        # k:
-        # [b, g, blk, k, d]
-        #
-        # output:
-        # [b, g, r, q, blk, k]
-        # =========================================================
-
-        # =========================================================
-        # real block-wise attention
-        # request별 실제 block까지만 계산
-        # =========================================================
-
+        # -------------------------------------------------
+        # 11. request별 실제 block까지만 attention score 계산
+        # IMPORTANT:
+        # score에는 반드시 self.scaling을 곱해야 함.
+        # -------------------------------------------------
         attn_chunks_per_row = []
 
         for row in range(bsz):
-
             row_chunks = []
 
             row_num_blocks = int(
                 num_needed_blocks_tensor[row].item()
             )
 
-            q_row = q_grouped[row : row + 1]
+            q_row = q_grouped[row: row + 1]
 
             for blk_idx in range(row_num_blocks):
-
                 k_chunk = k_blocks_for_attn[
-                    row : row + 1,
+                    row: row + 1,
                     :,
                     blk_idx,
                 ]
@@ -815,31 +1003,27 @@ class PagedLlamaAttention(nn.Module):
                     "b g r q d, b g k d -> b g r q k",
                     q_row,
                     k_chunk,
-                )
+                ) * self.scaling
 
                 row_chunks.append(score_chunk)
 
-            row_attn = torch.cat(row_chunks, dim=-1)
+            row_attn = torch.cat(
+                row_chunks,
+                dim=-1,
+            )
 
             attn_chunks_per_row.append(row_attn)
 
-        # =========================================================
-        # batch padding
-        # =========================================================
-
-        max_tokens = (
-            max_num_needed_blocks
-            * pool.block_size
-        )
-
+        # -------------------------------------------------
+        # 12. batch shape 맞추기 위한 padding
+        # -------------------------------------------------
+        max_tokens = max_num_needed_blocks * pool.block_size
         padded_attn = []
 
         for row_attn in attn_chunks_per_row:
-
             cur_tokens = row_attn.shape[-1]
 
             if cur_tokens < max_tokens:
-
                 pad_size = max_tokens - cur_tokens
 
                 row_attn = torch.nn.functional.pad(
@@ -855,76 +1039,67 @@ class PagedLlamaAttention(nn.Module):
             dim=0,
         )
 
-        # =========================================================
-        # block dimension + token dimension flatten
-        #
-        # [b,g,r,q,blk,k]
-        # →
-        # [b,g,r,q,total_seq]
-        # =========================================================
-
-        # =========================================================
-        # flatten block dimension
-        # =========================================================
-
         attn_weights = attn_weights.reshape(
             bsz,
             self.num_key_value_heads,
             self.num_key_value_groups,
             q_len,
-            max_num_needed_blocks * pool.block_size,
+            max_tokens,
         )
 
-        # =========================================================
-        # row별 real seq len masking
-        # unnecessary compute 제거
-        # =========================================================
-
+        # -------------------------------------------------
+        # 13. real seq len mask
+        # block 내부 padding token 제거
+        # -------------------------------------------------
         token_positions = torch.arange(
-            max_num_needed_blocks * pool.block_size,
+            max_tokens,
             device=attn_weights.device,
+            dtype=torch.long,
         ).view(1, 1, 1, 1, -1)
 
         real_seq_mask = (
             token_positions
-            < total_seq_len_tensor.view(bsz, 1, 1, 1, 1)
+            < total_seq_len_tensor.view(
+                bsz,
+                1,
+                1,
+                1,
+                1,
+            )
         )
 
         attn_weights = attn_weights.masked_fill(
             ~real_seq_mask,
             float("-inf"),
         )
-        if self.debug_verbose:
-            _tensor_debug(
-                "attn_weights(before mask)",
-                attn_weights,
-                self.layer_idx,
-            )
 
         if self.debug_stop_on_nonfinite:
             _assert_no_nan(
-                "attn_weights(before mask)",
+                "attn_weights(before causal mask)",
                 attn_weights,
                 self.layer_idx,
             )
             _assert_no_posinf(
-                "attn_weights(before mask)",
+                "attn_weights(before causal mask)",
                 attn_weights,
                 self.layer_idx,
             )
 
-        # =========================================================
-        # 12. causal mask
-        # =========================================================
-
-        q_abs = start_pos_tensor[:, None] + torch.arange(
-            q_len,
-            device=target_device,
-            dtype=torch.long,
-        )[None, :]
+        # -------------------------------------------------
+        # 14. causal mask
+        # 현재 query 위치보다 미래 token은 볼 수 없게 함
+        # -------------------------------------------------
+        q_abs = (
+            start_pos_tensor[:, None]
+            + torch.arange(
+                q_len,
+                device=target_device,
+                dtype=torch.long,
+            )[None, :]
+        )
 
         k_pos = torch.arange(
-            max_num_needed_blocks * pool.block_size,
+            max_tokens,
             device=target_device,
             dtype=torch.long,
         )[None, :]
@@ -939,15 +1114,15 @@ class PagedLlamaAttention(nn.Module):
             float("-inf"),
         )
 
-        # =========================================================
-        # 13. softmax
-        # =========================================================
-
+        # -------------------------------------------------
+        # 15. softmax
+        # -------------------------------------------------
         attn_weights = torch.softmax(
             attn_weights,
             dim=-1,
             dtype=torch.float32,
         ).to(q_grouped.dtype)
+
         if self.debug_verbose:
             _tensor_debug(
                 "attn_weights(after softmax)",
@@ -955,12 +1130,22 @@ class PagedLlamaAttention(nn.Module):
                 self.layer_idx,
             )
 
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan(
+                "attn_weights(after softmax)",
+                attn_weights,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "attn_weights(after softmax)",
+                attn_weights,
+                self.layer_idx,
+            )
 
-        # =========================================================
-        # 14. vectorized value accumulation
-        # Python loop 제거
-        # =========================================================
-
+        # -------------------------------------------------
+        # 16. value accumulation
+        # request별 실제 block만 사용
+        # -------------------------------------------------
         v_blocks_for_attn = v_blocks.permute(
             0,
             2,
@@ -969,63 +1154,35 @@ class PagedLlamaAttention(nn.Module):
             4,
         ).contiguous()
 
-        if self.debug_verbose:
-            _tensor_debug(
-                "v_blocks_for_attn",
-                v_blocks_for_attn,
-                self.layer_idx,
-            )
-        
-        # =========================================================
-        # [b,g,blk,k,d]
-        # →
-        # [b,g,total_seq,d]
-        # =========================================================
-
-        # =========================================================
-        # request별 block-wise value accumulation
-        # =========================================================
-
         attn_outputs = []
 
         for row in range(bsz):
-
             row_num_blocks = int(
                 num_needed_blocks_tensor[row].item()
             )
 
-            row_attn = attn_weights[
-                row : row + 1
-            ]
+            row_attn = attn_weights[row: row + 1]
 
             row_output = None
-
             start_idx = 0
 
             for blk_idx in range(row_num_blocks):
+                end_idx = start_idx + pool.block_size
 
-                end_idx = (
-                    start_idx
-                    + pool.block_size
-                )
-
-                # attention slice
                 attn_chunk = row_attn[
                     :,
                     :,
                     :,
                     :,
-                    start_idx:end_idx
+                    start_idx:end_idx,
                 ]
 
-                # value block
                 v_chunk = v_blocks_for_attn[
-                    row : row + 1,
+                    row: row + 1,
                     :,
                     blk_idx,
                 ]
 
-                # [1,g,r,q,d]
                 output_chunk = torch.einsum(
                     "b g r q k, b g k d -> b g r q d",
                     attn_chunk,
@@ -1048,21 +1205,35 @@ class PagedLlamaAttention(nn.Module):
 
         if self.debug_verbose:
             _tensor_debug(
-                "attn_output(before cast)",
+                "attn_output(before reshape)",
                 attn_output,
                 self.layer_idx,
             )
 
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan(
+                "attn_output(before reshape)",
+                attn_output,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "attn_output(before reshape)",
+                attn_output,
+                self.layer_idx,
+            )
+
+        # -------------------------------------------------
+        # 17. output shape 복원
+        # [bsz, kv_heads, groups, q_len, head_dim]
+        # -> [bsz, num_heads, q_len, head_dim]
+        # -> [bsz, q_len, hidden_size]
+        # -------------------------------------------------
         attn_output = attn_output.reshape(
             bsz,
             self.num_heads,
             q_len,
             self.head_dim,
         ).to(query_states.dtype)
-
-        # =========================================================
-        # 15. output
-        # =========================================================
 
         attn_output = attn_output.transpose(
             1,
@@ -1073,7 +1244,9 @@ class PagedLlamaAttention(nn.Module):
             self.hidden_size,
         )
 
-        attn_output = self.o_proj(attn_output).to(original_dtype)
+        attn_output = self.o_proj(
+            attn_output,
+        ).to(original_dtype)
 
         return attn_output, None
 
