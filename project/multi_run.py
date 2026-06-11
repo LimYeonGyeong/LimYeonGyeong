@@ -2,10 +2,7 @@ import os
 import gc
 import sys
 import torch
-import builtins
-import psutil
 import time
-from contextlib import contextmanager
 
 
 sys.path.append("/LimYeonGyeong/project")
@@ -21,99 +18,14 @@ from paged_llama.llama.config.configuration_llama import LlamaConfig
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
-# 기존 main.py에서 검증된 helper 재사용
-from main import (
-    measure_baseline_multi,
-    patch_model_with_paged_attention,
-    print_stats_table,
-)
+# 기존 main.py에서 검증된 patch helper 재사용
+from main import patch_model_with_paged_attention
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# 실행 중 너무 많이 찍히는 디버그 출력만 걸러낸다.
-# - measure_paged_multi() 내부의 step-by-step 로그
-# - modeling_llama.py 내부의 잔여 디버그 로그
-# 최종 결과, 로딩 메시지, 성능 표는 그대로 둔다.
-DEBUG_PREFIXES_TO_SUPPRESS = (
-    "[MAIN-PREFILL]",
-    "[MAIN-DECODE STEP",
-    "[CACHE-ID]",
-    "[CACHE-TYPE]",
-    "[CACHE-SEQ]",
-    "[CACHE-POS]",
-    "[CACHE-UPDATE]",
-    "[REQ-STATE]",
-    "[REQ-STATE-ID]",
-    "[POSITION-IDS]",
-    "[CHECK]",
-    "[MODEL-ENTRY]",
-    "[MODEL-EXIT]",
-    "[LM-HEAD-ENTRY]",
-    "[LM-HEAD-EXIT]",
-    "[PagedCacheShim",
-    "[DBG]",
-)
-
-
-def build_decode_positions(model):
-
-    request_state = getattr(
-        model.model,
-        "active_request_state",
-        None,
-    )
-
-    if request_state is None:
-        raise RuntimeError(
-            "[POSITION ERROR] active_request_state is None"
-        )
-
-    current_pos = int(request_state["seq_len"])
-
-    cache_position = torch.tensor(
-        [current_pos],
-        device=model.device,
-        dtype=torch.long,
-    )
-
-    position_ids = cache_position.unsqueeze(0)
-
-    return cache_position, position_ids
-
-
-@contextmanager
-def suppress_debug_prints(enabled: bool = True):
-
-    if not enabled:
-        yield
-        return
-
-    original_print = builtins.print
-
-    def filtered_print(*args, **kwargs):
-
-        if not args:
-            return original_print(*args, **kwargs)
-
-        text = " ".join(str(a) for a in args)
-
-        if text.startswith(DEBUG_PREFIXES_TO_SUPPRESS):
-            return
-
-        return original_print(*args, **kwargs)
-
-    builtins.print = filtered_print
-
-    try:
-        yield
-
-    finally:
-        builtins.print = original_print
 
 
 def build_local_config_from_hf(hf_config):
@@ -270,24 +182,63 @@ def build_mixed_prompts(n_requests: int = 2):
     return prompts
 
 
-def _bind_request_runtime(
-    model,
-    block_table,
-    request_state,
-    pool,
-):
+def print_topk_logits(tokenizer, logits, step_label: str, k: int = 5):
 
-    for layer in model.model.layers:
+    topk = torch.topk(
+        logits[:, -1, :],
+        k=k,
+        dim=-1,
+    )
 
-        layer.self_attn.block_table = block_table
+    for row in range(topk.indices.shape[0]):
 
-        layer.self_attn.page_pool = pool
+        print(f"\n[TOPK][{step_label}] row={row}")
 
-    model.model.block_table = block_table
+        for rank in range(k):
 
-    model.model.page_pool = pool
+            token_id = int(topk.indices[row, rank].item())
+            token_text = tokenizer.decode([token_id])
+            score = float(topk.values[row, rank].item())
 
-    model.model.active_request_state = request_state
+            print(
+                f"rank={rank + 1} "
+                f"token_id={token_id} "
+                f"decoded={repr(token_text)} "
+                f"logit={score:.4f}"
+            )
+
+
+def decode_request_outputs(tokenizer, runtimes):
+
+    full_texts = []
+    response_texts = []
+
+    print("\n===== GENERATED TOKEN IDS =====")
+
+    for i, rt in enumerate(runtimes):
+
+        token_ids = rt["generated"][0].detach().cpu().tolist()
+        prompt_len = int(rt["prompt_len"])
+        response_ids = token_ids[prompt_len:]
+
+        print(f"\n[REQUEST {i + 1}] prompt_len={prompt_len}")
+        print(f"full_token_ids={token_ids}")
+        print(f"response_token_ids={response_ids}")
+
+        full_text = tokenizer.decode(
+            token_ids,
+            skip_special_tokens=True,
+        )
+
+        response_text = tokenizer.decode(
+            response_ids,
+            skip_special_tokens=True,
+        )
+
+        full_texts.append(full_text)
+        response_texts.append(response_text)
+
+    return full_texts, response_texts
 
 
 @torch.no_grad()
@@ -299,8 +250,6 @@ def measure_paged_multi(
     pool,
     max_new_tokens=20,
 ):
-
-    process = psutil.Process(os.getpid())
 
     request_ids = []
 
@@ -379,10 +328,6 @@ def measure_paged_multi(
 
         torch.cuda.reset_peak_memory_stats()
 
-    ram_start = process.memory_info().rss / 1024 / 1024
-
-    ctx_start = process.num_ctx_switches()
-
     t0 = time.perf_counter()
 
     # -------------------------------------------------
@@ -440,11 +385,17 @@ def measure_paged_multi(
                 rt["request_id"],
                 0,
             )
-        
+
         outputs = model(
             input_ids=batch_input_ids,
             use_cache=True,
             past_key_values=None,
+        )
+
+        print_topk_logits(
+            tokenizer,
+            outputs.logits,
+            step_label=f"prefill_len_{prompt_len}",
         )
 
         next_tokens = torch.argmax(
@@ -452,10 +403,7 @@ def measure_paged_multi(
             dim=-1,
             keepdim=True,
         )
-        print(
-            "logits top5 =",
-            torch.topk(outputs.logits[0, -1], 5)
-        )
+
         for i, rt in enumerate(group_rts):
 
             next_token = next_tokens[i:i+1]
@@ -479,23 +427,13 @@ def measure_paged_multi(
     # 3) DECODE
     # -------------------------------------------------
     for step in range(1, max_new_tokens):
-        
+
         active_rts = [
             rt
             for rt in runtimes
             if not rt["finished"]
         ]
-        print(
-            f"[STEP {step}] generated_len =",
-            [rt["generated"].shape[1]
-            for rt in active_rts]
-        )
 
-        print(
-            f"[STEP {step}] request_state_seq =",
-            [rt["request_state"]["seq_len"]
-            for rt in active_rts]
-        )
         if not active_rts:
             break
 
@@ -518,15 +456,7 @@ def measure_paged_multi(
             rt["request_state"]["seq_len"] = (
                 rt["generated"].shape[1]
         )
-        print("generated_len",
-            [rt["generated"].shape[1]
-            for rt in active_rts])
 
-        print(
-            "seq_len=",
-            [rt["request_state"]["seq_len"]
-            for rt in active_rts]
-        )
 
         # -------------------------------------------------
         # cache_position 생성
@@ -601,6 +531,12 @@ def measure_paged_multi(
         # -------------------------------------------------
         # next token
         # -------------------------------------------------
+        print_topk_logits(
+            tokenizer,
+            outputs.logits,
+            step_label=f"decode_step_{step}",
+        )
+
         next_tokens = torch.argmax(
             outputs.logits[:, -1, :],
             dim=-1,
@@ -656,17 +592,15 @@ def measure_paged_multi(
 
     t1 = time.perf_counter()
 
-    decoded_texts = [
-        tokenizer.decode(
-            rt["generated"][0],
-            skip_special_tokens=True,
-        )
-        for rt in runtimes
-    ]
+    full_texts, response_texts = decode_request_outputs(
+        tokenizer,
+        runtimes,
+    )
 
     return {
         "latency": t1 - t0,
-        "texts": decoded_texts,
+        "texts": full_texts,
+        "responses": response_texts,
     }
 
 
@@ -790,17 +724,27 @@ def multi_only_main():
         max_new_tokens=max_new_tokens,
     )
 
-    print("\n================ FINAL TEXT ================\n")
+    print("\n================ FINAL RESPONSE ONLY ================\n")
+
+    for i, text in enumerate(
+        stats_paged_multi["responses"]
+    ):
+
+        print(f"--- Request {i + 1} response ---")
+        print(repr(text))
+        print()
+
+    print("\n================ FINAL FULL TEXT ================\n")
 
     for i, text in enumerate(
         stats_paged_multi["texts"]
     ):
 
-        print(f"--- Request {i + 1} ---")
-
-        print(text)
-
+        print(f"--- Request {i + 1} full text ---")
+        print(repr(text))
         print()
+
+    print(f"latency={stats_paged_multi['latency']:.4f}s")
 
 
 if __name__ == "__main__":

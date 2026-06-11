@@ -1,3 +1,25 @@
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# paged_llama/llama/modeling_llama.py
+
+# paged_llama/llama/modeling/modeling_llama.py
+
 import torch
 from torch import nn
 import math
@@ -444,13 +466,6 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         
-        print(
-            f"[ATTN SHAPE][Layer {self.layer_idx}] "
-            f"hidden={hidden_states.shape} "
-            f"query={query_states.shape} "
-            f"key={key_states.shape}"
-        )
-        
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -491,9 +506,7 @@ class PagedLlamaAttention(nn.Module):
         self.head_dim = config.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        
-        self.scaling = self.head_dim**-0.5
-        
+
         self.page_pool = page_pool
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -533,6 +546,7 @@ class PagedLlamaAttention(nn.Module):
 
         return [single for _ in range(bsz)]
 
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -545,14 +559,24 @@ class PagedLlamaAttention(nn.Module):
         use_cache: bool | None = False,
         **kwargs,
     ):
+
+        # 1. dtype / device
+        original_dtype = hidden_states.dtype
+        target_dtype = self.q_proj.weight.dtype
         target_device = self.q_proj.weight.device
 
-        bsz, q_len, _ = hidden_states.shape
-        pool = self.page_pool
+        hidden_states = hidden_states.to(dtype=target_dtype, device=target_device)
+        bsz, q_len, _ = hidden_states.size()
 
-        # ---------------------------
-        # 1. QKV projection
-        # ---------------------------
+        # 2. page pool
+        pool = self.page_pool if self.page_pool is not None else getattr(self, "pool", None)
+        if pool is None:
+            raise ValueError(f"Layer {self.layer_idx} | PagePool is not initialized.")
+
+        # 3. block table 확보
+        block_table_tensors = self._normalize_block_tables(block_table, bsz, target_device)
+
+        # 4. q, k, v projection
         query_states = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -565,9 +589,24 @@ class PagedLlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        # ---------------------------
-        # 2. RoPE
-        # ---------------------------
+        if self.debug_verbose:
+            _tensor_debug("hidden_states", hidden_states, self.layer_idx)
+            _tensor_debug("query_states(after q_proj)", query_states, self.layer_idx)
+            _tensor_debug("key_states(after k_proj)", key_states, self.layer_idx)
+            _tensor_debug("value_states(after v_proj)", value_states, self.layer_idx)
+
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("query_states(after q_proj)", query_states, self.layer_idx)
+            _assert_no_posinf("query_states(after q_proj)", query_states, self.layer_idx)
+            _assert_no_nan("key_states(after k_proj)", key_states, self.layer_idx)
+            _assert_no_posinf("key_states(after k_proj)", key_states, self.layer_idx)
+            _assert_no_nan("value_states(after v_proj)", value_states, self.layer_idx)
+            _assert_no_posinf("value_states(after v_proj)", value_states, self.layer_idx)
+
+        # 5. RoPE
+        if position_embeddings is None and "position_embeddings" in kwargs:
+            position_embeddings = kwargs["position_embeddings"]
+
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(
@@ -577,135 +616,467 @@ class PagedLlamaAttention(nn.Module):
                 sin.to(target_device),
             )
 
-        # ---------------------------
-        # 3. block_table normalize
-        # ---------------------------
-        if isinstance(block_table, list):
-            bt_tensor = torch.stack([
-                bt.to_tensor(device=target_device) if hasattr(bt, "to_tensor")
-                else bt.to(target_device)
-                for bt in block_table
-            ], dim=0)
+        if self.debug_verbose:
+            _tensor_debug("query_states(after rope)", query_states, self.layer_idx)
+            _tensor_debug("key_states(after rope)", key_states, self.layer_idx)
+
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan("query_states(after rope)", query_states, self.layer_idx)
+            _assert_no_posinf("query_states(after rope)", query_states, self.layer_idx)
+            _assert_no_nan("key_states(after rope)", key_states, self.layer_idx)
+            _assert_no_posinf("key_states(after rope)", key_states, self.layer_idx)
+
+        # 6. 현재 step 위치 정보
+        if cache_position is not None:
+            if cache_position.dim() == 2:
+                start_pos_tensor = cache_position[:, 0].to(device=target_device, dtype=torch.long)
+            else:
+                cp_flat = cache_position.reshape(-1).to(device=target_device, dtype=torch.long)
+                if cp_flat.numel() == bsz:
+                    start_pos_tensor = cp_flat
+                else:
+                    start_pos_tensor = cp_flat[0].repeat(bsz)
+        elif position_ids is not None:
+            if position_ids.dim() == 2:
+                start_pos_tensor = position_ids[:, 0].to(device=target_device, dtype=torch.long)
+            else:
+                pid_flat = position_ids.reshape(-1).to(device=target_device, dtype=torch.long)
+                if pid_flat.numel() == bsz:
+                    start_pos_tensor = pid_flat
+                else:
+                    start_pos_tensor = pid_flat[0].repeat(bsz)
         else:
-            bt_tensor = (
-                block_table.to_tensor(device=target_device)
-                if hasattr(block_table, "to_tensor")
-                else block_table.to(target_device)
+            start_pos_tensor = torch.zeros((bsz,), device=target_device, dtype=torch.long)
+
+        total_seq_len_tensor = start_pos_tensor + q_len
+        total_seq_len_list = total_seq_len_tensor.tolist()
+        max_total_seq_len = int(total_seq_len_tensor.max().item()) if bsz > 0 else q_len
+
+        num_needed_blocks_tensor = (total_seq_len_tensor + pool.block_size - 1) // pool.block_size
+        num_needed_blocks_list = num_needed_blocks_tensor.tolist()
+        max_num_needed_blocks = int(num_needed_blocks_tensor.max().item()) if bsz > 0 else 1
+
+        # 7. WRITE 준비
+        abs_pos = start_pos_tensor[:, None] + torch.arange(
+            q_len,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]  # [bsz, q_len]
+
+        block_idx_logic = abs_pos // pool.block_size
+        block_offset = abs_pos % pool.block_size
+
+        padded_active_indices = torch.zeros(
+            (bsz, max_num_needed_blocks),
+            dtype=torch.long,
+            device=target_device,
+        )
+
+        physical_block_idx_per_token = torch.zeros(
+            (bsz, q_len),
+            dtype=torch.long,
+            device=target_device,
+        )
+
+        for row in range(bsz):
+            start_pos = int(start_pos_tensor[row].item())
+            total_seq_len = int(total_seq_len_tensor[row].item())
+            num_needed_blocks = int(num_needed_blocks_tensor[row].item())
+
+            block_table_tensor = block_table_tensors[row]
+
+
+            row_block_idx_logic = block_idx_logic[row]
+
+            if torch.any(row_block_idx_logic >= block_table_tensor.size(1)):
+                bad_block_idx = int(row_block_idx_logic.max().item())
+                raise IndexError(
+                    f"Layer {self.layer_idx} | row {row} | block_idx_logic {bad_block_idx} "
+                    f"out of range (size {block_table_tensor.size(1)})"
+                )
+
+            if num_needed_blocks > block_table_tensor.size(1):
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} | row {row} | Block table size too small! "
+                    f"Need {num_needed_blocks} blocks but only have {block_table_tensor.size(1)}"
+                )
+
+            active_indices = block_table_tensor[0, :num_needed_blocks].to(target_device)
+            padded_active_indices[row, :num_needed_blocks] = active_indices
+            if num_needed_blocks < max_num_needed_blocks:
+                padded_active_indices[row, num_needed_blocks:] = active_indices[-1]
+
+            physical_block_idx_per_token[row] = block_table_tensor[0, row_block_idx_logic]
+            
+        # 8. WRITE를 batch scatter로 처리
+        batch_idx = torch.arange(bsz, device=target_device, dtype=torch.long)[:, None]
+        token_idx = torch.arange(q_len, device=target_device, dtype=torch.long)[None, :]
+
+        k_src = key_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
+        v_src = value_states.permute(0, 2, 1, 3).contiguous()  # [bsz, q_len, kv_heads, head_dim]
+
+        pool.k_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = k_src.to(pool.k_cache.dtype)
+        pool.v_cache[self.layer_idx, physical_block_idx_per_token, :, block_offset, :] = v_src.to(pool.v_cache.dtype)
+        # Minimal cache debug: layer 0 only, first row/token only.
+        if self.debug and self.layer_idx == 0:
+            sample_row = 0
+            sample_tok = 0
+            pb = int(physical_block_idx_per_token[sample_row, sample_tok].item())
+            off = int(block_offset[sample_row, sample_tok].item())
+            seq_len0 = int(total_seq_len_tensor[sample_row].item())
+            print(f"[CACHE] layer=0 row=0 seq_len={seq_len0} block={pb} offset={off}")
+
+
+        # 9. READ를 batch gather로 처리
+        layer_k_cache = pool.k_cache[self.layer_idx]
+        layer_v_cache = pool.v_cache[self.layer_idx]
+
+        k_blocks = layer_k_cache[padded_active_indices]
+        v_blocks = layer_v_cache[padded_active_indices]
+        if self.debug_verbose:
+            _tensor_debug("k_blocks", k_blocks, self.layer_idx)
+            _tensor_debug("v_blocks", v_blocks, self.layer_idx)
+
+        # =========================================================
+        # 10. vectorized block attention
+        # Python loop 제거
+        # =========================================================
+
+        q_grouped = query_states.view(
+            bsz,
+            self.num_key_value_heads,
+            self.num_key_value_groups,
+            q_len,
+            self.head_dim,
+        )
+        # ---------------------------------------------------------
+        # k_blocks:
+        # [bsz, blocks, kv_heads, block_size, head_dim]
+        #
+        # →
+        #
+        # [bsz, kv_heads, blocks, block_size, head_dim]
+        # ---------------------------------------------------------
+
+        k_blocks_for_attn = k_blocks.permute(
+            0,
+            2,
+            1,
+            3,
+            4,
+        ).contiguous()
+
+        if self.debug_verbose:
+            _tensor_debug(
+                "k_blocks_for_attn",
+                k_blocks_for_attn,
+                self.layer_idx,
             )
 
-        # ---------------------------
-        # 4. token-wise index (CRITICAL FIX)
-        # ---------------------------
-        # cache_position: [bsz, q_len]
-        token_pos = cache_position
+        # =========================================================
+        # attention score 계산
+        #
+        # q:
+        # [b, g, r, q, d]
+        #
+        # k:
+        # [b, g, blk, k, d]
+        #
+        # output:
+        # [b, g, r, q, blk, k]
+        # =========================================================
 
-        block_idx = token_pos // pool.block_size
-        offset_idx = token_pos % pool.block_size
+        # =========================================================
+        # real block-wise attention
+        # request별 실제 block까지만 계산
+        # =========================================================
 
-        phys_block = torch.gather(bt_tensor, dim=1, index=block_idx)
+        attn_chunks_per_row = []
 
-        # flatten
-        flat_size = bsz * q_len
+        for row in range(bsz):
 
-        phys_block_f = phys_block.reshape(flat_size)
-        offset_f = offset_idx.reshape(flat_size)
+            row_chunks = []
 
-        k_flat = key_states.transpose(1, 2).reshape(
-            flat_size,
-            self.num_key_value_heads,
-            self.head_dim
+            row_num_blocks = int(
+                num_needed_blocks_tensor[row].item()
+            )
+
+            q_row = q_grouped[row : row + 1]
+
+            for blk_idx in range(row_num_blocks):
+
+                k_chunk = k_blocks_for_attn[
+                    row : row + 1,
+                    :,
+                    blk_idx,
+                ]
+
+                score_chunk = torch.einsum(
+                    "b g r q d, b g k d -> b g r q k",
+                    q_row,
+                    k_chunk,
+                )
+
+                row_chunks.append(score_chunk)
+
+            row_attn = torch.cat(row_chunks, dim=-1)
+
+            attn_chunks_per_row.append(row_attn)
+
+        # =========================================================
+        # batch padding
+        # =========================================================
+
+        max_tokens = (
+            max_num_needed_blocks
+            * pool.block_size
         )
 
-        v_flat = value_states.transpose(1, 2).reshape(
-            flat_size,
-            self.num_key_value_heads,
-            self.head_dim
+        padded_attn = []
+
+        for row_attn in attn_chunks_per_row:
+
+            cur_tokens = row_attn.shape[-1]
+
+            if cur_tokens < max_tokens:
+
+                pad_size = max_tokens - cur_tokens
+
+                row_attn = torch.nn.functional.pad(
+                    row_attn,
+                    (0, pad_size),
+                    value=float("-inf"),
+                )
+
+            padded_attn.append(row_attn)
+
+        attn_weights = torch.cat(
+            padded_attn,
+            dim=0,
         )
 
-        # ---------------------------
-        # 5. WRITE KV CACHE (FIXED)
-        # ---------------------------
-        pool.k_cache[
-            self.layer_idx,
-            phys_block_f,
-            :,
-            offset_f,
-            :
-        ] = k_flat.to(pool.k_cache.dtype)
+        # =========================================================
+        # block dimension + token dimension flatten
+        #
+        # [b,g,r,q,blk,k]
+        # →
+        # [b,g,r,q,total_seq]
+        # =========================================================
 
-        pool.v_cache[
-            self.layer_idx,
-            phys_block_f,
-            :,
-            offset_f,
-            :
-        ] = v_flat.to(pool.v_cache.dtype)
+        # =========================================================
+        # flatten block dimension
+        # =========================================================
 
-        # ---------------------------
-        # 6. READ KV CACHE
-        # ---------------------------
-        k_blocks = pool.k_cache[self.layer_idx, bt_tensor]
-        v_blocks = pool.v_cache[self.layer_idx, bt_tensor]
-
-        # [bsz, max_blocks, heads, block, dim]
-        k_blocks = k_blocks.permute(0, 2, 1, 3, 4)
-        v_blocks = v_blocks.permute(0, 2, 1, 3, 4)
-
-        k_blocks_flat = k_blocks.reshape(
+        attn_weights = attn_weights.reshape(
             bsz,
             self.num_key_value_heads,
-            -1,
-            self.head_dim
+            self.num_key_value_groups,
+            q_len,
+            max_num_needed_blocks * pool.block_size,
         )
 
-        v_blocks_flat = v_blocks.reshape(
-            bsz,
-            self.num_key_value_heads,
-            -1,
-            self.head_dim
+        # =========================================================
+        # row별 real seq len masking
+        # unnecessary compute 제거
+        # =========================================================
+
+        token_positions = torch.arange(
+            max_num_needed_blocks * pool.block_size,
+            device=attn_weights.device,
+        ).view(1, 1, 1, 1, -1)
+
+        real_seq_mask = (
+            token_positions
+            < total_seq_len_tensor.view(bsz, 1, 1, 1, 1)
         )
 
-        # repeat kv heads
-        k_blocks_flat = repeat_kv(k_blocks_flat, self.num_key_value_groups)
-        v_blocks_flat = repeat_kv(v_blocks_flat, self.num_key_value_groups)
+        attn_weights = attn_weights.masked_fill(
+            ~real_seq_mask,
+            float("-inf"),
+        )
+        if self.debug_verbose:
+            _tensor_debug(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
 
-        # ---------------------------
-        # 7. ATTENTION SCORE
-        # ---------------------------
-        attn_weights = torch.matmul(
-            query_states,
-            k_blocks_flat.transpose(-2, -1)
-        ) * self.scaling
+        if self.debug_stop_on_nonfinite:
+            _assert_no_nan(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
+            _assert_no_posinf(
+                "attn_weights(before mask)",
+                attn_weights,
+                self.layer_idx,
+            )
 
-        # ---------------------------
-        # 8. SAFE MASK (FIXED MULTI REQUEST)
-        # ---------------------------
-        seq_lens = cache_position.max(dim=-1).values + 1  # [bsz]
+        # =========================================================
+        # 12. causal mask
+        # =========================================================
 
-        kv_len = k_blocks_flat.size(-2)
+        q_abs = start_pos_tensor[:, None] + torch.arange(
+            q_len,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]
 
-        token_idx = torch.arange(kv_len, device=hidden_states.device)
+        k_pos = torch.arange(
+            max_num_needed_blocks * pool.block_size,
+            device=target_device,
+            dtype=torch.long,
+        )[None, :]
 
-        mask = token_idx[None, None, None, :] < seq_lens[:, None, None, None]
+        causal_keep_mask = (
+            k_pos[:, None, :]
+            <= q_abs[:, :, None]
+        )
 
-        attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+        attn_weights = attn_weights.masked_fill(
+            ~causal_keep_mask[:, None, None, :, :],
+            float("-inf"),
+        )
 
-        # ---------------------------
-        # 9. SOFTMAX + OUTPUT
-        # ---------------------------
+        # =========================================================
+        # 13. softmax
+        # =========================================================
+
         attn_weights = torch.softmax(
             attn_weights,
             dim=-1,
-            dtype=torch.float32
+            dtype=torch.float32,
+        ).to(q_grouped.dtype)
+        if self.debug_verbose:
+            _tensor_debug(
+                "attn_weights(after softmax)",
+                attn_weights,
+                self.layer_idx,
+            )
+
+
+        # =========================================================
+        # 14. vectorized value accumulation
+        # Python loop 제거
+        # =========================================================
+
+        v_blocks_for_attn = v_blocks.permute(
+            0,
+            2,
+            1,
+            3,
+            4,
+        ).contiguous()
+
+        if self.debug_verbose:
+            _tensor_debug(
+                "v_blocks_for_attn",
+                v_blocks_for_attn,
+                self.layer_idx,
+            )
+        
+        # =========================================================
+        # [b,g,blk,k,d]
+        # →
+        # [b,g,total_seq,d]
+        # =========================================================
+
+        # =========================================================
+        # request별 block-wise value accumulation
+        # =========================================================
+
+        attn_outputs = []
+
+        for row in range(bsz):
+
+            row_num_blocks = int(
+                num_needed_blocks_tensor[row].item()
+            )
+
+            row_attn = attn_weights[
+                row : row + 1
+            ]
+
+            row_output = None
+
+            start_idx = 0
+
+            for blk_idx in range(row_num_blocks):
+
+                end_idx = (
+                    start_idx
+                    + pool.block_size
+                )
+
+                # attention slice
+                attn_chunk = row_attn[
+                    :,
+                    :,
+                    :,
+                    :,
+                    start_idx:end_idx
+                ]
+
+                # value block
+                v_chunk = v_blocks_for_attn[
+                    row : row + 1,
+                    :,
+                    blk_idx,
+                ]
+
+                # [1,g,r,q,d]
+                output_chunk = torch.einsum(
+                    "b g r q k, b g k d -> b g r q d",
+                    attn_chunk,
+                    v_chunk,
+                )
+
+                if row_output is None:
+                    row_output = output_chunk
+                else:
+                    row_output = row_output + output_chunk
+
+                start_idx = end_idx
+
+            attn_outputs.append(row_output)
+
+        attn_output = torch.cat(
+            attn_outputs,
+            dim=0,
+        )
+
+        if self.debug_verbose:
+            _tensor_debug(
+                "attn_output(before cast)",
+                attn_output,
+                self.layer_idx,
+            )
+
+        attn_output = attn_output.reshape(
+            bsz,
+            self.num_heads,
+            q_len,
+            self.head_dim,
         ).to(query_states.dtype)
 
-        attn_output = torch.matmul(attn_weights, v_blocks_flat)
+        # =========================================================
+        # 15. output
+        # =========================================================
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(
+            1,
+            2,
+        ).reshape(
+            bsz,
+            q_len,
+            self.hidden_size,
+        )
 
-        attn_output = attn_output.flatten(2)
+        attn_output = self.o_proj(attn_output).to(original_dtype)
 
-        return self.o_proj(attn_output), None
+        return attn_output, None
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
@@ -730,10 +1101,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        print("\n===== DECODER LAYER =====")
-        print("layer hidden_states =", hidden_states.shape)
-        print("attention_mask =", None if attention_mask is None else attention_mask.shape)
-        print("position_ids =", None if position_ids is None else position_ids.shape)
+
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -745,7 +1113,6 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             block_table=getattr(self.self_attn, "block_table", None),
             **kwargs,
         )
-        print("after self_attn =", hidden_states.shape)
 
         hidden_states = residual + hidden_states
 
