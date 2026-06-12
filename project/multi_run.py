@@ -4,6 +4,7 @@ import sys
 import time
 import math
 import random
+import argparse
 
 import torch
 import psutil
@@ -18,9 +19,7 @@ from paged_llama.llama.config.configuration_llama import LlamaConfig
 from paged_llama.llama.memory.page_pool import PagePool
 from paged_llama.llama.memory.simple_scheduler import SimpleScheduler
 
-# main.py에 있는 검증된 patch helper 사용
 from main import patch_model_with_paged_attention
-
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -36,12 +35,25 @@ def model_device(model):
     return next(model.parameters()).device
 
 
+def dtype_nbytes(dtype):
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    if dtype == torch.float32:
+        return 4
+    if dtype == torch.float64:
+        return 8
+    if dtype in (torch.int8, torch.uint8, torch.bool):
+        return 1
+    if dtype in (torch.int16, torch.short):
+        return 2
+    if dtype in (torch.int32, torch.int):
+        return 4
+    if dtype in (torch.int64, torch.long):
+        return 8
+    return 2
+
+
 def reset_cuda_stats_for_measurement():
-    """
-    main.py의 측정 방식과 동일하게 generation 직전에 CUDA 통계를 초기화한다.
-    주의: 이 함수는 모델이 GPU에 올라간 뒤 호출해도 현재 allocated 값은 사라지지 않고,
-    peak 기준만 현재 상태로 리셋된다.
-    """
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -49,7 +61,6 @@ def reset_cuda_stats_for_measurement():
 
 
 def read_cuda_stats_mb():
-    """PyTorch CUDA allocator 기준 VRAM 통계를 MB 단위로 읽는다."""
     if device != "cuda":
         return {
             "peak_vram_mb": 0.0,
@@ -66,6 +77,36 @@ def read_cuda_stats_mb():
         "reserved_vram_mb": torch.cuda.memory_reserved() / 1024 / 1024,
         "max_reserved_vram_mb": torch.cuda.max_memory_reserved() / 1024 / 1024,
     }
+
+
+def estimate_kv_cache_mb(num_layers, num_kv_heads, head_dim, tokens, dtype):
+    # K와 V 두 개이므로 * 2
+    bytes_used = (
+        int(num_layers)
+        * int(num_kv_heads)
+        * int(head_dim)
+        * int(tokens)
+        * 2
+        * dtype_nbytes(dtype)
+    )
+    return bytes_used / 1024 / 1024
+
+
+def get_pool_cache_mb(pool):
+    return (
+        pool.k_cache.numel() * pool.k_cache.element_size()
+        + pool.v_cache.numel() * pool.v_cache.element_size()
+    ) / 1024 / 1024
+
+
+def get_block_table_len(block_table):
+    if hasattr(block_table, "to_tensor"):
+        return int(block_table.to_tensor(device="cpu").shape[1])
+    if hasattr(block_table, "block_table"):
+        return int(len(block_table.block_table[0]))
+    if hasattr(block_table, "physical_blocks"):
+        return int(len(block_table.physical_blocks))
+    return 0
 
 
 # =========================================================
@@ -159,47 +200,65 @@ def load_paged_model():
 # Prompt Generation
 # =========================================================
 
-def make_prompt(question: str) -> str:
+def make_prompt(question: str, style: str = "plain") -> str:
+    if style == "short":
+        extra = "Answer in one short sentence."
+    elif style == "medium":
+        extra = "Answer in three simple sentences."
+    elif style == "long":
+        extra = "Answer in six to eight clear sentences with one concrete example."
+    else:
+        extra = "Answer in clear plain English."
+
     return (
         "### Instruction:\n"
         f"{question}\n"
-        "Answer in clear plain English.\n"
+        f"{extra}\n"
         "Do not use markdown, bullet points, code blocks, or numbered lists.\n"
         "### Response:\n"
     )
 
 
-def build_mixed_prompts(n_requests: int = 2, seed: int | None = None):
+def build_mixed_prompts(n_requests: int = 4, seed: int | None = None):
     rng = random.Random(seed)
 
     question_bank = [
-        "Explain what a large language model is in one clear sentence.",
-        "Explain transformer attention for a beginner in three simple sentences.",
-        "Explain why KV cache is useful during LLM inference.",
-        "Explain paged attention in simple terms.",
-        "Explain why batching improves LLM inference throughput.",
-        "Explain the difference between prefill and decode in LLM generation.",
-        "Explain why memory usage matters when serving large language models.",
-        "Explain how attention helps a transformer understand context.",
-        "Explain what token generation means in an autoregressive language model.",
-        "Explain why reducing unnecessary attention computation can improve latency.",
-        "Explain what a cache miss means in a memory system.",
-        "Explain why GPU memory access can become a bottleneck.",
-        "Explain what sequence length means in transformer inference.",
-        "Explain what request-level scheduling means in LLM serving.",
-        "Explain why masking is used in causal language models.",
+        ("Explain LLM in one sentence.", "short"),
+        ("Explain transformer attention in one sentence.", "short"),
+        ("Explain why KV cache is useful during LLM inference.", "medium"),
+        ("Explain paged attention in simple terms.", "medium"),
+        ("Explain the difference between prefill and decode in LLM generation.", "medium"),
+        ("Explain why GPU memory access can become a bottleneck during LLM serving.", "medium"),
+        ("Explain request-level scheduling in LLM serving.", "medium"),
+        ("Explain why batching improves LLM inference throughput.", "medium"),
+        (
+            "Explain paged attention, KV cache fragmentation, block allocation, and request scheduling in LLM serving.",
+            "long",
+        ),
+        (
+            "Explain how continuous batching helps when many users send requests with different prompt lengths and output lengths.",
+            "long",
+        ),
+        (
+            "Explain why reducing unnecessary attention computation can improve latency, throughput, and GPU memory efficiency.",
+            "long",
+        ),
+        (
+            "Explain how attention helps a transformer understand context across a long input sequence.",
+            "long",
+        ),
     ]
 
     if n_requests <= len(question_bank):
-        selected_questions = rng.sample(question_bank, n_requests)
+        selected = rng.sample(question_bank, n_requests)
     else:
-        selected_questions = [rng.choice(question_bank) for _ in range(n_requests)]
+        selected = [rng.choice(question_bank) for _ in range(n_requests)]
 
-    prompts = [make_prompt(question) for question in selected_questions]
+    prompts = [make_prompt(question, style) for question, style in selected]
 
     print("\n================ GENERATED QUESTIONS ================\n")
-    for i, question in enumerate(selected_questions):
-        print(f"[Question {i + 1}] {question}")
+    for i, (question, style) in enumerate(selected):
+        print(f"[Question {i + 1}] ({style}) {question}")
     print()
 
     return prompts
@@ -231,11 +290,7 @@ def _print_topk_logits(logits, tokenizer, tag: str, k: int = 5):
 # =========================================================
 
 @torch.no_grad()
-def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=40):
-    """
-    main.py의 measure_baseline_multi 방식으로 측정하되,
-    답변 출력용 responses/texts를 추가한다.
-    """
+def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=80):
     model.eval()
     process = psutil.Process(os.getpid())
 
@@ -296,6 +351,16 @@ def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=40):
 
     latency = t1 - t0
 
+    # baseline도 같은 토큰 수 기준의 이론 KV 사용량을 같이 표시한다.
+    cfg = model.config
+    kv_used_mb = estimate_kv_cache_mb(
+        num_layers=cfg.num_hidden_layers,
+        num_kv_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        head_dim=cfg.hidden_size // cfg.num_attention_heads,
+        tokens=total_tokens,
+        dtype=next(model.parameters()).dtype,
+    )
+
     return {
         "latency": latency,
         "throughput": generated_tokens / latency if latency > 0 else 0.0,
@@ -313,8 +378,15 @@ def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=40):
             if generated_tokens > 0
             else 0.0
         ),
-        "used_blocks": 0,
-        "block_utilization": 0.0,
+        "used_blocks": None,
+        "allocated_blocks": None,
+        "pool_blocks": None,
+        "block_utilization": None,
+        "pool_block_utilization": None,
+        "kv_cache_capacity_mb": None,
+        "theoretical_kv_used_mb": kv_used_mb,
+        "kv_cache_waste_mb": None,
+        "kv_cache_waste_ratio": None,
         "texts": decoded_texts,
         "responses": response_texts,
         "prompt_tokens_total": prompt_tokens_total,
@@ -329,6 +401,18 @@ def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=40):
 # Paged Measurement
 # =========================================================
 
+def bind_paged_runtime(model, attn_layers, pool, batch_block_tables, batch_request_states):
+    # decode step마다 전체 layer 객체를 다시 찾지 않도록 attn_layers를 미리 만들어 사용한다.
+    for attn in attn_layers:
+        attn.block_table = batch_block_tables
+        attn.page_pool = pool
+
+    model.model.block_table = batch_block_tables
+    model.model.page_pool = pool
+    model.model.active_request_state = None
+    model.model.active_request_states = batch_request_states
+
+
 @torch.no_grad()
 def measure_paged_multi(
     model,
@@ -336,20 +420,13 @@ def measure_paged_multi(
     prompts,
     scheduler,
     pool,
-    max_new_tokens=40,
+    max_new_tokens=80,
     enable_token_debug: bool = False,
 ):
-    """
-    Custom Paged Attention multi-request generation + main.py 방식 성능 측정.
-
-    핵심:
-    - VRAM 통계는 함수 시작 직전에 reset하고, generation 직후 바로 읽는다.
-    - return 이후에 del / empty_cache로 값을 덮어쓰지 않는다.
-    - 답변 출력용 responses/texts도 함께 반환한다.
-    """
     model.eval()
     process = psutil.Process(os.getpid())
     dev = model_device(model)
+    attn_layers = [layer.self_attn for layer in model.model.layers]
 
     request_ids = []
     runtimes = []
@@ -392,8 +469,13 @@ def measure_paged_multi(
             "finished": False,
         })
 
+    allocated_blocks_initial = sum(
+        get_block_table_len(rt["block_table"])
+        for rt in runtimes
+    )
+
     # -------------------------------------------------
-    # 2) 성능 측정 시작: main.py와 같은 위치
+    # 2) 성능 측정 시작
     # -------------------------------------------------
     reset_cuda_stats_for_measurement()
 
@@ -418,14 +500,13 @@ def measure_paged_multi(
         batch_block_tables = [rt["block_table"] for rt in group_rts]
         batch_request_states = [rt["request_state"] for rt in group_rts]
 
-        for layer in model.model.layers:
-            layer.self_attn.block_table = batch_block_tables
-            layer.self_attn.page_pool = pool
-
-        model.model.block_table = batch_block_tables
-        model.model.page_pool = pool
-        model.model.active_request_state = None
-        model.model.active_request_states = batch_request_states
+        bind_paged_runtime(
+            model=model,
+            attn_layers=attn_layers,
+            pool=pool,
+            batch_block_tables=batch_block_tables,
+            batch_request_states=batch_request_states,
+        )
 
         for rt in group_rts:
             scheduler.set_seq_len(rt["request_id"], 0)
@@ -438,30 +519,16 @@ def measure_paged_multi(
         )
 
         if enable_token_debug:
-            _print_topk_logits(
-                outputs.logits,
-                tokenizer,
-                tag=f"prefill_len_{prompt_len}",
-            )
+            _print_topk_logits(outputs.logits, tokenizer, tag=f"prefill_len_{prompt_len}")
 
-        next_tokens = torch.argmax(
-            outputs.logits[:, -1, :],
-            dim=-1,
-            keepdim=True,
-        )
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
 
         for i, rt in enumerate(group_rts):
             next_token = next_tokens[i:i + 1]
-            rt["generated"] = torch.cat(
-                [rt["generated"], next_token],
-                dim=1,
-            )
+            rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
             rt["request_state"]["seq_len"] = rt["generated"].shape[1]
 
-            if (
-                tokenizer.eos_token_id is not None
-                and int(next_token.item()) == tokenizer.eos_token_id
-            ):
+            if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
                 rt["finished"] = True
 
     # -------------------------------------------------
@@ -490,14 +557,13 @@ def measure_paged_multi(
         batch_block_tables = [rt["block_table"] for rt in active_rts]
         batch_request_states = [rt["request_state"] for rt in active_rts]
 
-        for layer in model.model.layers:
-            layer.self_attn.block_table = batch_block_tables
-            layer.self_attn.page_pool = pool
-
-        model.model.block_table = batch_block_tables
-        model.model.page_pool = pool
-        model.model.active_request_state = None
-        model.model.active_request_states = batch_request_states
+        bind_paged_runtime(
+            model=model,
+            attn_layers=attn_layers,
+            pool=pool,
+            batch_block_tables=batch_block_tables,
+            batch_request_states=batch_request_states,
+        )
 
         outputs = model(
             input_ids=batch_last_tokens,
@@ -508,33 +574,19 @@ def measure_paged_multi(
         )
 
         if enable_token_debug:
-            _print_topk_logits(
-                outputs.logits,
-                tokenizer,
-                tag=f"decode_step_{step}",
-            )
+            _print_topk_logits(outputs.logits, tokenizer, tag=f"decode_step_{step}")
 
-        next_tokens = torch.argmax(
-            outputs.logits[:, -1, :],
-            dim=-1,
-            keepdim=True,
-        )
+        next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
 
         for i, rt in enumerate(active_rts):
             next_token = next_tokens[i:i + 1]
-            rt["generated"] = torch.cat(
-                [rt["generated"], next_token],
-                dim=1,
-            )
+            rt["generated"] = torch.cat([rt["generated"], next_token], dim=1)
 
-            if (
-                tokenizer.eos_token_id is not None
-                and int(next_token.item()) == tokenizer.eos_token_id
-            ):
+            if tokenizer.eos_token_id is not None and int(next_token.item()) == tokenizer.eos_token_id:
                 rt["finished"] = True
 
     # -------------------------------------------------
-    # 5) 성능 측정 종료: generation 직후 바로 읽기
+    # 5) 성능 측정 종료
     # -------------------------------------------------
     if device == "cuda":
         torch.cuda.synchronize()
@@ -554,24 +606,38 @@ def measure_paged_multi(
     peak_allocated = cuda_stats["peak_vram_mb"]
 
     # -------------------------------------------------
-    # 6) block 사용량 계산
-    # main.py와 동일하게 used_blocks / pool.num_blocks 비율 사용
+    # 6) Paged 전용 메모리 지표
     # -------------------------------------------------
-    used_blocks = 0
-    for rt in runtimes:
-        bt = rt["block_table"]
-        if hasattr(bt, "to_tensor"):
-            used_blocks += bt.to_tensor(device="cpu").shape[1]
-        elif hasattr(bt, "block_table"):
-            used_blocks += len(bt.block_table[0])
-        elif hasattr(bt, "physical_blocks"):
-            used_blocks += len(bt.physical_blocks)
-        else:
-            used_blocks += math.ceil(rt["generated"].shape[1] / pool.block_size)
+    final_lengths = [int(rt["generated"].shape[1]) for rt in runtimes]
+    needed_blocks_final = sum(math.ceil(length / pool.block_size) for length in final_lengths)
+    allocated_blocks = allocated_blocks_initial
 
-    block_utilization = (
-        used_blocks / pool.num_blocks
+    token_block_capacity = allocated_blocks * pool.block_size
+    token_block_utilization = (
+        total_tokens / token_block_capacity
+        if token_block_capacity > 0
+        else 0.0
+    )
+
+    pool_block_utilization = (
+        allocated_blocks / pool.num_blocks
         if pool.num_blocks > 0
+        else 0.0
+    )
+
+    cfg = model.config
+    kv_cache_capacity_mb = get_pool_cache_mb(pool)
+    theoretical_kv_used_mb = estimate_kv_cache_mb(
+        num_layers=cfg.num_hidden_layers,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.hidden_size // cfg.num_attention_heads,
+        tokens=total_tokens,
+        dtype=pool.k_cache.dtype,
+    )
+    kv_cache_waste_mb = max(kv_cache_capacity_mb - theoretical_kv_used_mb, 0.0)
+    kv_cache_waste_ratio = (
+        kv_cache_waste_mb / kv_cache_capacity_mb
+        if kv_cache_capacity_mb > 0
         else 0.0
     )
 
@@ -587,21 +653,14 @@ def measure_paged_multi(
         full_ids = rt["generated"][0]
         response_ids = full_ids[rt["prompt_len"]:]
 
-        full_text = tokenizer.decode(
-            full_ids,
-            skip_special_tokens=True,
-        )
-        response_text = tokenizer.decode(
-            response_ids,
-            skip_special_tokens=True,
-        )
+        full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
 
         decoded_texts.append(full_text)
         decoded_responses.append(response_text)
         generated_token_ids.append(full_ids.detach().cpu().tolist())
         response_token_ids.append(response_ids.detach().cpu().tolist())
 
-    # request release는 통계 측정 이후에 수행
     for rid in request_ids:
         scheduler.release_request(rid)
 
@@ -624,8 +683,15 @@ def measure_paged_multi(
             if generated_tokens > 0
             else 0.0
         ),
-        "used_blocks": used_blocks,
-        "block_utilization": block_utilization,
+        "used_blocks": needed_blocks_final,
+        "allocated_blocks": allocated_blocks,
+        "pool_blocks": pool.num_blocks,
+        "block_utilization": token_block_utilization,
+        "pool_block_utilization": pool_block_utilization,
+        "kv_cache_capacity_mb": kv_cache_capacity_mb,
+        "theoretical_kv_used_mb": theoretical_kv_used_mb,
+        "kv_cache_waste_mb": kv_cache_waste_mb,
+        "kv_cache_waste_ratio": kv_cache_waste_ratio,
         "texts": decoded_texts,
         "responses": decoded_responses,
         "generated_token_ids": generated_token_ids,
@@ -690,7 +756,14 @@ def print_multi_request_result_table(normal_stats, paged_stats):
         ("VRAM/token (KB)", fmt_float(normal_stats.get("vram_per_token_kb"), 2), fmt_float(paged_stats.get("vram_per_token_kb"), 2)),
         ("Context Switch", fmt_int(normal_stats.get("ctx_switches")), fmt_int(paged_stats.get("ctx_switches"))),
         ("Used Blocks", "-", fmt_int(paged_stats.get("used_blocks"))),
-        ("Block Utilization", "-", fmt_percent(paged_stats.get("block_utilization"))),
+        ("Allocated Blocks", "-", fmt_int(paged_stats.get("allocated_blocks"))),
+        ("Pool Blocks", "-", fmt_int(paged_stats.get("pool_blocks"))),
+        ("Token Block Utilization", "-", fmt_percent(paged_stats.get("block_utilization"))),
+        ("Pool Block Utilization", "-", fmt_percent(paged_stats.get("pool_block_utilization"))),
+        ("KV Cache Capacity (MB)", "-", fmt_float(paged_stats.get("kv_cache_capacity_mb"), 2)),
+        ("Theoretical KV Used (MB)", fmt_float(normal_stats.get("theoretical_kv_used_mb"), 2), fmt_float(paged_stats.get("theoretical_kv_used_mb"), 2)),
+        ("KV Cache Waste (MB)", "-", fmt_float(paged_stats.get("kv_cache_waste_mb"), 2)),
+        ("KV Cache Waste Ratio", "-", fmt_percent(paged_stats.get("kv_cache_waste_ratio"))),
         ("Prompt Tokens", fmt_int(normal_stats.get("prompt_tokens_total")), fmt_int(paged_stats.get("prompt_tokens_total"))),
         ("Generated Tokens", fmt_int(normal_stats.get("generated_tokens_total")), fmt_int(paged_stats.get("generated_tokens_total"))),
         ("Total Tokens", fmt_int(normal_stats.get("total_tokens")), fmt_int(paged_stats.get("total_tokens"))),
@@ -714,15 +787,49 @@ def print_multi_request_result_table(normal_stats, paged_stats):
             f"{paged_value:<{paged_width}} |"
         )
 
+    print("\n================ RESULT INTERPRETATION ================\n")
+    normal_latency = normal_stats.get("latency") or 0.0
+    paged_latency = paged_stats.get("latency") or 0.0
+    normal_vram = normal_stats.get("peak_vram_mb") or 0.0
+    paged_vram = paged_stats.get("peak_vram_mb") or 0.0
+
+    if normal_latency > 0 and paged_latency > 0:
+        print(f"Paged latency ratio        : {paged_latency / normal_latency:.2f}x of normal")
+    if normal_vram > 0 and paged_vram > 0:
+        print(f"Peak VRAM difference       : {normal_vram - paged_vram:.1f} MB")
+    print(
+        "Note: This implementation validates Paged Attention's block-based KV cache management. "
+        "It is not expected to beat HuggingFace generate() in latency because this code uses Python-level "
+        "block-wise attention rather than a CUDA/Triton fused PagedAttention kernel."
+    )
+
 
 # =========================================================
 # Main
 # =========================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_requests", type=int, default=4)
+    parser.add_argument("--max_new_tokens", type=int, default=80)
+    parser.add_argument("--block_size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--token_debug", action="store_true")
+    return parser.parse_args()
+
+
 def multi_only_main():
+    args = parse_args()
+
     print(">>> Multi Request 비교 실행")
     print(f">>> torch.cuda.is_available() = {torch.cuda.is_available()}")
     print(f">>> device = {device}")
+    print(f">>> num_requests = {args.num_requests}")
+    print(f">>> max_new_tokens = {args.max_new_tokens}")
+    print(f">>> block_size = {args.block_size}")
+
+    if not torch.cuda.is_available():
+        print("[WARNING] CUDA가 잡히지 않아 VRAM 측정이 0으로 나올 수 있습니다.")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
@@ -731,12 +838,7 @@ def multi_only_main():
 
     tokenizer.padding_side = "left"
 
-    num_requests = 2
-    max_new_tokens = 40
-    block_size = 16
-    enable_token_debug = False
-
-    prompts = build_mixed_prompts(n_requests=num_requests, seed=None)
+    prompts = build_mixed_prompts(n_requests=args.num_requests, seed=args.seed)
 
     print("\n================ PROMPTS ================\n")
     for i, prompt in enumerate(prompts):
@@ -758,10 +860,9 @@ def multi_only_main():
         model=model_normal,
         tokenizer=tokenizer,
         prompts=prompts,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=args.max_new_tokens,
     )
 
-    # 통계는 이미 저장되었으므로 이후 cleanup 가능
     del model_normal
     gc.collect()
     if device == "cuda":
@@ -779,38 +880,48 @@ def multi_only_main():
         prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].shape[1]
         max_prompt_len = max(max_prompt_len, prompt_len)
 
-    shared_total_tokens = max_prompt_len + max_new_tokens
-    blocks_per_request = (shared_total_tokens + block_size - 1) // block_size
+    shared_total_tokens = max_prompt_len + args.max_new_tokens
+    blocks_per_request = (shared_total_tokens + args.block_size - 1) // args.block_size
     all_needed_blocks = blocks_per_request * len(prompts)
-    safety_margin = 4
+    safety_margin = max(4, len(prompts))
     num_blocks = all_needed_blocks + safety_margin
+
+    print("\n================ PAGED CACHE CONFIG ================\n")
+    print(f"max_prompt_len       = {max_prompt_len}")
+    print(f"shared_total_tokens  = {shared_total_tokens}")
+    print(f"blocks_per_request   = {blocks_per_request}")
+    print(f"all_needed_blocks    = {all_needed_blocks}")
+    print(f"safety_margin        = {safety_margin}")
+    print(f"num_blocks           = {num_blocks}")
 
     pool = PagePool(
         num_blocks=num_blocks,
         num_layers=config.num_hidden_layers,
         num_heads=config.num_key_value_heads,
-        block_size=block_size,
+        block_size=args.block_size,
         head_dim=config.hidden_size // config.num_attention_heads,
         device=device,
         dtype=model_paged.dtype,
     )
 
-    scheduler = SimpleScheduler(page_pool=pool, block_size=block_size)
+    scheduler = SimpleScheduler(page_pool=pool, block_size=args.block_size)
 
     dummy_total_tokens = (
         tokenizer(prompts[0], return_tensors="pt")["input_ids"].shape[1]
-        + max_new_tokens
+        + args.max_new_tokens
     )
-    dummy_block_table = scheduler.allocate_for_request(
-        "dummy_req",
-        dummy_total_tokens,
-    )
+    dummy_block_table = scheduler.allocate_for_request("dummy_req", dummy_total_tokens)
 
     model_paged = patch_model_with_paged_attention(
         model=model_paged,
         page_pool=pool,
         block_table=dummy_block_table,
     )
+
+    # patch helper가 debug 속성을 남겨도 최종 측정에서는 출력 제거
+    for layer in model_paged.model.layers:
+        layer.self_attn.debug = False
+        layer.self_attn.debug_verbose = False
 
     scheduler.release_request("dummy_req")
 
@@ -820,8 +931,8 @@ def multi_only_main():
         prompts=prompts,
         scheduler=scheduler,
         pool=pool,
-        max_new_tokens=max_new_tokens,
-        enable_token_debug=enable_token_debug,
+        max_new_tokens=args.max_new_tokens,
+        enable_token_debug=args.token_debug,
     )
 
     # -------------------------------------------------
