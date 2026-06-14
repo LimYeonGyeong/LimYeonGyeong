@@ -401,14 +401,20 @@ def measure_baseline_multi(model, tokenizer, prompts, max_new_tokens=80):
 # Paged Measurement
 # =========================================================
 
+def bind_paged_static_runtime(model, attn_layers, pool):
+    # page_pool은 실행 중 거의 바뀌지 않으므로 한 번만 연결한다.
+    for attn in attn_layers:
+        attn.page_pool = pool
+    model.model.page_pool = pool
+
+
 def bind_paged_runtime(model, attn_layers, pool, batch_block_tables, batch_request_states):
-    # decode step마다 전체 layer 객체를 다시 찾지 않도록 attn_layers를 미리 만들어 사용한다.
+    # block_table/request_state만 현재 batch에 맞춰 갱신한다.
+    # page_pool은 bind_paged_static_runtime()에서 미리 연결하여 반복 비용을 줄인다.
     for attn in attn_layers:
         attn.block_table = batch_block_tables
-        attn.page_pool = pool
 
     model.model.block_table = batch_block_tables
-    model.model.page_pool = pool
     model.model.active_request_state = None
     model.model.active_request_states = batch_request_states
 
@@ -427,6 +433,7 @@ def measure_paged_multi(
     process = psutil.Process(os.getpid())
     dev = model_device(model)
     attn_layers = [layer.self_attn for layer in model.model.layers]
+    bind_paged_static_runtime(model, attn_layers, pool)
 
     request_ids = []
     runtimes = []
@@ -534,6 +541,10 @@ def measure_paged_multi(
     # -------------------------------------------------
     # 4) DECODE
     # -------------------------------------------------
+    prev_active_key = None
+    cached_batch_block_tables = None
+    cached_batch_request_states = None
+
     for step in range(1, max_new_tokens):
         active_rts = [rt for rt in runtimes if not rt["finished"]]
         if not active_rts:
@@ -554,16 +565,22 @@ def measure_paged_multi(
         )
         batch_position_ids = batch_cache_position.unsqueeze(1)
 
-        batch_block_tables = [rt["block_table"] for rt in active_rts]
-        batch_request_states = [rt["request_state"] for rt in active_rts]
+        active_key = tuple(rt["request_id"] for rt in active_rts)
 
-        bind_paged_runtime(
-            model=model,
-            attn_layers=attn_layers,
-            pool=pool,
-            batch_block_tables=batch_block_tables,
-            batch_request_states=batch_request_states,
-        )
+        # active request 구성이 바뀌었을 때만 block table을 다시 연결한다.
+        # seq_len은 request_state dict 내부 값만 갱신되므로 매 step 재바인딩할 필요가 없다.
+        if active_key != prev_active_key:
+            cached_batch_block_tables = [rt["block_table"] for rt in active_rts]
+            cached_batch_request_states = [rt["request_state"] for rt in active_rts]
+
+            bind_paged_runtime(
+                model=model,
+                attn_layers=attn_layers,
+                pool=pool,
+                batch_block_tables=cached_batch_block_tables,
+                batch_request_states=cached_batch_request_states,
+            )
+            prev_active_key = active_key
 
         outputs = model(
             input_ids=batch_last_tokens,
