@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "/LimYeonGyeong/project/main.py", line 15, in <module>
-    import transformers.models.llama.modeling_llama as llama_mod
-  File "/usr/local/lib/python3.10/dist-packages/transformers/models/llama/modeling_llama.py", line 28, in <module>
-    from ..activations import ACT2FN
-ModuleNotFoundError: No module named 'transformers.models.activations'
